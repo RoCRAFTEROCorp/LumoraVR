@@ -87,11 +87,22 @@ public sealed class SubEmissionManager
     }
 
     // Borrow a batch aimed at a target. Returns null when the target is not a declared target.
+    //
+    // The pool is the one piece of this manager two simulations can reach at once: the owner borrows
+    // from it during its step and the TARGET hands batches back from inside its own step, and when the
+    // host steps simulations side by side those are different threads. The lock is uncontended in
+    // practice and costs nothing measurable; a torn pool would cost a batch. -xlinka
     public SubEmissionBatch? BorrowBatch(ParticleSimulation target)
     {
         if (!_pending.TryGetValue(target, out var list))
             return null;
-        var batch = _pool.Count > 0 ? _pool.Pop() : new SubEmissionBatch();
+        SubEmissionBatch? batch = null;
+        lock (_pool)
+        {
+            if (_pool.Count > 0)
+                batch = _pool.Pop();
+        }
+        batch ??= new SubEmissionBatch();
         batch.Clear();
         list.Add(batch);
         return batch;
@@ -121,7 +132,10 @@ public sealed class SubEmissionManager
     internal void Return(SubEmissionBatch batch)
     {
         batch.Clear();
-        if (_pool.Count < 32)
-            _pool.Push(batch);
+        lock (_pool)
+        {
+            if (_pool.Count < 32)
+                _pool.Push(batch);
+        }
     }
 }

@@ -20,7 +20,11 @@ public interface ISoftBodySpace
 // with the particle's world position; push it out of anything it overlaps and return true. The push
 // direction doubles as the surface normal for the friction response, so move the particle to the
 // surface rather than to some arbitrary safe spot.
+//
+// The particle index is the solver's own (it matches the vertex order the body was built from) so a
+// host can keep per-particle contact state across steps: which surface this particle sat on last
+// time and how far it may travel before that answer has to be asked again. -xlinka
 public interface ISoftBodyCollisionHandler
 {
-    bool ResolveParticle(ref float3 position, float radius);
+    bool ResolveParticle(int index, ref float3 position, float radius);
 }

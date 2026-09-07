@@ -41,12 +41,18 @@ public sealed class SoftBodySolver
         public int A;
         public int B;
         public float Rest;
+
+        // Share of the correction each end takes, fixed at build from the pin state: a free-free edge
+        // splits it in half, a pinned end takes none. Baked here so the inner loop is one sqrt, one
+        // divide and two scaled adds with nothing to look up. Edges with both ends pinned never enter
+        // the list at all. -xlinka
+        public float Ka;
+        public float Kb;
     }
 
     private Particle[]? _particles;
     private Edge[]? _edges;
     private Edge[]? _bendEdges;       // cross-edge constraints over each pair of adjacent triangles
-    private float[]? _invMass;        // 0 = pinned, 1 = free; lets the constraint solve run branchless
     private int[]? _restIndices;
     private float3[]? _restOffsets;   // each rest vertex relative to the rest centroid (shape-match goal)
     private int[]? _lraPin;
@@ -177,7 +183,7 @@ public sealed class SoftBodySolver
             if (a == b) return;
             long key = a < b ? ((long)a << 32) | (uint)b : ((long)b << 32) | (uint)a;
             if (edgeSet.ContainsKey(key)) return;
-            edgeSet[key] = new Edge { A = a, B = b, Rest = float3.Distance(_particles[a].Pos, _particles[b].Pos) };
+            edgeSet[key] = MakeEdge(a, b);
         }
         for (int t = 0; t + 2 < indices.Length; t += 3)
         {
@@ -185,13 +191,15 @@ public sealed class SoftBodySolver
             AddEdge(indices[t + 1], indices[t + 2]);
             AddEdge(indices[t + 2], indices[t]);
         }
-        _edges = new Edge[edgeSet.Count];
-        edgeSet.Values.CopyTo(_edges, 0);
 
+        // The average is taken over EVERY unique edge, pinned rows included, because every threshold in
+        // the solver hangs off it and it has to mean the same thing whatever gets pinned. The solve list
+        // then drops the edges that cannot move anything.
         float edgeSum = 0f;
-        for (int e = 0; e < _edges.Length; e++)
-            edgeSum += _edges[e].Rest;
-        _avgEdge = _edges.Length > 0 ? MathF.Max(edgeSum / _edges.Length, 1e-3f) : 0.1f;
+        foreach (var edge in edgeSet.Values)
+            edgeSum += edge.Rest;
+        _avgEdge = edgeSet.Count > 0 ? MathF.Max(edgeSum / edgeSet.Count, 1e-3f) : 0.1f;
+        _edges = CollectSolvable(edgeSet.Values);
 
         // BENDING constraints: for every interior edge shared by two triangles, constrain the two OPPOSITE
         // vertices to their rest separation. Stretch edges alone fold like wet paper (zero resistance to
@@ -205,7 +213,7 @@ public sealed class SoftBodySolver
             if (opposite.TryGetValue(key, out int other))
             {
                 if (other != opp)
-                    bendList.Add(new Edge { A = other, B = opp, Rest = float3.Distance(_particles[other].Pos, _particles[opp].Pos) });
+                    bendList.Add(MakeEdge(other, opp));
             }
             else
             {
@@ -218,18 +226,14 @@ public sealed class SoftBodySolver
             AddBend(indices[t + 1], indices[t + 2], indices[t]);
             AddBend(indices[t + 2], indices[t], indices[t + 1]);
         }
-        _bendEdges = bendList.ToArray();
+        _bendEdges = CollectSolvable(bendList);
 
         _restIndices = indices;
         var restCentroid = Centroid();
         _restVolume = ComputeVolume(indices, restCentroid);
         _restOffsets = new float3[n];
-        _invMass = new float[n];
         for (int i = 0; i < n; i++)
-        {
             _restOffsets[i] = _particles[i].Pos - restCentroid;
-            _invMass[i] = _particles[i].Pinned ? 0f : 1f;
-        }
 
         // Long-range attachment: nearest pin (rest-space distance) per free particle. Rest-space euclidean
         // is an approximation of the true geodesic, but for sheets/blobs it's within a few percent and it
@@ -263,6 +267,35 @@ public sealed class SoftBodySolver
         _lastDt = 1f / 60f;
         _wasSimulating = false;
         IsAwake = true;
+    }
+
+    private Edge MakeEdge(int a, int b)
+    {
+        var particles = _particles!;
+        float wa = particles[a].Pinned ? 0f : 1f;
+        float wb = particles[b].Pinned ? 0f : 1f;
+        float wsum = wa + wb;
+        return new Edge
+        {
+            A = a,
+            B = b,
+            Rest = float3.Distance(particles[a].Pos, particles[b].Pos),
+            Ka = wsum > 0f ? wa / wsum : 0f,
+            Kb = wsum > 0f ? wb / wsum : 0f,
+        };
+    }
+
+    // Only edges with at least one free end can move anything; the rest are skipped once here instead
+    // of once per iteration per step forever.
+    private static Edge[] CollectSolvable(IEnumerable<Edge> edges)
+    {
+        var list = new List<Edge>();
+        foreach (var edge in edges)
+        {
+            if (edge.Ka + edge.Kb > 0f)
+                list.Add(edge);
+        }
+        return list.ToArray();
     }
 
     // STEP
@@ -389,13 +422,13 @@ public sealed class SoftBodySolver
         // compounds to the REQUESTED one and tuning finally means what it says. -xlinka
         float stiffness = CorrectedStiffness(Stiffness, iterations);
         float bend = CorrectedStiffness(BendStiffness, iterations);
-        var invMass = _invMass!;
         var bendEdges = _bendEdges;
+        bool solveBend = bend > 0f && bendEdges != null && bendEdges.Length > 0;
         for (int iter = 0; iter < iterations; iter++)
         {
-            SolveEdges(particles, edges, invMass, stiffness);
-            if (bend > 0f && bendEdges != null && bendEdges.Length > 0)
-                SolveEdges(particles, bendEdges, invMass, bend);
+            SolveEdges(particles, edges, stiffness);
+            if (solveBend)
+                SolveEdges(particles, bendEdges!, bend);
         }
 
         // LONG-RANGE ATTACHMENT: clamp every free particle to at most its rest distance (small slack) from
@@ -462,7 +495,7 @@ public sealed class SoftBodySolver
             bool hitSurface = false;
             var posBefore = pos;
 
-            if (collision != null && collision.ResolveParticle(ref pos, radius))
+            if (collision != null && collision.ResolveParticle(i, ref pos, radius))
                 hitSurface = true;
 
             if (hasGround && pos.y - radius < groundY)
@@ -621,26 +654,23 @@ public sealed class SoftBodySolver
     }
 
     // One relaxation pass over an edge list. Weighted position-based dynamics: correction split by
-    // inverse mass, pinned = 0 -> immovable. Shared by the stretch and bend lists. -xlinka
-    private static void SolveEdges(Particle[] particles, Edge[] edges, float[] invMass, float stiffness)
+    // the per-end shares baked at build, pinned = 0 -> immovable. Shared by the stretch and bend lists.
+    // The shares are exact halves or whole, so the arithmetic lands on the same bits as splitting by
+    // the inverse-mass sum did. -xlinka
+    private static void SolveEdges(Particle[] particles, Edge[] edges, float stiffness)
     {
         for (int e = 0; e < edges.Length; e++)
         {
             ref var edge = ref edges[e];
-            float wa = invMass[edge.A];
-            float wb = invMass[edge.B];
-            float wsum = wa + wb;
-            if (wsum < 1e-6f) // both ends pinned
-                continue;
-            var pa = particles[edge.A].Pos;
-            var pb = particles[edge.B].Pos;
-            var delta = pb - pa;
+            ref var a = ref particles[edge.A];
+            ref var b = ref particles[edge.B];
+            var delta = b.Pos - a.Pos;
             float dist = delta.Length;
             if (dist < 1e-6f)
                 continue;
-            var corr = delta * ((dist - edge.Rest) / dist * stiffness / wsum);
-            particles[edge.A].Pos = pa + corr * wa;
-            particles[edge.B].Pos = pb - corr * wb;
+            var corr = delta * ((dist - edge.Rest) / dist * stiffness);
+            a.Pos += corr * edge.Ka;
+            b.Pos -= corr * edge.Kb;
         }
     }
 
