@@ -268,7 +268,10 @@ public struct PhosVertex
     public float3 GetBlendShapePositionDelta(string key, int frame = 0)
     {
         UpdateIndex();
-        return mesh.GetBlendShape(key).Frames[frame].positions[index];
+        // A frame only carries the channels its source had, and lookup no longer pre-allocates, so an
+        // absent channel reads as no delta rather than as an index blowout. -xlinka
+        var deltas = mesh.GetBlendShape(key).Frames[frame].positions;
+        return index < deltas.Length ? deltas[index] : float3.Zero;
     }
 
     /// <summary>
@@ -277,7 +280,9 @@ public struct PhosVertex
     public void SetBlendShapePositionDelta(string key, float3 delta, int frame = 0)
     {
         UpdateIndex();
-        mesh.GetBlendShape(key).Frames[frame].positions[index] = delta;
+        var f = mesh.GetBlendShape(key).Frames[frame];
+        f.EnsurePositions(System.Math.Max(mesh.VertexCount, index + 1));
+        f.positions[index] = delta;
     }
 
     /// <summary>
@@ -286,7 +291,8 @@ public struct PhosVertex
     public float3 GetBlendShapeNormalDelta(string key, int frame = 0)
     {
         UpdateIndex();
-        return mesh.GetBlendShape(key).Frames[frame].normals[index];
+        var deltas = mesh.GetBlendShape(key).Frames[frame].normals;
+        return index < deltas.Length ? deltas[index] : float3.Zero;
     }
 
     /// <summary>
@@ -304,7 +310,8 @@ public struct PhosVertex
     public float3 GetBlendShapeTangentDelta(string key, int frame = 0)
     {
         UpdateIndex();
-        return mesh.GetBlendShape(key).Frames[frame].tangents[index];
+        var deltas = mesh.GetBlendShape(key).Frames[frame].tangents;
+        return index < deltas.Length ? deltas[index] : float3.Zero;
     }
 
     /// <summary>

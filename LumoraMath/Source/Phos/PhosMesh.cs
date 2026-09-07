@@ -65,6 +65,12 @@ public class PhosMesh
         set => SetHasUV(0, value);
     }
 
+    public bool HasUV1s
+    {
+        get => uvChannels[1].HasData;
+        set => SetHasUV(1, value);
+    }
+
     /// <summary>Raw array of positions - direct access</summary>
     public float3[] RawPositions => positions;
 
@@ -279,6 +285,8 @@ public class PhosMesh
 
         Submeshes.Clear();
         BlendShapes.Clear();
+        _blendShapeByName.Clear();
+        _mappedBlendShapeCount = 0;
         bones.Clear();
     }
 
@@ -438,19 +446,143 @@ public class PhosMesh
 
     // Blend Shape Management
 
+    // A delta smaller than this in every component of every channel is one the exporter wrote out for
+    // completeness and nothing can ever see. Facial sources ship hundreds of them per mesh.
+    public const float BlendShapeDeltaEpsilon = 0.001f;
+
+    // BlendShapes stays a plain List because its ORDER is the public contract (renderers and drivers
+    // address shapes by index). The map is a lookup cache over that list, never a second source of
+    // truth: name lookup used to be a linear scan and decode does one lookup per shape, so a face mesh
+    // with 756 shapes burned a quarter of a million string compares before reading a single delta.
+    // Callers still append to the list directly, so a count that disagrees with the map rebuilds it.
+    // -xlinka
+    private readonly Dictionary<string, PhosBlendShape> _blendShapeByName = new Dictionary<string, PhosBlendShape>(StringComparer.Ordinal);
+    private int _mappedBlendShapeCount = -1;
+
+    // Rename or in-place replacement leaves the count unchanged, so it cannot be detected; say so here.
+    public void InvalidateBlendShapeMap() => _mappedBlendShapeCount = -1;
+
+    private Dictionary<string, PhosBlendShape> BlendShapeMap()
+    {
+        if (_mappedBlendShapeCount != BlendShapes.Count)
+        {
+            _blendShapeByName.Clear();
+            for (int i = 0; i < BlendShapes.Count; i++)
+            {
+                var key = BlendShapes[i].Name ?? string.Empty;
+                if (!_blendShapeByName.ContainsKey(key))
+                    _blendShapeByName[key] = BlendShapes[i];
+            }
+            _mappedBlendShapeCount = BlendShapes.Count;
+        }
+        return _blendShapeByName;
+    }
+
+    // Look up without creating, which the create-on-miss GetBlendShape cannot express.
+    public bool TryGetBlendShape(string name, out PhosBlendShape shape)
+        => BlendShapeMap().TryGetValue(name ?? string.Empty, out shape!);
+
+    // Frames come back unsized on purpose: the producer already holds packed delta arrays and assigns
+    // them whole, so allocating VertexCount here would only be overwritten and thrown away. Use
+    // PhosBlendShapeFrame.Allocate when the frame really is filled per vertex.
+    public PhosBlendShape AddBlendShape(string name, int frameCount = 1)
+    {
+        var shape = new PhosBlendShape(name, frameCount);
+        BlendShapes.Add(shape);
+
+        if (_mappedBlendShapeCount >= 0)
+        {
+            var key = shape.Name ?? string.Empty;
+            if (!_blendShapeByName.ContainsKey(key))
+                _blendShapeByName[key] = shape;
+            _mappedBlendShapeCount = BlendShapes.Count;
+        }
+        return shape;
+    }
+
     /// <summary>
     /// Get or create a blend shape by name.
     /// </summary>
     public PhosBlendShape GetBlendShape(string name)
     {
-        var existing = BlendShapes.FirstOrDefault(bs => bs.Name == name);
-        if (existing != null)
+        if (TryGetBlendShape(name, out var existing))
             return existing;
+        return AddBlendShape(name, 1);
+    }
 
-        var newShape = new PhosBlendShape(name, 1);
-        newShape.Frames[0].positions = new float3[VertexCount];
-        BlendShapes.Add(newShape);
-        return newShape;
+    // Drop every shape whose deltas are all below the epsilon, returning how many went. Reported
+    // indices are the ORIGINAL positions, ascending, because a caller remapping animation tracks needs
+    // to know where a shape used to sit, not where it ended up.
+    //
+    // Half of a real avatar's shapes are dead weight: the incident file carried 756 attachments of
+    // which 387 never moved a vertex, and every one of them was costing a dense per-vertex array in
+    // memory and a full block on disk. -xlinka
+    //
+    // epsilon is the caller's, because only the caller knows the model's scale: a delta that is noise on a
+    // metre-authored mesh is real motion on the same mesh authored in centimetres. Default keeps the old
+    // absolute behaviour for callers that have no bounds to hand.
+    public int StripEmptyBlendShapes(List<int>? removedIndices = null, float epsilon = BlendShapeDeltaEpsilon)
+    {
+        int reportStart = removedIndices?.Count ?? 0;
+        int removed = 0;
+
+        // Back to front: each removal then shifts only entries already examined.
+        for (int i = BlendShapes.Count - 1; i >= 0; i--)
+        {
+            if (!IsBlendShapeEmpty(BlendShapes[i], epsilon))
+                continue;
+
+            BlendShapes.RemoveAt(i);
+            removedIndices?.Add(i);
+            removed++;
+        }
+
+        if (removed > 0)
+        {
+            // Duplicate names make per-entry map removal ambiguous, and the map is only a cache.
+            InvalidateBlendShapeMap();
+            removedIndices?.Reverse(reportStart, removedIndices.Count - reportStart);
+        }
+        return removed;
+    }
+
+    private static bool IsBlendShapeEmpty(PhosBlendShape shape, float epsilon)
+    {
+        var frames = shape?.Frames;
+        if (frames == null)
+            return true;
+
+        for (int f = 0; f < frames.Length; f++)
+        {
+            var frame = frames[f];
+            if (frame == null)
+                continue;
+            // Normals and tangents are unit vectors whatever the model's units are, so a scale-derived
+            // epsilon does not apply to them: take whichever threshold is stricter and never let a large
+            // model's positional epsilon swallow real shading motion.
+            float directional = System.Math.Min(epsilon, BlendShapeDeltaEpsilon);
+            if (AnyDeltaAboveEpsilon(frame.positions, epsilon)
+                || AnyDeltaAboveEpsilon(frame.normals, directional)
+                || AnyDeltaAboveEpsilon(frame.tangents, directional))
+                return false;
+        }
+        return true;
+    }
+
+    private static bool AnyDeltaAboveEpsilon(float3[] deltas, float epsilon)
+    {
+        if (deltas == null)
+            return false;
+
+        for (int i = 0; i < deltas.Length; i++)
+        {
+            var d = deltas[i];
+            if (System.Math.Abs(d.x) >= epsilon
+                || System.Math.Abs(d.y) >= epsilon
+                || System.Math.Abs(d.z) >= epsilon)
+                return true;
+        }
+        return false;
     }
 
     /// <summary>Number of blend shapes on this mesh.</summary>
@@ -460,7 +592,7 @@ public class PhosMesh
     public int BlendShapeIndex(string name) => BlendShapes.FindIndex(bs => bs.Name == name);
 
     /// <summary>Whether a blend shape with this name exists.</summary>
-    public bool HasBlendShape(string name) => BlendShapeIndex(name) >= 0;
+    public bool HasBlendShape(string name) => BlendShapeMap().ContainsKey(name ?? string.Empty);
 
     // Utility Methods
 

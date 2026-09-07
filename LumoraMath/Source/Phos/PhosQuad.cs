@@ -165,21 +165,29 @@ public class PhosQuad : PhosShape
 
             switch (i)
             {
+                // V IS TOP-ORIGIN, matching every other UV producer in the engine.
+                //
+                // This used to put V=1 at the top, which is right on a renderer that samples V=0 at the
+                // BOTTOM row of a texture. Ours samples V=0 at row 0, and the rule is stated outright in
+                // TextureVariantStore: decoded rows stay top-down, imported mesh UVs are flipped per
+                // format to land top-origin, the glyph atlas uploads top-down and the UI puts V=0 on a
+                // quad's top edge. This primitive was the one dissenter, so every textured procedural
+                // quad drew upside down, and two places had grown local flips to compensate. -xlinka
                 case 0: // Upper left
                     cornerPos = new float3(-halfSize.x, halfSize.y, 0f);
-                    cornerUV = new float2(0f, 1f);
+                    cornerUV = new float2(0f, 0f);
                     break;
                 case 1: // Upper right
                     cornerPos = new float3(halfSize.x, halfSize.y, 0f);
-                    cornerUV = new float2(1f, 1f);
+                    cornerUV = new float2(1f, 0f);
                     break;
                 case 2: // Lower right
                     cornerPos = new float3(halfSize.x, -halfSize.y, 0f);
-                    cornerUV = new float2(1f, 0f);
+                    cornerUV = new float2(1f, 1f);
                     break;
                 case 3: // Lower left
                     cornerPos = new float3(-halfSize.x, -halfSize.y, 0f);
-                    cornerUV = new float2(0f, 0f);
+                    cornerUV = new float2(0f, 1f);
                     break;
                 default:
                     cornerPos = float3.Zero;

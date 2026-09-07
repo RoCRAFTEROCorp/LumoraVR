@@ -180,6 +180,27 @@ public struct float3 : IEquatable<float3>
         return MathF.Acos(dot);
     }
 
+    // Swing `from` toward `to` but never further than maxAngle radians away from it: the result sits on
+    // the cone of half-angle maxAngle around `to`, in the plane the two already span. This is the shape a
+    // neck has - the body may trail the head by so much and no more - and it is what a plain lerp cannot
+    // express, because a lerp has no notion of "close enough already, leave it alone". -xlinka
+    public static float3 LimitSwing(float3 from, float3 to, float maxAngle)
+    {
+        float lenSq = from.LengthSquared;
+        if (lenSq < float.Epsilon || to.LengthSquared < float.Epsilon)
+            return to;
+
+        float angle = Angle(from, to);
+        if (angle <= maxAngle)
+            return from;
+
+        float3 axis = Cross(to, from);
+        if (axis.LengthSquared < 1e-12f)
+            return from;   // exactly opposed: no unique plane, so leave it where it is
+
+        return floatQ.AxisAngleRad(axis.Normalized, maxAngle) * to.Normalized * MathF.Sqrt(lenSq);
+    }
+
     // Operators
     public static float3 operator +(float3 a, float3 b) => new float3(a.x + b.x, a.y + b.y, a.z + b.z);
     public static float3 operator -(float3 a, float3 b) => new float3(a.x - b.x, a.y - b.y, a.z - b.z);
