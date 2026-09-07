@@ -18,9 +18,23 @@ public static class TextureGpuCache
 {
     public const string Extension = ".lvgpu";
 
-    public static string BuildKey(string uri, TextureVariantId? variant, int width, int height, int mipCount)
+    // Set once at startup by the render layer, which is the only thing that knows what this device can
+    // sample. It is PART OF THE KEY: a blob baked as BPTC on a desktop and one baked as ASTC on a
+    // headset are different bytes for the same picture, and without the tag they hash the same and the
+    // wrong one gets handed over. Empty until set, which keys the same as the old scheme did. -xlinka
+    public static string CompressionTag { get; set; } = string.Empty;
+
+    // The per-texture inputs the format decision reads. Alpha is a property of the pixels and so of
+    // the address, but the normal-map flag comes from the descriptor and two providers can load the
+    // same address with it set differently; both would otherwise hash to one blob and one of them
+    // would be handed the other's format. HDR is in for the same reason it is in the sidecar: a
+    // blob baked as BC6H and one baked as BC1 must never share a name. -xlinka
+    public static string Intent(bool hasAlpha, bool isNormalMap, bool isHdr) =>
+        string.Concat(hasAlpha ? "a1" : "a0", isNormalMap ? "n1" : "n0", isHdr ? "h1" : "h0");
+
+    public static string BuildKey(string uri, TextureVariantId? variant, int width, int height, int mipCount, string? intent = null)
     {
-        string identity = $"{uri}|{variant?.Identifier ?? "src"}|{width}x{height}|{mipCount}";
+        string identity = $"{uri}|{variant?.Identifier ?? "src"}|{width}x{height}|{mipCount}|{CompressionTag}|{intent ?? string.Empty}";
         using var sha = System.Security.Cryptography.SHA256.Create();
         var hash = sha.ComputeHash(System.Text.Encoding.UTF8.GetBytes(identity));
         return Convert.ToHexString(hash, 0, 16).ToLowerInvariant();
@@ -38,11 +52,11 @@ public static class TextureGpuCache
     // is that a cached rung skips both the decode and the compression, so a second visit to the same
     // world can go straight to full quality instead of paying for preview rungs it will throw away
     // milliseconds later.
-    public static bool IsCached(LocalDB? db, string uri, TextureVariantId? variant, int width, int height, int mipCount)
+    public static bool IsCached(LocalDB? db, string uri, TextureVariantId? variant, int width, int height, int mipCount, string? intent = null)
     {
         if (db == null || string.IsNullOrEmpty(uri) || width <= 0 || height <= 0)
             return false;
-        var path = GetPath(db, BuildKey(uri, variant, width, height, mipCount));
+        var path = GetPath(db, BuildKey(uri, variant, width, height, mipCount, intent));
         try
         {
             return path != null && File.Exists(path);

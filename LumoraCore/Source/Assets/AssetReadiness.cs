@@ -11,6 +11,10 @@ namespace Lumora.Core.Assets;
 public interface IUrlAssetProvider
 {
     bool IsLoadPending { get; }
+
+    // The address the fetch was issued for, so a surface stuck on the loading skin can say WHICH asset
+    // never arrived instead of just that something did not. -xlinka
+    Uri? SourceUrl { get; }
 }
 
 // A provider that GENERATES its asset in-process (a checker, a gradient, a rounded rect, a render

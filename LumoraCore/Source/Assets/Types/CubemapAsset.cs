@@ -112,6 +112,16 @@ public class CubemapAsset : ImplementableAsset<ICubemapAssetHook>
         int width, height;
         try
         {
+            // An HDR panorama cannot go through the 8-bit decoder. Radiance would come back tone-mapped
+            // and an EXR would fail with a decode error that says nothing useful, and in both cases the
+            // sky quietly loses the range it was chosen for. Refuse it with a reason instead: a skybox
+            // that does not load is a question, a skybox that loads wrong is a bug hunt. -xlinka
+            if (TextureMetadata.DetectHdr(bytes))
+            {
+                FailLoad($"HDR panoramas are not supported yet (needs a half-float projector): {AssetURL}");
+                return;
+            }
+
             panorama = TextureVariantStore.DecodeRgba(bytes, out width, out height);
         }
         catch (Exception ex)

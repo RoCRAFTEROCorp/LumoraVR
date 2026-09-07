@@ -44,6 +44,27 @@ public abstract class MaterialProvider : DynamicAssetProvider<MaterialAsset>, IP
         }
     }
 
+    // What is holding this material back. Read only by the one-shot log a renderer emits when a surface has
+    // worn the loading skin far longer than any load takes - never per frame. -xlinka
+    public string DescribePendingDependency()
+    {
+        var members = _assetRefMembers ??= CollectAssetRefMembers();
+        for (int i = 0; i < members.Length; i++)
+        {
+            if (GetSyncMember(members[i]) is not IAssetRef reference)
+                continue;
+
+            var target = reference.Target;
+            if (!AssetReadiness.IsPending(target, inspectDependencies: false))
+                continue;
+
+            string url = (target as IUrlAssetProvider)?.SourceUrl?.ToString() ?? "<no url>";
+            string state = (target?.GenericAsset as Asset)?.LoadState.ToString() ?? "no asset yet";
+            return $"{GetSyncMemberName(members[i])} -> {target?.GetType().Name ?? "null"} [{state}] {url}";
+        }
+        return "nothing pending - the material asset itself has not been built";
+    }
+
     private int[] CollectAssetRefMembers()
     {
         int count = 0;

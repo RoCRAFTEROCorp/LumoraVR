@@ -41,13 +41,13 @@ public static class CloudVariants
 
     private static async Task<bool> TryFetchAsync(LocalDB db, LumoraClient client, string baseUri, string hash, TextureVariantId id)
     {
-        string key = hash + "|" + id.Identifier;
+        string key = hash + "|" + id.Storage.Identifier;
         lock (_gate)
         {
             if (_asked.TryGetValue(key, out var done) && done)
                 return false;
         }
-        var state = await client.GetVariantState(hash, id.Identifier).ConfigureAwait(false);
+        var state = await client.GetVariantState(hash, id.Storage.Identifier).ConfigureAwait(false);
         if (state.Failed || state.Data == null)
             return false;
         if (state.Data.IsSkipped)
@@ -60,7 +60,7 @@ public static class CloudVariants
         var blob = await client.FetchContent(state.Data.ResultHash!).ConfigureAwait(false);
         if (blob.Failed || blob.Data == null || blob.Data.Length == 0)
             return false;
-        await db.SaveDerivedAssetAsync(baseUri, id.Identifier, blob.Data, TextureVariantStore.VariantExtension).ConfigureAwait(false);
+        await db.SaveDerivedAssetAsync(baseUri, id.Storage.Identifier, blob.Data, TextureVariantStore.VariantExtension).ConfigureAwait(false);
         lock (_gate) _asked[key] = true;
         return true;
     }

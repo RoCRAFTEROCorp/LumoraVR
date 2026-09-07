@@ -63,6 +63,14 @@ public readonly struct TextureVariantId : IEquatable<TextureVariantId>
 
     public bool IsOriginal => MaxSize <= 0;
 
+    // The address a variant's BYTES live under. The compression axis is an upload intent: the
+    // generated blob is RGBA8 either way, so a texture that opted out of block compression reads
+    // the same rung everyone else does and only differs in what the renderer does with it. Without
+    // this the opt-out silently lost the resolution cap, because nobody generates a "compnone"
+    // blob and the load fell through to the full-size source. -xlinka
+    public TextureVariantId Storage =>
+        Compression == TextureCompressionKind.Block ? this : new TextureVariantId(MaxSize, Mipmaps, TextureCompressionKind.Block, Version);
+
     // Stable identifier, e.g. v1-max1024-mips1-compblock. Safe as both a URI path segment
     // and a filename fragment.
     public string Identifier =>

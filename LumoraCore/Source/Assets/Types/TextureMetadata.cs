@@ -21,6 +21,14 @@ public enum TextureFormatKind
     BC4_R,
     BC5_RG,
     BC7_RGBA,
+    // Appended after the first release of the sidecar: the name is what gets persisted, so order
+    // above this line is frozen. Half-float RGBA is the uncompressed HDR layout; BC6H is the only
+    // HDR block format we produce; the ETC2/ASTC entries are what a headset actually holds. -xlinka
+    RGBA16F,
+    BC6H_RGB,
+    ETC2_RGB8,
+    ETC2_RGBA8,
+    ASTC_4x4,
 }
 
 public static class TextureFormatKindExtensions
@@ -29,15 +37,17 @@ public static class TextureFormatKindExtensions
     public static bool IsBlockCompressed(this TextureFormatKind format) => format switch
     {
         TextureFormatKind.BC1_RGB or TextureFormatKind.BC3_RGBA or TextureFormatKind.BC4_R
-            or TextureFormatKind.BC5_RG or TextureFormatKind.BC7_RGBA => true,
+            or TextureFormatKind.BC5_RG or TextureFormatKind.BC7_RGBA or TextureFormatKind.BC6H_RGB
+            or TextureFormatKind.ETC2_RGB8 or TextureFormatKind.ETC2_RGBA8 or TextureFormatKind.ASTC_4x4 => true,
         _ => false,
     };
 
     // 0 when the format is not block compressed.
     public static int BlockBytes(this TextureFormatKind format) => format switch
     {
-        TextureFormatKind.BC1_RGB or TextureFormatKind.BC4_R => 8,
-        TextureFormatKind.BC3_RGBA or TextureFormatKind.BC5_RG or TextureFormatKind.BC7_RGBA => 16,
+        TextureFormatKind.BC1_RGB or TextureFormatKind.BC4_R or TextureFormatKind.ETC2_RGB8 => 8,
+        TextureFormatKind.BC3_RGBA or TextureFormatKind.BC5_RG or TextureFormatKind.BC7_RGBA
+            or TextureFormatKind.BC6H_RGB or TextureFormatKind.ETC2_RGBA8 or TextureFormatKind.ASTC_4x4 => 16,
         _ => 0,
     };
 
@@ -48,14 +58,20 @@ public static class TextureFormatKindExtensions
         TextureFormatKind.RG8 => 2,
         TextureFormatKind.RGB8 => 3,
         TextureFormatKind.RGBA8 => 4,
+        TextureFormatKind.RGBA16F => 8,
         _ => 0,
     };
 
     public static bool HasAlphaChannel(this TextureFormatKind format) => format switch
     {
-        TextureFormatKind.RGBA8 or TextureFormatKind.BC3_RGBA or TextureFormatKind.BC7_RGBA => true,
+        TextureFormatKind.RGBA8 or TextureFormatKind.BC3_RGBA or TextureFormatKind.BC7_RGBA
+            or TextureFormatKind.RGBA16F or TextureFormatKind.ETC2_RGBA8 or TextureFormatKind.ASTC_4x4 => true,
         _ => false,
     };
+
+    // Range beyond 1.0 survives in these; every other kind clips to the unit range.
+    public static bool IsHdr(this TextureFormatKind format) =>
+        format is TextureFormatKind.RGBA16F or TextureFormatKind.BC6H_RGB;
 
     public static string Label(this TextureFormatKind format) => format switch
     {
@@ -64,6 +80,11 @@ public static class TextureFormatKindExtensions
         TextureFormatKind.BC4_R => "BC4",
         TextureFormatKind.BC5_RG => "BC5",
         TextureFormatKind.BC7_RGBA => "BC7",
+        TextureFormatKind.BC6H_RGB => "BC6H",
+        TextureFormatKind.ETC2_RGB8 => "ETC2 RGB",
+        TextureFormatKind.ETC2_RGBA8 => "ETC2 RGBA",
+        TextureFormatKind.ASTC_4x4 => "ASTC 4x4",
+        TextureFormatKind.RGBA16F => "RGBA16F",
         TextureFormatKind.Unknown => "unknown",
         _ => format.ToString(),
     };
@@ -105,6 +126,11 @@ public sealed class TextureMetadata
 
     // Never guessed from file name or pixel statistics.
     public bool IsNormalMap { get; init; }
+
+    // Decoded from a floating-point source (Radiance or EXR). The pixels are RGBA half floats, the
+    // resolution ladder does not apply, and no format that clips to the unit range may ever be
+    // chosen for it. Set from the file's own signature, never from pixel statistics. -xlinka
+    public bool IsHdr { get; init; }
 
     // Null for the base asset.
     public string? VariantId { get; init; }
@@ -227,6 +253,61 @@ public sealed class TextureMetadata
         };
     }
 
+    // Half-float twin of Analyze. Only alpha is worth scanning: a grayscale or unused-blue test
+    // means nothing for radiance data and nothing downstream picks a narrower HDR layout anyway.
+    // Alpha counts as present when any texel's alpha half is not exactly 1.0 (0x3C00). -xlinka
+    public static TextureMetadata AnalyzeHalf(
+        byte[] rgbaHalf,
+        int width,
+        int height,
+        int mipCount,
+        long sourceBytes,
+        long decodedBytes,
+        bool isNormalMap,
+        string? variantId = null)
+    {
+        bool hasAlpha = false;
+        int pixels = width * height;
+        if (rgbaHalf != null && pixels > 0 && rgbaHalf.LongLength >= (long)pixels * 8)
+        {
+            for (int i = 0, o = 6; i < pixels; i++, o += 8)
+            {
+                if (rgbaHalf[o] != 0x00 || rgbaHalf[o + 1] != 0x3C)
+                {
+                    hasAlpha = true;
+                    break;
+                }
+            }
+        }
+
+        return new TextureMetadata
+        {
+            Width = width,
+            Height = height,
+            ContentFormat = TextureFormatKind.RGBA16F,
+            HasAlpha = hasAlpha,
+            MipCount = System.Math.Max(1, mipCount),
+            SourceBytes = sourceBytes,
+            DecodedBytes = decodedBytes,
+            SRgb = false,
+            IsNormalMap = isNormalMap,
+            IsHdr = true,
+            VariantId = variantId,
+        };
+    }
+
+    // Radiance starts with "#?RADIANCE" or "#?RGBE"; OpenEXR starts with the magic 76 2F 31 01.
+    // Both are floating-point formats, and an 8-bit decode of either silently tone-maps the
+    // picture, which is why this runs BEFORE any decoder sees the bytes. -xlinka
+    public static bool DetectHdr(byte[]? encoded)
+    {
+        if (encoded == null || encoded.Length < 4)
+            return false;
+        if (encoded[0] == 0x76 && encoded[1] == 0x2F && encoded[2] == 0x31 && encoded[3] == 0x01)
+            return true;
+        return encoded[0] == (byte)'#' && encoded[1] == (byte)'?';
+    }
+
     // PNG carries sRGB / iCCP / gAMA chunks; JPEG carries an APP2 ICC_PROFILE segment. Anything else, or a file
     // that says nothing, returns null - unknown stays unknown.
     public static bool? DetectSRgb(byte[] encoded)
@@ -323,6 +404,7 @@ public sealed class TextureMetadata
         bag[KeyPrefix + "sourceBytes"] = SourceBytes.ToString(CultureInfo.InvariantCulture);
         bag[KeyPrefix + "decodedBytes"] = DecodedBytes.ToString(CultureInfo.InvariantCulture);
         bag[KeyPrefix + "normalMap"] = IsNormalMap ? "1" : "0";
+        bag[KeyPrefix + "hdr"] = IsHdr ? "1" : "0";
         if (SRgb.HasValue)
             bag[KeyPrefix + "srgb"] = SRgb.Value ? "1" : "0";
         else
@@ -368,6 +450,7 @@ public sealed class TextureMetadata
             DecodedBytes = ReadLong("decodedBytes"),
             SRgb = srgb,
             IsNormalMap = ReadBool("normalMap"),
+            IsHdr = ReadBool("hdr"),
             VariantId = bag.TryGetValue(KeyPrefix + "variant", out var variant) ? variant : null,
         };
     }

@@ -20,6 +20,17 @@ public class SyncAssetList<A> : SyncList<AssetRef<A>> where A : Asset
     {
         ElementsAdded += (_, _, _) => OnChanged?.Invoke(this);
         ElementsRemoved += (_, _, _) => OnChanged?.Invoke(this);
+
+    }
+
+    // A material in the list finishing its load is a change to the list AS FAR AS A RENDERER IS
+    // CONCERNED, even though the list structure never moved. Relaying only structural edits meant a
+    // surface whose material arrived late kept its loading placeholder until something unrelated
+    // happened to dirty the renderer - which is exactly the "sometimes the shader loads, sometimes it
+    // doesn't" you get from a race. Called by the element's own AssetRef. -xlinka
+    internal void ElementAssetUpdated()
+    {
+        OnChanged?.Invoke(this);
     }
 
     public SyncAssetList(Component owner) : this()

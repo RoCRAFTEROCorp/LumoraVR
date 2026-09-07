@@ -77,6 +77,9 @@ public class AssetRef<A> : SyncRef<IAssetProvider<A>>, IAssetRef where A : Asset
     public void AssetUpdated()
     {
         SyncElementChanged();
+        // If this ref lives in a list, the list has to say so too - a renderer watches the LIST, not
+        // each element, so a late-loading material would otherwise never reach it.
+        (Parent as SyncAssetList<A>)?.ElementAssetUpdated();
     }
 
     public override void Dispose()

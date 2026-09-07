@@ -21,6 +21,15 @@ public class AssetManager : IDisposable
     // Assets reach the engine through here, not the global Engine.Current.
     public Engine Engine { get; }
 
+    // At most one heavy source-format parse (Assimp and friends) anywhere in the process at a time.
+    // One parse of a real avatar is seconds of CPU and gigabytes of transient allocation, and three
+    // measured concurrently showed ZERO parallel speedup while multiplying the peak until the machine
+    // paged and the world thread starved. Serializing them costs nothing in throughput and is the
+    // difference between a bounded import and an out-of-memory. Baked .lmesh reads must never take
+    // this: they are a buffer copy, and gating them would queue a whole scene load behind one FBX.
+    // -xlinka
+    internal static readonly System.Threading.SemaphoreSlim SourceParseGate = new(1, 1);
+
     public AssetManager(Engine engine)
     {
         Engine = engine;
@@ -39,7 +48,13 @@ public class AssetManager : IDisposable
         if (assetURL == null)
             return Task.FromResult<byte[]>(null!);
 
-        var tcs = new TaskCompletionSource<byte[]>();
+        // RunContinuationsAsynchronously, always. TrySetResult is called from inside the world update,
+        // and on a default TCS every awaiter parked on this gather resumes INLINE on the completer's
+        // thread - so a batch of mesh or texture decodes would run one after another inside a single
+        // world frame. Whether that happens is otherwise decided by whether the completing thread
+        // happens to carry a SynchronizationContext, which is not a decision anyone made. Forcing the
+        // continuations onto the pool makes the placement ours instead of an accident. -xlinka
+        var tcs = new TaskCompletionSource<byte[]>(TaskCreationOptions.RunContinuationsAsynchronously);
         // OriginalString, not ToString(): System.Uri lowercases the authority, and for a local://
         // asset the authority IS the owning machine's id. The peer transferer resolves an owner by
         // matching that id against the connected users' MachineID, which is case-sensitive, so a

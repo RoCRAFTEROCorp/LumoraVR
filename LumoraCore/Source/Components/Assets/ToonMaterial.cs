@@ -216,7 +216,9 @@ public class ToonMaterial : MaterialProvider, ICommonMaterial
         asset.SetFloat("RimBoundary", RimBoundary.Value);
 
         asset.SetColor("OutlineColor", OutlineColor.Value);
-        asset.SetFloat("OutlineWidth", System.Math.Clamp(OutlineWidth.Value, 0f, 0.1f));
+        // Mat_ToonOutline extrudes the hull in MODEL SPACE METRES, so 0.1 is a ten centimetre shell,
+        // not a thick line. Millimetres is the useful range. Same unit trap as XiexeToonMaterial. -xlinka
+        asset.SetFloat("OutlineWidth", System.Math.Clamp(OutlineWidth.Value, 0f, 0.005f));
 
         asset.SetTexture("MatcapTexture", MatcapTexture.Asset);
         asset.SetBool("UseMatcapTexture", MatcapTexture.Asset != null);

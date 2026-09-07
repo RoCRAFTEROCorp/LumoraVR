@@ -2,30 +2,57 @@
 // Licensed under the LumoraVR Source Available License. See LICENSE in the project root.
 
 using System;
+using System.Buffers.Binary;
 using System.IO;
 using System.Text;
+using K4os.Compression.LZ4;
 using Lumora.Core.Math;
 using Lumora.Core.Phos;
+using LumoraLogger = Lumora.Core.Logging.Logger;
 
 namespace Lumora.Core.Assets;
 
-/// <summary>
-/// Binary (de)serializer for a PhosMesh - the ".lmesh" on-disk/asset format. Engine-agnostic: it only
-/// touches PhosMesh's public surface, no Godot. This is what lets a skinned avatar mesh travel as a
-/// single content-hashed asset instead of tens of thousands of replicated data-model elements.
-///
-/// Every read is bounds-checked and the whole decode is wrapped so a malformed/truncated blob throws a
-/// clean InvalidDataException instead of corrupting state or crashing. -xlinka
-/// </summary>
+// Binary (de)serializer for a PhosMesh - the ".lmesh" on-disk/asset format. Engine-agnostic: it only
+// touches PhosMesh's public surface, no Godot. This is what lets a skinned avatar mesh travel as a
+// single content-hashed asset instead of tens of thousands of replicated data-model elements.
+//
+// Every read is bounds-checked and the whole decode is wrapped so a malformed/truncated blob throws a
+// clean InvalidDataException instead of corrupting state or crashing.
+//
+// LAYOUT
+//   magic "LMSH" (4) | version (4) | ...
+//   v1: the body follows the version directly, uncompressed, blend shape deltas dense, UV channels a
+//       contiguous count. Files in this shape are already in local caches, so v1 stays readable.
+//   v2: container flags (1) + uncompressed body length (4), then the body, LZ4 block compressed when
+//       that actually shrinks it. Inside, blend shape frames are SPARSE (moved-vertex indices plus
+//       deltas for only those vertices) and UV channels carry a presence bitmask.
+//
+// Sparse frames are the whole point of v2. A real avatar moves almost nothing: 7,209,317 vertex-shapes
+// across 756 attachments, of which 490,228 move. Dense costs 139 MB of deltas that are 93% zeros; the
+// index+delta form costs about 18 MB before compression. It expands back to dense on read because the
+// upload path and the mesh hooks both require dense arrays, so nothing downstream has to change.
+// -xlinka
 public static class PhosMeshSerializer
 {
     private static readonly byte[] Magic = { (byte)'L', (byte)'M', (byte)'S', (byte)'H' };
-    private const int Version = 1;
+
+    private const int CurrentVersion = 2;
+    private const int LegacyDenseVersion = 1;
+
+    // magic(4) + version(4) + container flags(1) + uncompressed body length(4)
+    private const int HeaderBytes = 13;
+
+    private const byte ContainerCompressed = 1 << 0;
 
     // Sanity caps so a hostile/garbage header can't make us allocate or loop unbounded. -xlinka
     private const int MaxVertices = 8_000_000;
     private const int MaxCount = 8_000_000;
     private const int MaxNameBytes = 4096;
+    private const int MaxBodyBytes = 768 * 1024 * 1024;
+
+    // A delta under a micrometre in model units cannot show on screen and is exporter float noise, so
+    // it is not worth an index and twelve bytes. Anything at or above it is kept verbatim. -xlinka
+    private const float MovedEpsilon = 1e-6f;
 
     // Geometry flags packed into one byte.
     [Flags]
@@ -38,111 +65,92 @@ public static class PhosMeshSerializer
         BoneBindings = 1 << 3,
     }
 
+    [Flags]
+    private enum FrameFlags : byte
+    {
+        None = 0,
+        Normals = 1 << 0,
+        Tangents = 1 << 1,
+    }
+
+    // What one blend shape frame will actually put on disk, worked out once so the measuring pass and
+    // the emitting pass agree byte for byte and neither rescans seven million vertex-shapes twice.
+    private struct FramePlan
+    {
+        public int[] Moved;
+        public bool HasNormals;
+        public bool HasTangents;
+    }
+
     public static byte[] Serialize(PhosMesh mesh)
     {
         if (mesh == null) throw new ArgumentNullException(nameof(mesh));
 
-        using var ms = new MemoryStream();
+        // Refuse a topology the reader cannot reconstruct, BEFORE anything is written. A blob that
+        // round-trips only one way still gets content-hashed into the database and then fails on every
+        // load forever, which is worse than not baking it. -xlinka
+        for (int i = 0; i < mesh.Submeshes.Count; i++)
+        {
+            var topology = mesh.Submeshes[i].Topology;
+            if (topology != PhosTopology.Triangles && topology != PhosTopology.Points)
+                throw new NotSupportedException(
+                    $"Submesh {i} of {mesh.Submeshes.Count} has topology {topology}; .lmesh reads back only Triangles and Points.");
+        }
+
+        int vc = mesh.VertexCount;
+
+        // Presence per channel, not a contiguous count: writing a count of 4 for a mesh that only has
+        // UV0 and UV3 makes the reader materialise empty channels 1 and 2 that the source never had.
+        byte uvMask = 0;
+        for (int ch = 0; ch < 4; ch++)
+        {
+            if (GetUVChannel(mesh, ch).Length > 0)
+                uvMask |= (byte)(1 << ch);
+        }
+
+        var plan = BuildBlendPlan(mesh, vc);
+
+        // Measure with the same writer that emits, so the pre-sized buffer can never disagree with the
+        // layout. A MemoryStream that doubles and then hands out ToArray() peaks at two to three times
+        // the blob at exactly the moment we are trying to hold memory down. -xlinka
+        long measured;
+        var counter = new CountingStream();
+        using (var cw = new BinaryWriter(counter, Encoding.UTF8, leaveOpen: true))
+        {
+            WriteBody(cw, mesh, vc, uvMask, plan, reportTruncation: true);
+            cw.Flush();
+            measured = counter.Length;
+        }
+
+        if (measured > MaxBodyBytes)
+            throw new InvalidDataException($"Serialized mesh body is {measured} bytes, over the {MaxBodyBytes} cap.");
+
+        int bodyLength = (int)measured;
+        var raw = new byte[HeaderBytes + bodyLength];
+        using (var ms = new MemoryStream(raw, HeaderBytes, bodyLength, writable: true, publiclyVisible: true))
         using (var w = new BinaryWriter(ms, Encoding.UTF8, leaveOpen: true))
         {
-            w.Write(Magic);
-            w.Write(Version);
-
-            int vc = mesh.VertexCount;
-            w.Write(vc);
-
-            var flags = MeshFlags.None;
-            if (mesh.HasNormals) flags |= MeshFlags.Normals;
-            if (mesh.HasTangents) flags |= MeshFlags.Tangents;
-            if (mesh.HasColors) flags |= MeshFlags.Colors;
-            if (mesh.HasBoneBindings) flags |= MeshFlags.BoneBindings;
-            w.Write((byte)flags);
-
-            int uvCount = System.Math.Clamp(mesh.UVChannelCount, 0, 4);
-            w.Write(uvCount);
-
-            // Per-vertex blocks (read up to VertexCount, never array.Length - the backing arrays are
-            // intentionally over-allocated). -xlinka
-            var pos = mesh.RawPositions;
-            for (int i = 0; i < vc; i++) WriteFloat3(w, pos[i]);
-
-            if (flags.HasFlag(MeshFlags.Normals))
-            {
-                var n = mesh.RawNormals;
-                for (int i = 0; i < vc; i++) WriteFloat3(w, n[i]);
-            }
-            if (flags.HasFlag(MeshFlags.Tangents))
-            {
-                var t = mesh.RawTangents;
-                for (int i = 0; i < vc; i++) WriteFloat4(w, t[i]);
-            }
-            if (flags.HasFlag(MeshFlags.Colors))
-            {
-                var c = mesh.RawColors;
-                for (int i = 0; i < vc; i++) WriteColor(w, c[i]);
-            }
-            if (flags.HasFlag(MeshFlags.BoneBindings))
-            {
-                var b = mesh.RawBoneBindings;
-                for (int i = 0; i < vc; i++)
-                {
-                    WriteFloat4(w, b[i].boneIndices);
-                    WriteFloat4(w, b[i].boneWeights);
-                }
-            }
-
-            for (int ch = 0; ch < uvCount; ch++)
-            {
-                var uv = GetUVChannel(mesh, ch);
-                for (int i = 0; i < vc; i++)
-                    WriteFloat2(w, i < uv.Length ? uv[i] : float2.Zero);
-            }
-
-            // Submeshes
-            w.Write(mesh.Submeshes.Count);
-            foreach (var sm in mesh.Submeshes)
-            {
-                w.Write((int)sm.Topology);
-                int idxCount = sm.IndexCount;
-                w.Write(idxCount);
-                var idx = sm.RawIndices;
-                for (int i = 0; i < idxCount; i++) w.Write(idx[i]);
-            }
-
-            // Bone table (name + bind pose)
-            w.Write(mesh.BoneCount);
-            for (int i = 0; i < mesh.BoneCount; i++)
-            {
-                var bone = mesh.GetBone(i);
-                WriteString(w, bone.Name);
-                WriteMatrix(w, bone.BindPose);
-            }
-
-            // Blend shapes
-            w.Write(mesh.BlendShapes.Count);
-            foreach (var shape in mesh.BlendShapes)
-            {
-                WriteString(w, shape.Name ?? string.Empty);
-                int frameCount = shape.Frames?.Length ?? 0;
-                w.Write(frameCount);
-                for (int f = 0; f < frameCount; f++)
-                {
-                    var frame = shape.Frames![f];
-                    bool hasN = frame != null && frame.normals != null && frame.normals.Length > 0;
-                    bool hasT = frame != null && frame.tangents != null && frame.tangents.Length > 0;
-                    w.Write(hasN);
-                    w.Write(hasT);
-
-                    for (int i = 0; i < vc; i++)
-                        WriteFloat3(w, SafeGet(frame?.positions, i));
-                    if (hasN)
-                        for (int i = 0; i < vc; i++) WriteFloat3(w, SafeGet(frame!.normals, i));
-                    if (hasT)
-                        for (int i = 0; i < vc; i++) WriteFloat3(w, SafeGet(frame!.tangents, i));
-                }
-            }
+            WriteBody(w, mesh, vc, uvMask, plan, reportTruncation: false);
+            w.Flush();
         }
-        return ms.ToArray();
+
+        var scratch = new byte[HeaderBytes + LZ4Codec.MaximumOutputSize(bodyLength)];
+        int written = LZ4Codec.Encode(raw.AsSpan(HeaderBytes, bodyLength), scratch.AsSpan(HeaderBytes), LZ4Level.L09_HC);
+        if (written > 0 && written < bodyLength)
+        {
+            // Release the uncompressed body before the trim copy so only one large allocation is
+            // standing at the peak.
+            raw = null!;
+            if (scratch.Length != HeaderBytes + written)
+                Array.Resize(ref scratch, HeaderBytes + written);
+            WriteHeader(scratch, ContainerCompressed, bodyLength);
+            return scratch;
+        }
+
+        // Already-packed data (small meshes, anything the codec cannot beat) stays raw and costs no
+        // copy at all: the header space was reserved at the front of this same buffer.
+        WriteHeader(raw, 0, bodyLength);
+        return raw;
     }
 
     public static PhosMesh Deserialize(byte[] data)
@@ -151,155 +159,428 @@ public static class PhosMeshSerializer
 
         try
         {
-            using var ms = new MemoryStream(data, writable: false);
-            using var r = new BinaryReader(ms, Encoding.UTF8, leaveOpen: true);
-
-            var magic = r.ReadBytes(4);
-            if (magic.Length != 4 || magic[0] != Magic[0] || magic[1] != Magic[1] || magic[2] != Magic[2] || magic[3] != Magic[3])
+            if (data.Length < 8 ||
+                data[0] != Magic[0] || data[1] != Magic[1] || data[2] != Magic[2] || data[3] != Magic[3])
                 throw new InvalidDataException("Not an .lmesh blob (bad magic).");
 
-            int version = r.ReadInt32();
-            if (version != Version)
-                throw new InvalidDataException($"Unsupported .lmesh version {version} (expected {Version}).");
+            int version = BinaryPrimitives.ReadInt32LittleEndian(data.AsSpan(4));
 
-            int vc = r.ReadInt32();
-            if (vc < 0 || vc > MaxVertices)
-                throw new InvalidDataException($"Vertex count {vc} out of range.");
-
-            var flags = (MeshFlags)r.ReadByte();
-            int uvCount = r.ReadInt32();
-            if (uvCount < 0 || uvCount > 4)
-                throw new InvalidDataException($"UV channel count {uvCount} out of range.");
-
-            var mesh = new PhosMesh();
-
-            // Set flags BEFORE growing the vertex arrays so IncreaseVertexCount allocates them. -xlinka
-            mesh.HasNormals = flags.HasFlag(MeshFlags.Normals);
-            mesh.HasTangents = flags.HasFlag(MeshFlags.Tangents);
-            mesh.HasColors = flags.HasFlag(MeshFlags.Colors);
-            mesh.HasBoneBindings = flags.HasFlag(MeshFlags.BoneBindings);
-            if (mesh.HasBoneBindings) mesh.EnsureBoneBindings();
-
-            if (vc > 0) mesh.IncreaseVertexCount(vc);
-
-            var pos = mesh.RawPositions;
-            for (int i = 0; i < vc; i++) pos[i] = ReadFloat3(r);
-
-            if (mesh.HasNormals)
+            if (version == LegacyDenseVersion)
             {
-                var n = mesh.RawNormals;
-                for (int i = 0; i < vc; i++) n[i] = ReadFloat3(r);
-            }
-            if (mesh.HasTangents)
-            {
-                var t = mesh.RawTangents;
-                for (int i = 0; i < vc; i++) t[i] = ReadFloat4(r);
-            }
-            if (mesh.HasColors)
-            {
-                var c = mesh.RawColors;
-                for (int i = 0; i < vc; i++) c[i] = ReadColor(r);
-            }
-            if (mesh.HasBoneBindings)
-            {
-                var b = mesh.RawBoneBindings;
-                for (int i = 0; i < vc; i++)
-                {
-                    var indices = ReadFloat4(r);
-                    var weights = ReadFloat4(r);
-                    b[i] = new PhosBoneBinding(indices, weights);
-                }
+                using var legacy = new MemoryStream(data, 8, data.Length - 8, writable: false);
+                using var lr = new BinaryReader(legacy, Encoding.UTF8, leaveOpen: true);
+                return ReadBody(lr, version);
             }
 
-            for (int ch = 0; ch < uvCount; ch++)
+            if (version != CurrentVersion)
+                throw new InvalidDataException($"Unsupported .lmesh version {version} (expected {LegacyDenseVersion} or {CurrentVersion}).");
+
+            if (data.Length < HeaderBytes)
+                throw new InvalidDataException("Truncated .lmesh blob.");
+
+            byte container = data[8];
+            int bodyLength = BinaryPrimitives.ReadInt32LittleEndian(data.AsSpan(9));
+            if (bodyLength < 0 || bodyLength > MaxBodyBytes)
+                throw new InvalidDataException($"Body length {bodyLength} out of range.");
+
+            if ((container & ContainerCompressed) != 0)
             {
-                mesh.SetHasUV(ch, true);
-                for (int i = 0; i < vc; i++)
-                    mesh.SetUV(ch, i, ReadFloat2(r));
+                var body = new byte[bodyLength];
+                int decoded = LZ4Codec.Decode(data.AsSpan(HeaderBytes), body.AsSpan());
+                if (decoded != bodyLength)
+                    throw new InvalidDataException($"Compressed body decoded to {decoded} bytes, expected {bodyLength}.");
+
+                using var ms = new MemoryStream(body, writable: false);
+                using var r = new BinaryReader(ms, Encoding.UTF8, leaveOpen: true);
+                return ReadBody(r, version);
             }
 
-            // Submeshes
-            int submeshCount = r.ReadInt32();
-            if (submeshCount < 0 || submeshCount > MaxCount)
-                throw new InvalidDataException($"Submesh count {submeshCount} out of range.");
-            for (int s = 0; s < submeshCount; s++)
-            {
-                int topology = r.ReadInt32();
-                int idxCount = r.ReadInt32();
-                if (idxCount < 0 || idxCount > MaxCount)
-                    throw new InvalidDataException($"Submesh index count {idxCount} out of range.");
+            if (data.Length - HeaderBytes < bodyLength)
+                throw new InvalidDataException("Truncated .lmesh blob.");
 
-                PhosSubmesh sm = (PhosTopology)topology switch
-                {
-                    PhosTopology.Triangles => new PhosTriangleSubmesh(mesh),
-                    PhosTopology.Points => new PhosPointSubmesh(mesh),
-                    _ => throw new InvalidDataException($"Unsupported submesh topology {topology}."),
-                };
-
-                if (idxCount % sm.IndicesPerElement != 0)
-                    throw new InvalidDataException($"Index count {idxCount} is not a multiple of {sm.IndicesPerElement} for topology {topology}.");
-
-                if (idxCount > 0) sm.IncreaseCount(idxCount / sm.IndicesPerElement);
-                var idx = sm.RawIndices;
-                for (int i = 0; i < idxCount; i++) idx[i] = r.ReadInt32();
-
-                mesh.Submeshes.Add(sm);
-            }
-
-            // Bone table
-            int boneCount = r.ReadInt32();
-            if (boneCount < 0 || boneCount > MaxCount)
-                throw new InvalidDataException($"Bone count {boneCount} out of range.");
-            for (int i = 0; i < boneCount; i++)
-            {
-                var name = ReadString(r);
-                var bindPose = ReadMatrix(r);
-                var bone = mesh.AddBone(name);
-                bone.BindPose = bindPose;
-            }
-
-            // Blend shapes
-            int blendCount = r.ReadInt32();
-            if (blendCount < 0 || blendCount > MaxCount)
-                throw new InvalidDataException($"Blend shape count {blendCount} out of range.");
-            for (int s = 0; s < blendCount; s++)
-            {
-                var name = ReadString(r);
-                int frameCount = r.ReadInt32();
-                if (frameCount < 0 || frameCount > MaxCount)
-                    throw new InvalidDataException($"Blend shape frame count {frameCount} out of range.");
-
-                var shape = new PhosBlendShape(name, frameCount);
-                for (int f = 0; f < frameCount; f++)
-                {
-                    bool hasN = r.ReadBoolean();
-                    bool hasT = r.ReadBoolean();
-
-                    // PhosBlendShape allocates a Frames array of NULL elements (it's a class) - we must
-                    // instantiate each frame before writing into it. -xlinka
-                    var frame = new PhosBlendShapeFrame { positions = new float3[vc] };
-                    for (int i = 0; i < vc; i++) frame.positions[i] = ReadFloat3(r);
-                    if (hasN)
-                    {
-                        frame.normals = new float3[vc];
-                        for (int i = 0; i < vc; i++) frame.normals[i] = ReadFloat3(r);
-                    }
-                    if (hasT)
-                    {
-                        frame.tangents = new float3[vc];
-                        for (int i = 0; i < vc; i++) frame.tangents[i] = ReadFloat3(r);
-                    }
-                    shape.Frames[f] = frame;
-                }
-                mesh.BlendShapes.Add(shape);
-            }
-
-            return mesh;
+            using var plainStream = new MemoryStream(data, HeaderBytes, bodyLength, writable: false);
+            using var plainReader = new BinaryReader(plainStream, Encoding.UTF8, leaveOpen: true);
+            return ReadBody(plainReader, version);
         }
         catch (EndOfStreamException ex)
         {
             throw new InvalidDataException("Truncated .lmesh blob.", ex);
         }
+    }
+
+    // --- body ---
+
+    private static void WriteBody(BinaryWriter w, PhosMesh mesh, int vc, byte uvMask, FramePlan[][] plan, bool reportTruncation)
+    {
+        w.Write(vc);
+
+        var flags = MeshFlags.None;
+        if (mesh.HasNormals) flags |= MeshFlags.Normals;
+        if (mesh.HasTangents) flags |= MeshFlags.Tangents;
+        if (mesh.HasColors) flags |= MeshFlags.Colors;
+        if (mesh.HasBoneBindings) flags |= MeshFlags.BoneBindings;
+        w.Write((byte)flags);
+        w.Write(uvMask);
+
+        // Per-vertex blocks (read up to VertexCount, never array.Length - the backing arrays are
+        // intentionally over-allocated). -xlinka
+        var pos = mesh.RawPositions;
+        for (int i = 0; i < vc; i++) WriteFloat3(w, pos[i]);
+
+        if (flags.HasFlag(MeshFlags.Normals))
+        {
+            var n = mesh.RawNormals;
+            for (int i = 0; i < vc; i++) WriteFloat3(w, n[i]);
+        }
+        if (flags.HasFlag(MeshFlags.Tangents))
+        {
+            var t = mesh.RawTangents;
+            for (int i = 0; i < vc; i++) WriteFloat4(w, t[i]);
+        }
+        if (flags.HasFlag(MeshFlags.Colors))
+        {
+            var c = mesh.RawColors;
+            for (int i = 0; i < vc; i++) WriteColor(w, c[i]);
+        }
+        if (flags.HasFlag(MeshFlags.BoneBindings))
+        {
+            var b = mesh.RawBoneBindings;
+            for (int i = 0; i < vc; i++)
+            {
+                WriteFloat4(w, b[i].boneIndices);
+                WriteFloat4(w, b[i].boneWeights);
+            }
+        }
+
+        for (int ch = 0; ch < 4; ch++)
+        {
+            if ((uvMask & (1 << ch)) == 0) continue;
+            var uv = GetUVChannel(mesh, ch);
+            for (int i = 0; i < vc; i++)
+                WriteFloat2(w, i < uv.Length ? uv[i] : float2.Zero);
+        }
+
+        w.Write(mesh.Submeshes.Count);
+        foreach (var sm in mesh.Submeshes)
+        {
+            w.Write((int)sm.Topology);
+            int idxCount = sm.IndexCount;
+            w.Write(idxCount);
+            var idx = sm.RawIndices;
+            for (int i = 0; i < idxCount; i++) w.Write(idx[i]);
+        }
+
+        w.Write(mesh.BoneCount);
+        for (int i = 0; i < mesh.BoneCount; i++)
+        {
+            var bone = mesh.GetBone(i);
+            WriteString(w, bone.Name, reportTruncation);
+            WriteMatrix(w, bone.BindPose);
+        }
+
+        w.Write(mesh.BlendShapes.Count);
+        for (int s = 0; s < mesh.BlendShapes.Count; s++)
+        {
+            var shape = mesh.BlendShapes[s];
+            WriteString(w, shape.Name ?? string.Empty, reportTruncation);
+
+            var frames = plan[s];
+            w.Write(frames.Length);
+            for (int f = 0; f < frames.Length; f++)
+            {
+                var frame = shape.Frames![f];
+                var fp = frames[f];
+
+                var frameFlags = FrameFlags.None;
+                if (fp.HasNormals) frameFlags |= FrameFlags.Normals;
+                if (fp.HasTangents) frameFlags |= FrameFlags.Tangents;
+                w.Write((byte)frameFlags);
+
+                var moved = fp.Moved;
+                w.Write(moved.Length);
+                for (int i = 0; i < moved.Length; i++) w.Write(moved[i]);
+
+                for (int i = 0; i < moved.Length; i++) WriteFloat3(w, SafeGet(frame?.positions, moved[i]));
+                if (fp.HasNormals)
+                    for (int i = 0; i < moved.Length; i++) WriteFloat3(w, SafeGet(frame!.normals, moved[i]));
+                if (fp.HasTangents)
+                    for (int i = 0; i < moved.Length; i++) WriteFloat3(w, SafeGet(frame!.tangents, moved[i]));
+            }
+        }
+    }
+
+    private static PhosMesh ReadBody(BinaryReader r, int version)
+    {
+        int vc = r.ReadInt32();
+        if (vc < 0 || vc > MaxVertices)
+            throw new InvalidDataException($"Vertex count {vc} out of range.");
+
+        var flags = (MeshFlags)r.ReadByte();
+
+        int uvMask;
+        if (version == LegacyDenseVersion)
+        {
+            int uvCount = r.ReadInt32();
+            if (uvCount < 0 || uvCount > 4)
+                throw new InvalidDataException($"UV channel count {uvCount} out of range.");
+            uvMask = (1 << uvCount) - 1;
+        }
+        else
+        {
+            uvMask = r.ReadByte();
+            if ((uvMask & ~0xF) != 0)
+                throw new InvalidDataException($"UV channel mask 0x{uvMask:X2} out of range.");
+        }
+
+        var mesh = new PhosMesh();
+
+        // Set flags BEFORE growing the vertex arrays so IncreaseVertexCount allocates them. -xlinka
+        mesh.HasNormals = flags.HasFlag(MeshFlags.Normals);
+        mesh.HasTangents = flags.HasFlag(MeshFlags.Tangents);
+        mesh.HasColors = flags.HasFlag(MeshFlags.Colors);
+        mesh.HasBoneBindings = flags.HasFlag(MeshFlags.BoneBindings);
+        if (mesh.HasBoneBindings) mesh.EnsureBoneBindings();
+
+        if (vc > 0) mesh.IncreaseVertexCount(vc);
+
+        var pos = mesh.RawPositions;
+        for (int i = 0; i < vc; i++) pos[i] = ReadFloat3(r);
+
+        if (mesh.HasNormals)
+        {
+            var n = mesh.RawNormals;
+            for (int i = 0; i < vc; i++) n[i] = ReadFloat3(r);
+        }
+        if (mesh.HasTangents)
+        {
+            var t = mesh.RawTangents;
+            for (int i = 0; i < vc; i++) t[i] = ReadFloat4(r);
+        }
+        if (mesh.HasColors)
+        {
+            var c = mesh.RawColors;
+            for (int i = 0; i < vc; i++) c[i] = ReadColor(r);
+        }
+        if (mesh.HasBoneBindings)
+        {
+            var b = mesh.RawBoneBindings;
+            for (int i = 0; i < vc; i++)
+            {
+                var indices = ReadFloat4(r);
+                var weights = ReadFloat4(r);
+                b[i] = new PhosBoneBinding(indices, weights);
+            }
+        }
+
+        for (int ch = 0; ch < 4; ch++)
+        {
+            if ((uvMask & (1 << ch)) == 0) continue;
+            mesh.SetHasUV(ch, true);
+            for (int i = 0; i < vc; i++)
+                mesh.SetUV(ch, i, ReadFloat2(r));
+        }
+
+        int submeshCount = r.ReadInt32();
+        if (submeshCount < 0 || submeshCount > MaxCount)
+            throw new InvalidDataException($"Submesh count {submeshCount} out of range.");
+        for (int s = 0; s < submeshCount; s++)
+        {
+            int topology = r.ReadInt32();
+            int idxCount = r.ReadInt32();
+            if (idxCount < 0 || idxCount > MaxCount)
+                throw new InvalidDataException($"Submesh index count {idxCount} out of range.");
+
+            PhosSubmesh sm = (PhosTopology)topology switch
+            {
+                PhosTopology.Triangles => new PhosTriangleSubmesh(mesh),
+                PhosTopology.Points => new PhosPointSubmesh(mesh),
+                _ => throw new InvalidDataException($"Unsupported submesh topology {topology}."),
+            };
+
+            if (idxCount % sm.IndicesPerElement != 0)
+                throw new InvalidDataException($"Index count {idxCount} is not a multiple of {sm.IndicesPerElement} for topology {topology}.");
+
+            if (idxCount > 0) sm.IncreaseCount(idxCount / sm.IndicesPerElement);
+            var idx = sm.RawIndices;
+            for (int i = 0; i < idxCount; i++) idx[i] = r.ReadInt32();
+
+            mesh.Submeshes.Add(sm);
+        }
+
+        int boneCount = r.ReadInt32();
+        if (boneCount < 0 || boneCount > MaxCount)
+            throw new InvalidDataException($"Bone count {boneCount} out of range.");
+        for (int i = 0; i < boneCount; i++)
+        {
+            var name = ReadString(r);
+            var bindPose = ReadMatrix(r);
+            var bone = mesh.AddBone(name);
+            bone.BindPose = bindPose;
+        }
+
+        int blendCount = r.ReadInt32();
+        if (blendCount < 0 || blendCount > MaxCount)
+            throw new InvalidDataException($"Blend shape count {blendCount} out of range.");
+        for (int s = 0; s < blendCount; s++)
+        {
+            var name = ReadString(r);
+            int frameCount = r.ReadInt32();
+            if (frameCount < 0 || frameCount > MaxCount)
+                throw new InvalidDataException($"Blend shape frame count {frameCount} out of range.");
+
+            var shape = new PhosBlendShape(name, frameCount);
+            for (int f = 0; f < frameCount; f++)
+            {
+                shape.Frames[f] = version == LegacyDenseVersion
+                    ? ReadDenseFrame(r, vc)
+                    : ReadSparseFrame(r, vc);
+            }
+            mesh.BlendShapes.Add(shape);
+        }
+
+        return mesh;
+    }
+
+    private static PhosBlendShapeFrame ReadDenseFrame(BinaryReader r, int vc)
+    {
+        bool hasN = r.ReadBoolean();
+        bool hasT = r.ReadBoolean();
+
+        // PhosBlendShape allocates a Frames array of NULL elements (it's a class) - we must
+        // instantiate each frame before writing into it. -xlinka
+        var frame = new PhosBlendShapeFrame();
+        frame.Allocate(vc, hasN, hasT);
+
+        for (int i = 0; i < vc; i++) frame.positions[i] = ReadFloat3(r);
+        if (hasN)
+            for (int i = 0; i < vc; i++) frame.normals[i] = ReadFloat3(r);
+        if (hasT)
+            for (int i = 0; i < vc; i++) frame.tangents[i] = ReadFloat3(r);
+        return frame;
+    }
+
+    // Sparse on disk, dense in memory: Godot wants a full delta array at upload and the mesh hooks
+    // index it directly, so the scatter has to happen here and not later. -xlinka
+    private static PhosBlendShapeFrame ReadSparseFrame(BinaryReader r, int vc)
+    {
+        var frameFlags = (FrameFlags)r.ReadByte();
+        bool hasN = frameFlags.HasFlag(FrameFlags.Normals);
+        bool hasT = frameFlags.HasFlag(FrameFlags.Tangents);
+
+        int moved = r.ReadInt32();
+        if (moved < 0 || moved > vc)
+            throw new InvalidDataException($"Blend shape frame moves {moved} of {vc} vertices.");
+
+        var frame = new PhosBlendShapeFrame();
+        frame.Allocate(vc, hasN, hasT);
+
+        var indices = moved > 0 ? new int[moved] : Array.Empty<int>();
+        for (int i = 0; i < moved; i++)
+        {
+            int index = r.ReadInt32();
+            if (index < 0 || index >= vc)
+                throw new InvalidDataException($"Blend shape delta index {index} out of range (vertex count {vc}).");
+            indices[i] = index;
+        }
+
+        for (int i = 0; i < moved; i++) frame.positions[indices[i]] = ReadFloat3(r);
+        if (hasN)
+            for (int i = 0; i < moved; i++) frame.normals[indices[i]] = ReadFloat3(r);
+        if (hasT)
+            for (int i = 0; i < moved; i++) frame.tangents[indices[i]] = ReadFloat3(r);
+        return frame;
+    }
+
+    private static FramePlan[][] BuildBlendPlan(PhosMesh mesh, int vc)
+    {
+        var plan = new FramePlan[mesh.BlendShapes.Count][];
+        for (int s = 0; s < mesh.BlendShapes.Count; s++)
+        {
+            var frames = mesh.BlendShapes[s].Frames;
+            int frameCount = frames?.Length ?? 0;
+            plan[s] = new FramePlan[frameCount];
+
+            for (int f = 0; f < frameCount; f++)
+            {
+                var frame = frames![f];
+                bool hasN = frame?.normals != null && frame.normals.Length > 0;
+                bool hasT = frame?.tangents != null && frame.tangents.Length > 0;
+
+                int count = 0;
+                for (int i = 0; i < vc; i++)
+                {
+                    if (IsMoved(frame, i, hasN, hasT)) count++;
+                }
+
+                var moved = count > 0 ? new int[count] : Array.Empty<int>();
+                int at = 0;
+                for (int i = 0; i < vc && at < count; i++)
+                {
+                    if (IsMoved(frame, i, hasN, hasT)) moved[at++] = i;
+                }
+
+                plan[s][f] = new FramePlan
+                {
+                    Moved = moved,
+                    // A shape that carries a channel but never moves it costs nothing here, and a
+                    // channel with no moved vertices is not worth declaring at all.
+                    HasNormals = hasN && count > 0,
+                    HasTangents = hasT && count > 0,
+                };
+            }
+        }
+        return plan;
+    }
+
+    private static bool IsMoved(PhosBlendShapeFrame? frame, int i, bool hasN, bool hasT)
+    {
+        if (frame == null) return false;
+        if (Exceeds(SafeGet(frame.positions, i))) return true;
+        if (hasN && Exceeds(SafeGet(frame.normals, i))) return true;
+        if (hasT && Exceeds(SafeGet(frame.tangents, i))) return true;
+        return false;
+    }
+
+    private static bool Exceeds(float3 v) =>
+        System.Math.Abs(v.x) > MovedEpsilon ||
+        System.Math.Abs(v.y) > MovedEpsilon ||
+        System.Math.Abs(v.z) > MovedEpsilon;
+
+    private static void WriteHeader(byte[] buffer, byte containerFlags, int bodyLength)
+    {
+        buffer[0] = Magic[0];
+        buffer[1] = Magic[1];
+        buffer[2] = Magic[2];
+        buffer[3] = Magic[3];
+        BinaryPrimitives.WriteInt32LittleEndian(buffer.AsSpan(4), CurrentVersion);
+        buffer[8] = containerFlags;
+        BinaryPrimitives.WriteInt32LittleEndian(buffer.AsSpan(9), bodyLength);
+    }
+
+    // Counts what a write would cost without holding any of it, so the real buffer can be allocated
+    // once at exactly the right size.
+    private sealed class CountingStream : Stream
+    {
+        private long _length;
+
+        public override bool CanRead => false;
+        public override bool CanSeek => false;
+        public override bool CanWrite => true;
+        public override long Length => _length;
+
+        public override long Position
+        {
+            get => _length;
+            set => throw new NotSupportedException();
+        }
+
+        public override void Flush() { }
+        public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => _length += count;
+        public override void Write(ReadOnlySpan<byte> buffer) => _length += buffer.Length;
+        public override void WriteByte(byte value) => _length++;
     }
 
     // --- primitive read/write helpers (BinaryWriter is little-endian on our targets) ---
@@ -319,13 +600,32 @@ public static class PhosMeshSerializer
     private static color ReadColor(BinaryReader r) => new color { r = r.ReadSingle(), g = r.ReadSingle(), b = r.ReadSingle(), a = r.ReadSingle() };
     private static float4x4 ReadMatrix(BinaryReader r) => new float4x4 { c0 = ReadFloat4(r), c1 = ReadFloat4(r), c2 = ReadFloat4(r), c3 = ReadFloat4(r) };
 
-    private static void WriteString(BinaryWriter w, string s)
+    private static void WriteString(BinaryWriter w, string s, bool reportTruncation)
     {
-        var bytes = Encoding.UTF8.GetBytes(s ?? string.Empty);
+        var text = s ?? string.Empty;
+        var bytes = Encoding.UTF8.GetBytes(text);
         if (bytes.Length > MaxNameBytes)
-            throw new InvalidDataException($"String length {bytes.Length} exceeds cap {MaxNameBytes}.");
+        {
+            // An over-long bone or shape name is a broken exporter, and throwing here throws away the
+            // whole import after the parse and every mesh already baked. Cut it on a character
+            // boundary instead so the name stays valid UTF-8, and say so once. The read side keeps
+            // the throw: a length past the cap there means the blob is malformed. -xlinka
+            int was = bytes.Length;
+            text = TruncateUtf8(text, MaxNameBytes);
+            bytes = Encoding.UTF8.GetBytes(text);
+            if (reportTruncation)
+                LumoraLogger.Warn($"PhosMeshSerializer: name of {was} UTF-8 bytes truncated to the {MaxNameBytes} cap (starts \"{text.Substring(0, System.Math.Min(48, text.Length))}\").");
+        }
         w.Write(bytes.Length);
         w.Write(bytes);
+    }
+
+    private static string TruncateUtf8(string s, int maxBytes)
+    {
+        var encoder = Encoding.UTF8.GetEncoder();
+        var buffer = new byte[maxBytes];
+        encoder.Convert(s.AsSpan(), buffer.AsSpan(), flush: true, out int charsUsed, out _, out _);
+        return s.Substring(0, charsUsed);
     }
 
     private static string ReadString(BinaryReader r)

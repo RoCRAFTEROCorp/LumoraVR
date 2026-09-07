@@ -136,7 +136,11 @@ public class FlatToonMaterial : MaterialProvider, ICommonMaterial
         asset.SetFloat("RimPower", RimPower.Value);
 
         asset.SetColor("OutlineColor", OutlineColor.Value);
-        asset.SetFloat("OutlineWidth", OutlineWidth.Value);
+        // Unlike the other two, Mat_FlatToonOutline multiplies by view depth, so this number is a
+        // screen-space factor and 0.1 really is its ceiling. It was the only one not clamped at all,
+        // which let an imported value walk straight past the shader's hint_range - a hint the editor
+        // honours and code does not. -xlinka
+        asset.SetFloat("OutlineWidth", System.Math.Clamp(OutlineWidth.Value, 0f, 0.1f));
 
         asset.SetTexture("NormalMap", NormalMap.Asset);
         asset.SetBool("UseNormalMap", NormalMap.Asset != null);

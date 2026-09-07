@@ -90,6 +90,10 @@ public static class VariantWorker
 
         try
         {
+            // The ladder is RGBA8; a radiance map has no honest rung in it.
+            if (TextureMetadata.DetectHdr(source.Data))
+                return Outcome.Skip();
+
             var rgba = TextureVariantStore.DecodeRgba(source.Data, out int width, out int height);
             if (rgba == null || width <= 0 || height <= 0)
                 return Outcome.Fail("source is not a decodable image");

@@ -34,9 +34,23 @@ public class RenderTexture : TextureAsset
         OrthographicSize = orthographicSize <= 0f ? 1f : orthographicSize;
         Version++;
 
-        (Hook as IRenderTextureAssetHook)?.Configure(
+        var hook = Hook as IRenderTextureAssetHook;
+        hook?.Configure(
             RenderWidth, RenderHeight, CullMask, ClearColor,
             CameraPosition, CameraRotation, OrthographicSize);
+        if (CameraOverride.HasValue)
+            hook?.SetCameraOverride(CameraOverride);
+    }
+
+    // Set by a Camera component that is filming into this texture, cleared when it stops. Kept on the
+    // asset rather than only on the hook so a camera that resolves before the render hook exists is not
+    // silently dropped - Configure re-pushes it. -xlinka
+    public RenderCameraParameters? CameraOverride { get; private set; }
+
+    public void SetCameraOverride(RenderCameraParameters? parameters)
+    {
+        CameraOverride = parameters;
+        (Hook as IRenderTextureAssetHook)?.SetCameraOverride(parameters);
     }
 
     /// <summary>

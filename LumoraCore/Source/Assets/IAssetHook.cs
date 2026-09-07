@@ -41,6 +41,10 @@ public interface ITextureAssetHook : IAssetHook
         var levels = request.MipLevels;
         if (levels == null || levels.Length == 0)
             return;
+        // UploadData is an RGBA8 contract. Feeding it half floats would put a picture of noise on
+        // screen, which is worse than no picture.
+        if (request.IsHdr)
+            return;
         UploadData(levels[0], request.Width, request.Height, request.GenerateMipmaps || levels.Length > 1);
     }
 }
@@ -63,6 +67,11 @@ public sealed class TextureUploadRequest
     public bool IsNormalMap { get; init; }
 
     public bool? SRgb { get; init; }
+
+    // True when MipLevels hold RGBA half floats (8 bytes per texel) instead of RGBA8. Range above
+    // 1.0 is the whole point of such a texture, so the renderer may only pick a format that keeps
+    // it (BC6H) or none at all. -xlinka
+    public bool IsHdr { get; init; }
 
     // Same key means same pixels and same compression intent. Null skips the cache.
     public string? CacheKey { get; init; }
@@ -91,6 +100,39 @@ public interface IRenderTextureAssetHook : ITextureAssetHook
     // Render exactly one frame now, then go idle again (keeping the last frame). Used for render-on-change:
     // the UI viewport only re-renders when its captured content actually changed, instead of every frame.
     void RequestRender();
+
+    // Hand the viewport over to a Camera component, or null to give it back to the provider's own fields.
+    //
+    // A provider-driven render texture is a fixed orthographic capture that only redraws when something
+    // it captured changed - that is what the UI canvases use. A camera-driven one is filming a live
+    // scene from a slot that can move, so it redraws continuously. The two cannot share one set of
+    // fields, so the camera's parameters ride separately and take priority while they are set. -xlinka
+    void SetCameraOverride(RenderCameraParameters? parameters);
+}
+
+// Everything a Camera needs the renderer to know, in engine terms. Position and rotation are GLOBAL:
+// the viewport that renders this does not sit under the camera's slot, so there is no parent transform
+// on the other side to compose with. -xlinka
+public readonly struct RenderCameraParameters
+{
+    public bool Perspective { get; init; }
+    public float FieldOfView { get; init; }
+    public float OrthographicSize { get; init; }
+    public float NearClip { get; init; }
+    public float FarClip { get; init; }
+
+    public Math.float3 Position { get; init; }
+    public Math.floatQ Rotation { get; init; }
+
+    public int CullMask { get; init; }
+
+    public Components.ClearMode Clear { get; init; }
+    public Math.color BackgroundColor { get; init; }
+
+    public bool RenderShadows { get; init; }
+    public bool OcclusionCulling { get; init; }
+    public bool Msaa { get; init; }
+    public bool PostProcessing { get; init; }
 }
 
 public interface IMeshAssetHook : IAssetHook

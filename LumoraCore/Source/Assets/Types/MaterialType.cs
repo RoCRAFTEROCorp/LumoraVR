@@ -73,6 +73,16 @@ public enum MaterialType
 
     // World portal face: picture in an ellipse with a crystal rim (Mat_Portal.gdshader).
     Portal,
+
+    // Denser toon model ported from Xiexe's Unity Shaders (MIT, (c) 2019 Xiexe): ramp shading with a
+    // lit AND a shadow-side rim, subsurface bleed, a sharpenable specular lobe and an outline hull.
+    // Separate from Toon on purpose - that one is our own simpler model and content depends on it.
+    XiexeToon,
+
+    // Specular-workflow PBS. The metallic material cannot stand in for it: a specular map carries a
+    // reflectance COLOUR, not a metalness, and reading one as the other inverts the surface. Ported
+    // from Unity's built-in Standard (Specular setup), MIT, (c) 2016 Unity Technologies.
+    PBS_Specular,
 }
 
 // What the alpha channel of a toon surface means. Opaque throws it away, cutout tests it against the

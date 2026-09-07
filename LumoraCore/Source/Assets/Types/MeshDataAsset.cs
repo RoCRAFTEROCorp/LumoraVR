@@ -91,6 +91,22 @@ public class MeshDataAsset : ImplementableAsset<IMeshAssetHook>
     /// Gather and decode this mesh from its URL. Only runs for URL (static) instances;
     /// procedural instances set their data directly via <see cref="SetMeshData"/>.
     /// </summary>
+    // The formats that build a full Assimp scene. Everything else decodes as a buffer and runs free.
+    private static readonly string[] SceneFormats =
+    {
+        ".fbx", ".dae", ".blend", ".3ds", ".ase", ".x", ".gltf", ".glb", ".vrm", ".lwo", ".lws", ".ms3d",
+    };
+
+    private static bool NeedsSourceParseGate(string ext)
+    {
+        foreach (var format in SceneFormats)
+        {
+            if (ext.Equals(format, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+        return false;
+    }
+
     protected override async Task LoadSelf()
     {
         var bytes = await AssetManager.RequestGather(AssetURL).ConfigureAwait(false);
@@ -101,9 +117,41 @@ public class MeshDataAsset : ImplementableAsset<IMeshAssetHook>
         }
 
         var descriptor = TargetVariant as MeshVariantDescriptor ?? MeshVariantDescriptor.Default;
-        string ext = ResolveExtension(AssetURL);
+        string ext = SniffIfUnknown(ResolveExtension(AssetURL), bytes);
 
-        var mesh = MeshDecoder.Decode(bytes, ext, descriptor.MeshIndex);
+        // Two separate guarantees, and both are needed.
+        //
+        // The hop off-thread is unconditional: this line runs on whichever thread completed the gather,
+        // and a source parse landing on the world loop is a multi-second frame.
+        //
+        // Gated on what a format COSTS, not on whether it was baked. An .obj or .stl is a buffer walk
+        // like .lmesh is; only the scene formats build a whole Assimp scene graph with materials,
+        // animations and morph attachments. Gating the cheap ones too would serialise a world full of
+        // small props behind whichever FBX happened to take the semaphore first.
+        //
+        // The gate is only for source formats. Content saved against a source model URL still arrives
+        // here once per mesh index, so one avatar is N whole-file parses of the same bytes, each one
+        // keeping a full scene alive while it throws all but one mesh away. Run together they do not
+        // finish sooner, they just stack their peaks until the machine pages. .lmesh is a baked single
+        // mesh - buffer copy, no gate, or an ordinary scene load would queue behind one FBX. -xlinka
+        PhosMesh? mesh;
+        if (!NeedsSourceParseGate(ext))
+        {
+            mesh = await DecodeOffThread(() => MeshDecoder.Decode(bytes, ext, descriptor.MeshIndex)).ConfigureAwait(false);
+        }
+        else
+        {
+            await Lumora.Core.Assets.AssetManager.SourceParseGate.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                mesh = await DecodeOffThread(() => MeshDecoder.Decode(bytes, ext, descriptor.MeshIndex)).ConfigureAwait(false);
+            }
+            finally
+            {
+                Lumora.Core.Assets.AssetManager.SourceParseGate.Release();
+            }
+        }
+
         if (mesh == null)
         {
             FailLoad($"Failed to decode mesh {AssetURL}");
@@ -132,6 +180,27 @@ public class MeshDataAsset : ImplementableAsset<IMeshAssetHook>
                 return Path.GetExtension(path) ?? "";
         }
         return Path.GetExtension(url.IsFile ? url.LocalPath : url.AbsolutePath) ?? "";
+    }
+
+    // Last resort, not the mechanism. The format travels with the asset: a transfer declares it in its
+    // start header and the receiving cache file keeps that extension, so ResolveExtension normally
+    // answers. This only catches the blob a peer on an older build sends with no format at all, where
+    // the alternative is a mesh nobody can decode. Both headers identify their container outright, so
+    // there is no guessing: "LMSH" is our own bake and "glTF" is the binary glTF container. -xlinka
+    private static string SniffIfUnknown(string ext, byte[] data)
+    {
+        if (!string.IsNullOrEmpty(ext) && !ext.Equals(".asset", StringComparison.OrdinalIgnoreCase))
+            return ext;
+
+        if (data.Length >= 4)
+        {
+            if (data[0] == 'L' && data[1] == 'M' && data[2] == 'S' && data[3] == 'H')
+                return ".lmesh";
+            if (data[0] == 'g' && data[1] == 'l' && data[2] == 'T' && data[3] == 'F')
+                return ".glb";
+        }
+
+        return ext;
     }
 
     /// <summary>

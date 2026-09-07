@@ -130,6 +130,8 @@ public class ImageProvider : StaticAssetProvider<TextureAsset>, ICustomInspector
         });
         if (metadata.IsNormalMap)
             InspectorStats.AddRow(ui, "Marked", "normal map");
+        if (metadata.IsHdr)
+            InspectorStats.AddRow(ui, "Range", "HDR (half float, no resolution cap)");
 
         InspectorStats.AddRow(ui, "Stored", InspectorStats.Bytes(metadata.SourceBytes));
         InspectorStats.AddRow(ui, "Decoded", InspectorStats.Bytes(metadata.DecodedBytes));

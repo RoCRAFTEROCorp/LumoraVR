@@ -11,15 +11,15 @@ using LumoraLogger = Lumora.Core.Logging.Logger;
 
 namespace Lumora.Core.Assets;
 
-/// <summary>
-/// Decodes mesh file bytes (glTF/GLB, OBJ, and the Assimp-supported formats) into a
-/// <see cref="PhosMesh"/>. Engine-agnostic and runs off the main thread during asset load.
-/// </summary>
+// Decodes mesh file bytes (glTF/GLB, OBJ, and the Assimp-supported formats) into a PhosMesh.
+// Engine-agnostic and runs off the main thread during asset load.
 public static class MeshDecoder
 {
-    /// <summary>Decode mesh bytes of the given file extension (e.g. ".glb"). <paramref name="meshIndex"/> -1
-    /// decodes the whole file concatenated; >= 0 decodes only that glTF mesh (one Phos asset per mesh).
-    /// Returns null on failure.</summary>
+    // Decode mesh bytes of the given file extension (e.g. ".glb"). meshIndex -1 decodes the whole file
+    // concatenated; >= 0 decodes only that mesh (one Phos asset per mesh). Returns null on failure.
+    //
+    // This is the LEGACY route for content already saved against a source model URL. Fresh imports bake
+    // one .lmesh per mesh at import time and never come back through here. -xlinka
     public static PhosMesh? Decode(byte[] fileData, string extension, int meshIndex = -1)
     {
         if (fileData == null || fileData.Length == 0)
@@ -244,12 +244,35 @@ public static class MeshDecoder
         if (scene == null || !scene.HasMeshes || scene.MeshCount == 0)
             throw new InvalidOperationException($"Assimp could not decode mesh data for '{extension}'");
 
+        return ConvertScene(scene, meshIndex, extension);
+    }
+
+    // Where every named node rests, for bones whose exporter gave no usable inverse bind. Exposed so an
+    // importer that converts many meshes out of ONE parse walks the node tree once instead of per mesh.
+    internal static Dictionary<string, System.Numerics.Matrix4x4> BuildNodeRestMap(Assimp.Scene scene)
+        => BuildGlobalNodeTransforms(scene?.RootNode);
+
+    // The per-mesh conversion, over a scene SOMEBODY ELSE PARSED.
+    //
+    // This exists so the model importer can parse a file once and bake all of its meshes, instead of every
+    // MeshProvider re-parsing the whole source through the URL path. Re-parsing was the import blowup: a nine
+    // mesh avatar meant ten concurrent whole-file parses, each keeping every mesh it then threw away.
+    //
+    // meshIndex >= 0 converts only that mesh; -1 concatenates the whole scene (the legacy whole-file shape).
+    // label only names the source in log lines. -xlinka
+    internal static PhosMesh ConvertScene(Assimp.Scene scene, int meshIndex, string? label = null,
+        Dictionary<string, System.Numerics.Matrix4x4>? nodeRest = null)
+    {
+        if (scene == null)
+            throw new ArgumentNullException(nameof(scene));
+
+        string extension = label ?? "";
         var phosMesh = new PhosMesh();
         phosMesh.HasNormals = true;
         phosMesh.HasUV0s = true;
 
         // Kept for bones whose exporter gave no usable inverse bind; empty walks cost nothing.
-        var globalNodeRest = BuildGlobalNodeTransforms(scene.RootNode);
+        var globalNodeRest = nodeRest ?? BuildGlobalNodeTransforms(scene.RootNode);
         int rebuiltBinds = 0;
 
         var allPositions = new List<float3>();
@@ -276,8 +299,12 @@ public static class MeshDecoder
         var morphPos = new List<List<float3>>();
         var morphNorm = new List<List<float3>>();
         var morphTang = new List<List<float3>>();
-        bool anyMorphNorm = false;
-        bool anyMorphTang = false;
+        // Per shape, not per mesh: one shape carrying normal deltas used to force a dense normal array
+        // onto every other shape of the mesh, and a dense channel costs VertexCount * 12 bytes for a
+        // shape that never touches it. On an avatar with hundreds of shapes that is the difference
+        // between tens of megabytes and nothing. -xlinka
+        var morphHasNorm = new List<bool>();
+        var morphHasTang = new List<bool>();
 
         // Tangents (xyz + handedness sign in w, for normal maps) and vertex colors, parallel to allPositions.
         var allTangents = new List<float4>();
@@ -312,6 +339,8 @@ public static class MeshDecoder
                     morphPos.Add(pl);
                     morphNorm.Add(nl);
                     morphTang.Add(tl);
+                    morphHasNorm.Add(false);
+                    morphHasTang.Add(false);
                 }
             }
 
@@ -390,7 +419,7 @@ public static class MeshDecoder
                         var an = att.Normals[i];
                         var bn = mesh.Normals[i];
                         morphNorm[m].Add(new float3(an.X - bn.X, an.Y - bn.Y, an.Z - bn.Z));
-                        anyMorphNorm = true;
+                        morphHasNorm[m] = true;
                     }
                     else morphNorm[m].Add(float3.Zero);
 
@@ -403,7 +432,7 @@ public static class MeshDecoder
                         var atn = Normalize3(at.X, at.Y, at.Z);
                         var btn = Normalize3(baseT.x, baseT.y, baseT.z);
                         morphTang[m].Add(new float3(atn.x - btn.x, atn.y - btn.y, atn.z - btn.z));
-                        anyMorphTang = true;
+                        morphHasTang[m] = true;
                     }
                     else morphTang[m].Add(float3.Zero);
                 }
@@ -534,11 +563,16 @@ public static class MeshDecoder
             if (morphPos[m].Count != phosMesh.VertexCount)
                 continue;
             var bs = phosMesh.GetBlendShape(morphNames[m]);
-            bs.Frames[0].positions = morphPos[m].ToArray();
-            if (anyMorphNorm)
-                bs.Frames[0].normals = morphNorm[m].ToArray();
-            if (anyMorphTang && morphTang[m].Count == phosMesh.VertexCount)
-                bs.Frames[0].tangents = morphTang[m].ToArray();
+            bool withNormals = morphHasNorm[m] && morphNorm[m].Count == phosMesh.VertexCount;
+            bool withTangents = morphHasTang[m] && morphTang[m].Count == phosMesh.VertexCount;
+
+            var frame = bs.Frames[0];
+            frame.Allocate(phosMesh.VertexCount, withNormals, withTangents);
+            morphPos[m].CopyTo(frame.positions);
+            if (withNormals)
+                morphNorm[m].CopyTo(frame.normals);
+            if (withTangents)
+                morphTang[m].CopyTo(frame.tangents);
         }
 
         var submesh = new PhosTriangleSubmesh(phosMesh);

@@ -77,6 +77,71 @@ public static class TextureVariantStore
     // and every procedural texture upload top-down, and the UI puts V=0 on the top edge of a quad. The
     // flip that used to live here turned every loaded picture upside down in the world browser and on
     // any model whose UVs were right. Cubemap faces take these rows as they are too. -xlinka
+    // Formats our own decoder cannot read are handed to the platform, which usually can. Installed by
+    // the rendering layer at startup; null means there is nothing to fall back to.
+    //
+    // WebP is the case that forced this. The built-in decoder handles PNG, JPEG, BMP, TGA, PSD and GIF
+    // and nothing else, so a WebP texture failed outright even though the platform decodes it happily
+    // one layer down - the failure just came too early to ever reach it. Imported avatars routinely
+    // carry WebP. -xlinka
+    public delegate byte[]? PlatformImageDecoder(byte[] encoded, out int width, out int height);
+
+    public static PlatformImageDecoder? PlatformDecoder { get; set; }
+
+    // Same shape for floating-point sources, returning RGBA half floats (8 bytes per texel). Only
+    // EXR needs it: Radiance is decoded here. Null means EXR is not readable on this build. -xlinka
+    public static PlatformImageDecoder? PlatformHdrDecoder { get; set; }
+
+    // Floating-point sources decode to RGBA half floats and NEVER through DecodeRgba: the 8-bit
+    // decoder tone-maps Radiance data on the way in without saying so, and the picture that comes
+    // out is a clipped, gamma-bent version of what the creator made. Radiance goes through the
+    // float path of the built-in decoder; EXR is the platform's, when it has one. -xlinka
+    public static byte[]? DecodeRgbaHalf(byte[] encoded, out int width, out int height)
+    {
+        width = 0;
+        height = 0;
+        if (encoded == null || encoded.Length == 0)
+            return null;
+
+        bool exr = encoded.Length >= 4 && encoded[0] == 0x76 && encoded[1] == 0x2F && encoded[2] == 0x31 && encoded[3] == 0x01;
+        if (!exr)
+        {
+            using var stream = new MemoryStream(encoded);
+            var result = ImageResultFloat.FromStream(stream, ColorComponents.RedGreenBlueAlpha);
+            if (result?.Data == null || result.Width <= 0 || result.Height <= 0)
+                return null;
+            width = result.Width;
+            height = result.Height;
+            return PackHalf(result.Data, width, height);
+        }
+
+        var platform = PlatformHdrDecoder;
+        if (platform == null)
+            return null;
+        var pixels = platform(encoded, out width, out height);
+        return pixels != null && width > 0 && height > 0 ? pixels : null;
+    }
+
+    // Float RGBA to half RGBA, little-endian. NaN and infinity are clamped away here because a
+    // single bad texel poisons every mip below it once the chain is filtered. -xlinka
+    public static byte[] PackHalf(float[] rgba, int width, int height)
+    {
+        long count = (long)width * height * 4;
+        var packed = new byte[count * 2];
+        for (long i = 0, o = 0; i < count && i < rgba.Length; i++, o += 2)
+        {
+            float v = rgba[i];
+            if (float.IsNaN(v))
+                v = 0f;
+            else if (float.IsInfinity(v))
+                v = v > 0 ? 65504f : -65504f;
+            ushort bits = BitConverter.HalfToUInt16Bits((Half)v);
+            packed[o] = (byte)bits;
+            packed[o + 1] = (byte)(bits >> 8);
+        }
+        return packed;
+    }
+
     public static byte[]? DecodeRgba(byte[] encoded, out int width, out int height)
     {
         width = 0;
@@ -84,11 +149,28 @@ public static class TextureVariantStore
         if (encoded == null || encoded.Length == 0)
             return null;
 
-        using var stream = new MemoryStream(encoded);
-        var result = ImageResult.FromStream(stream, ColorComponents.RedGreenBlueAlpha);
-        width = result.Width;
-        height = result.Height;
-        return result.Data;
+        try
+        {
+            using var stream = new MemoryStream(encoded);
+            var result = ImageResult.FromStream(stream, ColorComponents.RedGreenBlueAlpha);
+            if (result?.Data != null && result.Width > 0 && result.Height > 0)
+            {
+                width = result.Width;
+                height = result.Height;
+                return result.Data;
+            }
+        }
+        catch (Exception) when (PlatformDecoder != null)
+        {
+            // Fall through: an unreadable format is the platform's problem now, not a failure.
+        }
+
+        var platform = PlatformDecoder;
+        if (platform == null)
+            return null;
+
+        var pixels = platform(encoded, out width, out height);
+        return pixels != null && width > 0 && height > 0 ? pixels : null;
     }
 
     // RESAMPLING
@@ -344,6 +426,40 @@ public static class TextureVariantStore
 
             byte[]? rgba;
             int width, height;
+
+            // An HDR source gets its sidecar (so a joiner learns the dimensions and the HDR fact
+            // without pulling pixels) and nothing else. Every rung of the ladder is RGBA8, and an
+            // RGBA8 rung of a radiance map is a clipped picture with a wrong name.
+            if (TextureMetadata.DetectHdr(sourceBytes))
+            {
+                byte[]? half;
+                try
+                {
+                    half = DecodeRgbaHalf(sourceBytes, out width, out height);
+                }
+                catch (Exception ex)
+                {
+                    Logger.Warn($"TextureVariantStore: cannot decode HDR '{baseLocalUri}': {ex.Message}");
+                    return null;
+                }
+                if (half == null || width <= 0 || height <= 0)
+                    return null;
+
+                int hdrMips = mipmaps ? TextureMetadata.FullMipCount(width, height) : 1;
+                var hdrMeta = TextureMetadata.AnalyzeHalf(half, width, height, hdrMips,
+                    sourceBytes.LongLength,
+                    TextureMetadata.ComputeGpuBytes(TextureFormatKind.RGBA16F, width, height, hdrMips),
+                    isNormalMap);
+                await db.SetAssetMetadataAsync(baseLocalUri, bag => hdrMeta.WriteTo(bag)).ConfigureAwait(false);
+                var hdrSidecar = GetMetadataUri(baseLocalUri);
+                if (hdrSidecar != null && !db.Exists(hdrSidecar))
+                {
+                    await db.SaveDerivedAssetAsync(baseLocalUri, MetadataSuffix, hdrMeta.ToSidecarBytes(), MetadataExtension)
+                        .ConfigureAwait(false);
+                }
+                return hdrMeta;
+            }
+
             try
             {
                 rgba = DecodeRgba(sourceBytes, out width, out height);

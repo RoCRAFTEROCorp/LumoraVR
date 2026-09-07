@@ -21,8 +21,10 @@ public class PBS_Specular : MaterialProvider, ICommonMaterial
     public readonly AssetRef<TextureAsset> AlbedoTexture;
 
     // SPECULAR
+    // Smoothness is the ALPHA of SpecularColor, not a member of its own - the specular workflow packs
+    // the two together everywhere else too (the map's RGBA carries exactly the same pair), and a
+    // separate field would be a second source of truth that imported material data has no way to fill.
     public readonly Sync<colorHDR> SpecularColor;
-    public readonly Sync<float> Smoothness;
     public readonly AssetRef<TextureAsset> SpecularMap;
 
     // NORMAL MAP
@@ -42,7 +44,17 @@ public class PBS_Specular : MaterialProvider, ICommonMaterial
     public readonly Sync<Culling> Culling;
     public readonly Sync<int> RenderQueue;
 
-    protected override MaterialType MaterialType => MaterialType.PBS_Metallic; // reuse same Godot type
+    protected override MaterialType MaterialType => MaterialType.PBS_Specular;
+
+    public float Smoothness
+    {
+        get => SpecularColor.Value.a;
+        set
+        {
+            var c = SpecularColor.Value;
+            SpecularColor.Value = new colorHDR(c.r, c.g, c.b, value);
+        }
+    }
 
     // ICommonMaterial
     public colorHDR Color
@@ -65,8 +77,7 @@ public class PBS_Specular : MaterialProvider, ICommonMaterial
         AlbedoColor = new Sync<colorHDR>(this, colorHDR.White);
         AlbedoTexture = new AssetRef<TextureAsset>(this);
 
-        SpecularColor = new Sync<colorHDR>(this, new colorHDR(0.5f, 0.5f, 0.5f, 1.0f));
-        Smoothness = new Sync<float>(this, 0.5f);
+        SpecularColor = new Sync<colorHDR>(this, new colorHDR(0.5f, 0.5f, 0.5f, 0.5f));
         SpecularMap = new AssetRef<TextureAsset>(this);
 
         NormalMap = new AssetRef<TextureAsset>(this);
@@ -96,18 +107,23 @@ public class PBS_Specular : MaterialProvider, ICommonMaterial
         asset.SetColor("AlbedoColor", AlbedoColor.Value);
         asset.SetTexture("AlbedoTexture", AlbedoTexture.Asset);
 
-        // Map specular to metallic workflow for Godot
-        asset.SetFloat("Metallic", 0.0f);
-        asset.SetFloat("Smoothness", Smoothness.Value);
+        // The specular workflow goes to a shader of its own. It used to be squeezed into the metallic
+        // material, which meant the specular map landed in the metallic slot and was then read as a
+        // glTF metallic-roughness pack - blue channel as metalness, with Metallic pinned to 1. A skin
+        // or fur surface authored with a coloured specular tint came out fully metal and near-black.
         asset.SetColor("SpecularColor", SpecularColor.Value);
-        asset.SetTexture("MetallicMap", SpecularMap.Asset);
+        asset.SetTexture("SpecularMap", SpecularMap.Asset);
+        asset.SetBool("UseSpecularMap", SpecularMap.Asset != null);
 
         asset.SetTexture("NormalMap", NormalMap.Asset);
+        asset.SetBool("UseNormalMap", NormalMap.Asset != null);
         asset.SetFloat("NormalScale", NormalScale.Value);
 
         asset.SetColor("EmissiveColor", EmissiveColor.Value);
         asset.SetTexture("EmissiveMap", EmissiveMap.Asset);
+        asset.SetBool("UseEmissiveMap", EmissiveMap.Asset != null);
 
         asset.SetTexture("OcclusionMap", OcclusionMap.Asset);
+        asset.SetBool("UseOcclusionMap", OcclusionMap.Asset != null);
     }
 }

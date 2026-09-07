@@ -6,11 +6,9 @@ using LumoraLogger = Lumora.Core.Logging.Logger;
 
 namespace Lumora.Core.Assets;
 
-/// <summary>
-/// Component base for providers backed by a shared, URL-loaded asset. The provider is a thin
-/// <see cref="IAssetRequester"/>: it resolves its URL and asks the <see cref="AssetManager"/> for
-/// the asset, which loads itself and is shared across every requester for the same URL.
-/// </summary>
+// Component base for providers backed by a shared, URL-loaded asset. The provider is a thin
+// IAssetRequester: it resolves its URL and asks the AssetManager for the asset, which loads itself and
+// is shared across every requester for the same URL.
 public abstract class StaticAssetProvider<A> : AssetProvider<A>, IAssetRequester, IUrlAssetProvider
     where A : LoadableAsset, new()
 {
@@ -33,6 +31,8 @@ public abstract class StaticAssetProvider<A> : AssetProvider<A>, IAssetRequester
 
     // A load that FAILED is not pending: nothing more is coming, so whoever is showing a loading skin
     // over this has to stop. No URL is not pending either - there is nothing to wait for. -xlinka
+    public Uri? SourceUrl => URL.Value;
+
     public bool IsLoadPending
     {
         get
@@ -43,6 +43,23 @@ public abstract class StaticAssetProvider<A> : AssetProvider<A>, IAssetRequester
             if (asset != null && asset.LoadState == AssetLoadState.Failed)
                 return false;
             return !IsAssetAvailable;
+        }
+    }
+
+    // The raw state for a diagnostic line, and nothing else reads it. Asset hides the instance until it
+    // is loaded, so from outside "not loaded" is indistinguishable from "never asked for" - and those
+    // are different bugs: the first is a decode still running or failed, the second is a provider with
+    // no reference holding it open (a request is only issued on the first reference). The reference
+    // count is printed for that reason. -xlinka
+    public string LoadStateDescription
+    {
+        get
+        {
+            var asset = _asset;
+            string state = URL.Value == null ? "no url"
+                : asset == null ? (_resolvedUrl == null ? "not requested" : "requested, no asset yet")
+                : asset.LoadState.ToString();
+            return $"{state}, refs={AssetReferenceCount}";
         }
     }
 
@@ -58,11 +75,9 @@ public abstract class StaticAssetProvider<A> : AssetProvider<A>, IAssetRequester
             UpdateAsset();
     }
 
-    /// <summary>
-    /// The variant descriptor (wrap/mipmap options, etc.) for this provider's request, or null
-    /// for the default variant. Recomputed on every refresh; if it changes, the asset is
-    /// re-requested for the new variant.
-    /// </summary>
+    // The variant descriptor (wrap/mipmap options, etc.) for this provider's request, or null for the
+    // default variant. Recomputed on every refresh; if it changes, the asset is re-requested for the new
+    // variant.
     protected virtual IAssetVariantDescriptor? GetVariantDescriptor() => null;
 
     protected override void UpdateAsset()

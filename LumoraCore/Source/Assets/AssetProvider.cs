@@ -319,15 +319,27 @@ public abstract class AssetProvider<A> : Component, IAssetProvider<A> where A : 
             {
                 var filePath = localDB.GetFilePath(assetURL.ToString());
                 LumoraLogger.Debug($"AssetProvider.ProcessURL: GetFilePath returned '{filePath}'");
-                if (!string.IsNullOrEmpty(filePath))
+                // A record whose file is gone is worth no more than no record at all, and both heal the
+                // same way, so treat them alike rather than handing back a path that cannot be read.
+                if (!string.IsNullOrEmpty(filePath) && File.Exists(filePath))
                 {
                     var resolvedUri = new Uri(filePath);
                     LumoraLogger.Debug($"AssetProvider.ProcessURL: Resolved to {resolvedUri}");
                     return resolvedUri;
                 }
             }
-            LumoraLogger.Warn($"AssetProvider: Could not resolve local URI: {assetURL}");
-            return null!;
+
+            // Having no record for a local:// hash is the NORMAL state of a machine that just joined:
+            // every such URI in the world it received names content another machine imported. Returning
+            // null here ended the story - the provider reported the asset removed, nobody ever asked for
+            // the bytes, and since a gather is the only door into peer transfer the joiner never even
+            // asked its peers. That is why a joiner could not load an imported mesh at all.
+            //
+            // Hand the local:// URI straight through instead. The gather path checks our own cache first
+            // and falls through to the session transferer, so the load fails only once the transfer has
+            // actually failed. -xlinka
+            LumoraLogger.Debug($"AssetProvider.ProcessURL: no local record for {assetURL}; deferring to the gather path");
+            return assetURL;
         }
 
         if (assetURL.IsFile && !File.Exists(assetURL.LocalPath))

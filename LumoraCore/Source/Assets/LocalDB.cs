@@ -164,7 +164,7 @@ public class LocalDB : IDisposable
         {
             if (_assetRecords.TryGetValue(hash, out _))
             {
-                Logger.Log($"LocalDB: Asset already saved: {localUri}");
+                Logger.Debug($"LocalDB: Asset already saved: {localUri}");
                 return localUri;
             }
         }
@@ -210,7 +210,23 @@ public class LocalDB : IDisposable
     {
         if (mesh == null)
             return Task.FromResult<string>(null!);
-        return SaveAssetAsync(PhosMeshSerializer.Serialize(mesh), ".lmesh");
+
+        // Serialize refuses a mesh whose topology cannot round-trip, and it refuses it SYNCHRONOUSLY -
+        // so on the import path that throw would escape a Task-returning method and take the whole
+        // model down after several meshes had already been written. One unsupported submesh should
+        // cost that mesh its bake and nothing else; the caller already falls back to the source URL.
+        byte[] data;
+        try
+        {
+            data = PhosMeshSerializer.Serialize(mesh);
+        }
+        catch (NotSupportedException ex)
+        {
+            Logger.Warn($"LocalDB: mesh cannot be baked, falling back to the source model - {ex.Message}");
+            return Task.FromResult<string>(null!);
+        }
+
+        return SaveAssetAsync(data, ".lmesh");
     }
 
     // DERIVED ASSETS
@@ -304,6 +320,148 @@ public class LocalDB : IDisposable
 
         await SaveAssetRecordsAsync();
         return uri;
+    }
+
+    // ADOPTION
+    //
+    // A file that arrived over peer transfer is already addressed: the hash is right there in the URI we
+    // asked for. Re-hashing it to find that out reads every byte of an avatar mesh a second time, on the
+    // thread that is about to decode it, before anything can be drawn. So take the URI's word for the
+    // address, register the record immediately, and check the claim afterwards on a background thread.
+    // The window that opens is narrow and bounded: a peer that serves bytes not matching the hash it was
+    // asked for gets one load out of it, then loses both the record and the file.
+    //
+    // Synchronous on purpose. The caller reads the returned path and hands the bytes to a decoder that
+    // resolves the format from this record, so the record has to exist by the time this returns or the
+    // very first load after a transfer races the write that would have told it what it is. -xlinka
+    public string? AdoptGatheredAsset(string localUri, string filePath, string? format = null)
+    {
+        var key = ExtractKey(localUri);
+        if (string.IsNullOrEmpty(key) || string.IsNullOrEmpty(filePath) || !File.Exists(filePath))
+            return null;
+
+        lock (_lock)
+        {
+            if (_assetRecords.TryGetValue(key!, out var existing) && File.Exists(existing.FilePath))
+            {
+                // Idempotent: called again with the file this record already points at, do nothing at all.
+                // Deleting there would destroy the cache entry it was asked to create.
+                if (string.Equals(existing.FilePath, filePath, StringComparison.OrdinalIgnoreCase))
+                    return existing.FilePath;
+
+                // Someone else already landed these bytes. Drop the duplicate rather than churn the cache.
+                try { File.Delete(filePath); } catch { /* temp sweep gets it */ }
+                return existing.FilePath;
+            }
+        }
+
+        var extension = format;
+        if (string.IsNullOrEmpty(extension))
+            extension = Path.GetExtension(filePath);
+        if (!string.IsNullOrEmpty(extension) && !extension!.StartsWith("."))
+            extension = "." + extension;
+
+        var targetPath = Path.Combine(GetAssetCachePath(), key + extension);
+        long size;
+        try
+        {
+            // A rename inside our own base path, not a copy: the temp directory and the cache are the
+            // same volume by construction.
+            File.Move(filePath, targetPath, true);
+            size = new FileInfo(targetPath).Length;
+        }
+        catch (Exception ex)
+        {
+            Logger.Error($"LocalDB: failed to adopt gathered asset {localUri}: {ex.Message}");
+            return null;
+        }
+
+        var record = new LocalAssetRecord
+        {
+            Hash = key!,
+            LocalUri = localUri,
+            FilePath = targetPath,
+            OriginalPath = localUri,
+            OriginalFileName = key + extension,
+            ImportedAt = DateTime.UtcNow,
+            FileSize = size,
+            // Adoption moves the bytes as they arrived. At-rest wrapping would mean reading and rewriting
+            // the whole file here, which is the cost this path exists to avoid; reads detect the header
+            // either way, so a plaintext entry in an otherwise encrypted cache still loads.
+            Encrypted = false,
+            Verified = false
+        };
+
+        lock (_lock)
+        {
+            _assetRecords[key!] = record;
+        }
+
+        _ = SaveAssetRecordsAsync();
+        VerifyAdoptedInBackground(key!, targetPath);
+
+        Logger.Log($"LocalDB: adopted gathered asset -> {localUri} ({size} bytes, '{extension}')");
+        return targetPath;
+    }
+
+    // A derived asset's key is a base hash plus a suffix, so it is not a hash of its own contents and
+    // there is nothing here to check it against. Only a bare hash gets verified.
+    private static bool IsContentHashKey(string key)
+    {
+        if (key.Length != 64)
+            return false;
+        foreach (var c in key)
+        {
+            bool hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+            if (!hex)
+                return false;
+        }
+        return true;
+    }
+
+    private void VerifyAdoptedInBackground(string key, string path)
+    {
+        if (!IsContentHashKey(key))
+            return;
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                var actual = await ComputeFileHashAsync(path);
+                if (actual == key)
+                {
+                    lock (_lock)
+                    {
+                        if (_assetRecords.TryGetValue(key, out var record))
+                            record.Verified = true;
+                    }
+                    await SaveAssetRecordsAsync();
+                    return;
+                }
+
+                Logger.Error($"LocalDB: adopted asset '{key}' hashes to '{actual}'; a peer served content that is not what was asked for. Dropping it.");
+                bool dropped;
+                lock (_lock)
+                {
+                    // Only drop the entry that is still the one we adopted. A legitimate local import of
+                    // the same hash can have replaced it while this was hashing, and that one is sound.
+                    dropped = _assetRecords.TryGetValue(key, out var record)
+                        && string.Equals(record.FilePath, path, StringComparison.OrdinalIgnoreCase)
+                        && _assetRecords.Remove(key);
+                }
+
+                if (!dropped)
+                    return;
+
+                try { File.Delete(path); } catch { /* record is gone either way */ }
+                await SaveAssetRecordsAsync();
+            }
+            catch (Exception ex)
+            {
+                Logger.Warn($"LocalDB: could not verify adopted asset '{key}': {ex.Message}");
+            }
+        });
     }
 
     // METADATA
@@ -639,6 +797,11 @@ public class LocalAssetRecord
     // which detects the encryption header regardless of this flag, so a plaintext/legacy file still
     // reads correctly even if the flag is stale. FileSize is the PLAINTEXT length.
     public bool Encrypted { get; set; }
+
+    // False only between a peer-gathered file being adopted under the hash in its URI and the background
+    // check confirming the bytes hash to that. Defaults true so every record written before this existed,
+    // and every record whose bytes we hashed ourselves, reads back as settled.
+    public bool Verified { get; set; } = true;
 
     // Reserved. The current model uses a single machine-bound master key (see LocalEncryption),
     // not a per-asset key, so this stays null. Kept for a future per-asset / server-issued key scheme.

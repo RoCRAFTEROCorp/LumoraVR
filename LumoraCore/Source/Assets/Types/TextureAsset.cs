@@ -46,6 +46,11 @@ public class TextureAsset : ImplementableAsset<ITextureAssetHook>
 
     public bool HasMipmaps => _hasMipmaps;
 
+    // Layout of PixelData and MipLevels. RGBA8 for everything except a floating-point source,
+    // which is held as RGBA half floats. Anything that reads PixelData as bytes-per-channel must
+    // check this first. -xlinka
+    public TextureFormatKind PixelFormat { get; private set; } = TextureFormatKind.RGBA8;
+
     // Counted, mips included.
     public long MemorySize
     {
@@ -107,7 +112,8 @@ public class TextureAsset : ImplementableAsset<ITextureAssetHook>
 
         Task<byte[]>? prefetch = null;
 
-        if (db != null && baseUri != null && sourceMeta != null)
+        // The ladder is RGBA8. An HDR source has no rung in it and loads from its own bytes only.
+        if (db != null && baseUri != null && sourceMeta != null && !sourceMeta.IsHdr)
         {
             var chain = TextureLoadChain.Build(sourceMeta.Width, sourceMeta.Height, descriptor);
             if (cloudHash != null)
@@ -167,11 +173,29 @@ public class TextureAsset : ImplementableAsset<ITextureAssetHook>
             return;
         }
 
+        bool normalMap = descriptor.IsNormalMap || (sourceMeta?.IsNormalMap ?? false);
+
+        if (TextureMetadata.DetectHdr(bytes))
+        {
+            await LoadHdrSourceAsync(bytes, descriptor, normalMap).ConfigureAwait(false);
+            return;
+        }
+
         int width, height;
         byte[]? rgba;
         try
         {
-            rgba = TextureVariantStore.DecodeRgba(bytes, out width, out height);
+            // Decoding a full-resolution source image is real CPU work, and this line runs on whichever
+            // thread completed the gather. Say where it goes instead of taking whatever the completer
+            // was standing on. -xlinka
+            var decoded = await DecodeOffThread(() =>
+            {
+                var pixels = TextureVariantStore.DecodeRgba(bytes, out int w, out int h);
+                return (Pixels: pixels, Width: w, Height: h);
+            }).ConfigureAwait(false);
+            rgba = decoded.Pixels;
+            width = decoded.Width;
+            height = decoded.Height;
         }
         catch (Exception ex)
         {
@@ -200,7 +224,7 @@ public class TextureAsset : ImplementableAsset<ITextureAssetHook>
                 ? TextureMetadata.ComputeGpuBytes(TextureFormatKind.RGBA8, width, height, mipCount)
                 : (long)width * height * 4,
             TextureMetadata.DetectSRgb(bytes),
-            descriptor.IsNormalMap);
+            normalMap);
 
         var original = new TextureVariantId(0, descriptor.GenerateMipmaps, descriptor.Compression);
         if (!TryClaimRank(System.Math.Max(width, height)))
@@ -221,6 +245,58 @@ public class TextureAsset : ImplementableAsset<ITextureAssetHook>
             await Hook.WaitForUploadAsync().ConfigureAwait(false);
     }
 
+    // Floating-point sources: decode to half, keep the full range all the way to the renderer. No
+    // ladder, no preview rung, and the resolution cap does not apply, because every one of those
+    // is an RGBA8 mechanism and an RGBA8 copy of a radiance map is a different, clipped picture.
+    // Decode failure here fails the load outright rather than falling back to the 8-bit decoder,
+    // which would put that clipped picture on screen and call it done. -xlinka
+    private async Task LoadHdrSourceAsync(byte[] bytes, TextureVariantDescriptor descriptor, bool normalMap)
+    {
+        int width, height;
+        byte[]? half;
+        try
+        {
+            var decoded = await DecodeOffThread(() =>
+            {
+                var pixels = TextureVariantStore.DecodeRgbaHalf(bytes, out int w, out int h);
+                return (Pixels: pixels, Width: w, Height: h);
+            }).ConfigureAwait(false);
+            half = decoded.Pixels;
+            width = decoded.Width;
+            height = decoded.Height;
+        }
+        catch (Exception ex)
+        {
+            FailLoad($"Failed to decode HDR image {AssetURL}: {ex.Message}");
+            return;
+        }
+
+        if (half == null || width <= 0 || height <= 0)
+        {
+            FailLoad($"Failed to decode HDR image {AssetURL}: no HDR decoder for this format on this build");
+            return;
+        }
+
+        int mipCount = descriptor.GenerateMipmaps ? TextureMetadata.FullMipCount(width, height) : 1;
+        var metadata = TextureMetadata.AnalyzeHalf(
+            half, width, height, mipCount,
+            bytes.LongLength,
+            TextureMetadata.ComputeGpuBytes(TextureFormatKind.RGBA16F, width, height, mipCount),
+            normalMap);
+
+        if (!TryClaimRank(System.Math.Max(width, height)))
+            return;
+
+        Metadata = metadata;
+        LoadedVariant = new TextureVariantId(0, descriptor.GenerateMipmaps, descriptor.Compression);
+
+        SetHdrImageData(half, width, height, descriptor.GenerateMipmaps);
+        Hook?.SetWrapMode(descriptor.WrapU, descriptor.WrapV);
+
+        if (Hook != null)
+            await Hook.WaitForUploadAsync().ConfigureAwait(false);
+    }
+
     private Task<byte[]> StartGather(Uri url) => AssetManager.RequestGather(url);
 
     // The address of a variant we can actually get hold of, or null if asking would be a wasted trip.
@@ -234,7 +310,7 @@ public class TextureAsset : ImplementableAsset<ITextureAssetHook>
         if (id.IsOriginal)
             return null;
 
-        var uri = TextureVariantStore.GetVariantUri(baseUri, id);
+        var uri = TextureVariantStore.GetVariantUri(baseUri, id.Storage);
         if (uri == null)
             return null;
 
@@ -257,7 +333,9 @@ public class TextureAsset : ImplementableAsset<ITextureAssetHook>
 
         var (width, height) = target.ResolveSize(sourceMeta.Width, sourceMeta.Height);
         int mipCount = descriptor.GenerateMipmaps ? TextureMetadata.FullMipCount(width, height) : 1;
-        return TextureGpuCache.IsCached(db, baseUri, target, width, height, mipCount);
+        string intent = TextureGpuCache.Intent(
+            sourceMeta.HasAlpha, descriptor.IsNormalMap || sourceMeta.IsNormalMap, sourceMeta.IsHdr);
+        return TextureGpuCache.IsCached(db, baseUri, target, width, height, mipCount, intent);
     }
 
     // Fetch one rung and put it on screen. gather is a transfer already in flight for this rung's
@@ -271,7 +349,7 @@ public class TextureAsset : ImplementableAsset<ITextureAssetHook>
         Task<byte[]>? gather,
         bool final)
     {
-        var variantUri = gather != null ? TextureVariantStore.GetVariantUri(baseUri, id) : ResolveReachableVariantUri(db, baseUri, id);
+        var variantUri = gather != null ? TextureVariantStore.GetVariantUri(baseUri, id.Storage) : ResolveReachableVariantUri(db, baseUri, id);
         if (variantUri == null)
             return false;
 
@@ -292,7 +370,7 @@ public class TextureAsset : ImplementableAsset<ITextureAssetHook>
             return false;
         }
 
-        var data = TextureVariantStore.Decode(blob);
+        var data = await DecodeOffThread(() => TextureVariantStore.Decode(blob)).ConfigureAwait(false);
         if (data == null)
         {
             if (blob != null && final)
@@ -305,7 +383,7 @@ public class TextureAsset : ImplementableAsset<ITextureAssetHook>
         // content hash and every session would pull it again. -xlinka
         if (!local && blob != null)
         {
-            await db.SaveDerivedAssetAsync(baseUri, id.Identifier, blob, TextureVariantStore.VariantExtension)
+            await db.SaveDerivedAssetAsync(baseUri, id.Storage.Identifier, blob, TextureVariantStore.VariantExtension)
                 .ConfigureAwait(false);
         }
 
@@ -374,6 +452,28 @@ public class TextureAsset : ImplementableAsset<ITextureAssetHook>
         _width = width;
         _height = height;
         _hasMipmaps = mipmaps;
+        PixelFormat = TextureFormatKind.RGBA8;
+        Version++;
+
+        Upload(generateMipmaps: mipmaps);
+    }
+
+    // RGBA half floats, 8 bytes per pixel, rows top-down like everything else.
+    public void SetHdrImageData(byte[] rgbaHalf, int width, int height, bool mipmaps = false)
+    {
+        if (rgbaHalf == null)
+            throw new ArgumentNullException(nameof(rgbaHalf));
+
+        long expectedSize = (long)width * height * 8;
+        if (rgbaHalf.LongLength < expectedSize)
+            throw new ArgumentException($"Pixel data too small. Expected at least {expectedSize} bytes, got {rgbaHalf.LongLength}");
+
+        _pixelData = rgbaHalf;
+        _mipLevels = new[] { rgbaHalf };
+        _width = width;
+        _height = height;
+        _hasMipmaps = mipmaps;
+        PixelFormat = TextureFormatKind.RGBA16F;
         Version++;
 
         Upload(generateMipmaps: mipmaps);
@@ -391,6 +491,7 @@ public class TextureAsset : ImplementableAsset<ITextureAssetHook>
         _width = width;
         _height = height;
         _hasMipmaps = levels.Length > 1;
+        PixelFormat = TextureFormatKind.RGBA8;
         Version++;
 
         Upload(generateMipmaps: false);
@@ -416,7 +517,8 @@ public class TextureAsset : ImplementableAsset<ITextureAssetHook>
             {
                 cacheKey = TextureGpuCache.BuildKey(
                     AssetURL.OriginalString, LoadedVariant,
-                    metadata.Width, metadata.Height, metadata.MipCount);
+                    metadata.Width, metadata.Height, metadata.MipCount,
+                    TextureGpuCache.Intent(metadata.HasAlpha, metadata.IsNormalMap, metadata.IsHdr));
                 cacheDirectory = db.GetGpuCachePath();
             }
         }
@@ -431,6 +533,7 @@ public class TextureAsset : ImplementableAsset<ITextureAssetHook>
             HasAlpha = metadata?.HasAlpha ?? true,
             IsNormalMap = metadata?.IsNormalMap ?? false,
             SRgb = metadata?.SRgb,
+            IsHdr = PixelFormat == TextureFormatKind.RGBA16F,
             CacheKey = cacheKey,
             CacheDirectory = cacheDirectory,
             Report = ReportUploaded,
@@ -463,6 +566,7 @@ public class TextureAsset : ImplementableAsset<ITextureAssetHook>
         _width = 0;
         _height = 0;
         _hasMipmaps = false;
+        PixelFormat = TextureFormatKind.RGBA8;
         Metadata = null;
         LoadedVariant = null;
         lock (_deliveryLock)

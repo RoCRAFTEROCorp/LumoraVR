@@ -190,4 +190,11 @@ public abstract class LoadableAsset : Asset
     /// Only invoked for URL (static) instances; procedural instances never call this.
     /// </summary>
     protected abstract Task LoadSelf();
+
+    // Run the CPU half of a load somewhere a stall is harmless. ProcessUpdate starts on the pool, but
+    // a LoadSelf resumes on whatever thread completed its gather, and that is the world update loop -
+    // so a decode written as a plain call after an await is one context capture away from freezing a
+    // frame for as long as the parse takes. Hopping here states the placement instead of inheriting
+    // it, and it holds no matter who completes the gather or what context they carry. -xlinka
+    protected static Task<T> DecodeOffThread<T>(Func<T> decode) => Task.Run(decode);
 }

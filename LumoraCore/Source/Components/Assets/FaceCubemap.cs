@@ -65,6 +65,11 @@ public class FaceCubemap : DynamicAssetProvider<CubemapAsset>, ICustomInspectorU
                 _status = $"waiting for {(CubemapFace)i}";
                 return;
             }
+            if (texture.PixelFormat != TextureFormatKind.RGBA8)
+            {
+                _status = $"{(CubemapFace)i} is {texture.PixelFormat.Label()}; faces must be 8-bit";
+                return;
+            }
             sources[i] = texture;
         }
 
