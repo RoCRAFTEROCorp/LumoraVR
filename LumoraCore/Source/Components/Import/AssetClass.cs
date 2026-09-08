@@ -22,4 +22,5 @@ public enum AssetClass
     Cubemap,
     Special,
     Shader,
+    Package,
 }

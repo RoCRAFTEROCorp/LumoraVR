@@ -32,6 +32,14 @@ public class SkeletonBuilder : ImplementableComponent
 
     public bool BoneHierarchyChanged { get; set; }
 
+    // Raised by the rendering hook once the platform skeleton actually exists. A skinned mesh cannot
+    // build until then, and the ref being ASSIGNED is not the same event as the skeleton being READY -
+    // the builder's own hook may not have run yet. Without this a renderer that binds too early simply
+    // never builds, and polling for it instead costs a full mesh rebuild every frame. -xlinka
+    public event System.Action? SkeletonReady;
+
+    public void NotifySkeletonReady() => SkeletonReady?.Invoke();
+
     // LIFECYCLE
 
     public override void OnAwake()
@@ -44,7 +52,7 @@ public class SkeletonBuilder : ImplementableComponent
         BoneNames.OnChanged += (list) => BoneHierarchyChanged = true;
         BoneSlots.OnChanged += (list) => BoneHierarchyChanged = true;
 
-        LumoraLogger.Log($"SkeletonBuilder: Awake on slot '{Slot.SlotName.Value}'");
+        LumoraLogger.Debug($"SkeletonBuilder: Awake on slot '{Slot.SlotName.Value}'");
     }
 
     public override void OnStart()
@@ -70,7 +78,7 @@ public class SkeletonBuilder : ImplementableComponent
     public override void OnDestroy()
     {
         base.OnDestroy();
-        LumoraLogger.Log($"SkeletonBuilder: Destroyed on slot '{Slot?.SlotName.Value}'");
+        LumoraLogger.Debug($"SkeletonBuilder: Destroyed on slot '{Slot?.SlotName.Value}'");
     }
 
     // PUBLIC API
@@ -112,7 +120,7 @@ public class SkeletonBuilder : ImplementableComponent
 
         BoneHierarchyChanged = true;
 
-        LumoraLogger.Log($"SkeletonBuilder: Added bone '{boneName}' (total: {BoneNames.Count})");
+        LumoraLogger.Debug($"SkeletonBuilder: Added bone '{boneName}' (total: {BoneNames.Count})");
     }
 
     public int GetBoneIndex(string boneName)
@@ -143,7 +151,7 @@ public class SkeletonBuilder : ImplementableComponent
         IsBuilt.Value = false;
         BoneHierarchyChanged = true;
 
-        LumoraLogger.Log("SkeletonBuilder: Cleared all bones");
+        LumoraLogger.Debug("SkeletonBuilder: Cleared all bones");
     }
 
     // PRIVATE METHODS

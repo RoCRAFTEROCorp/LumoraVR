@@ -233,23 +233,67 @@ public abstract class ImportDialog : Component
         var bLE = body.AttachComponent<LayoutElement>();
         bLE.FlexibleHeight.Value = 1f;
         bLE.MinHeight.Value = 200f;
+
+        // Body MUST carry its own layout controller. Without one, a fresh RectTransform is a 100x100
+        // box centred in its parent, so every row a dialog added landed on top of every other row in
+        // the middle of the panel - which is exactly how all of these looked. The page's own
+        // VerticalLayout only arranges the header and this Body slot; it does not reach inside. -xlinka
+        var bodyLayout = body.AttachComponent<VerticalLayout>();
+        bodyLayout.Spacing.Value = 6f;
+        bodyLayout.PaddingLeft.Value = GridPadding;
+        bodyLayout.PaddingRight.Value = GridPadding;
+        bodyLayout.PaddingTop.Value = 4f;
+        bodyLayout.PaddingBottom.Value = 4f;
+        bodyLayout.ForceExpandWidth.Value = true;
+        bodyLayout.ForceExpandHeight.Value = false;
+
         var bodyBuilder = new UIBuilder(body);
         if (_fontProvider != null) bodyBuilder.Font(_fontProvider);
         bodyBuilder.FontSize(13f);
         return bodyBuilder;
     }
 
-    // Attach GridLayout directly to the body slot. Subsequent GridButton calls
-    // add direct children of body which the grid arranges into rows x cols. - xlinka
+    // The button grid gets its OWN row under the body, and the builder is pointed at it so existing
+    // `SetupGrid(body); GridButton(body, ...)` call sites keep working unchanged.
+    //
+    // It used to attach a GridLayout to the body slot itself, which meant the grid then arranged every
+    // piece of content the dialog had already added as though it were a button - text, spacers and all -
+    // packing them into three columns on top of each other. -xlinka
     protected void SetupGrid(UIBuilder ui)
     {
-        var grid = ui.Current.AttachComponent<GridLayout>();
+        var row = ui.Current.AddSlot("Buttons");
+        row.AttachComponent<RectTransform>();
+
+        _gridRowElement = row.AttachComponent<LayoutElement>();
+        _gridRowElement.FlexibleHeight.Value = 0f;
+        _gridButtonCount = 0;
+        GrowGridRow();
+
+        var grid = row.AttachComponent<GridLayout>();
         grid.Columns.Value = GridItemsPerRow;
         grid.Spacing.Value = GridItemSpacing;
         grid.PaddingLeft.Value = GridPadding;
         grid.PaddingRight.Value = GridPadding;
         grid.PaddingTop.Value = GridPadding;
         grid.PaddingBottom.Value = GridPadding;
+
+        ui.NestInto(row);
+    }
+
+    private LayoutElement? _gridRowElement;
+    private int _gridButtonCount;
+
+    // The row has to be tall enough for however many buttons actually get added, which is only known
+    // as they arrive - a fixed height clips the second row the moment a dialog has four buttons.
+    private void GrowGridRow()
+    {
+        if (_gridRowElement == null)
+            return;
+
+        int rows = System.Math.Max(1, (_gridButtonCount + GridItemsPerRow - 1) / GridItemsPerRow);
+        float height = rows * ButtonHeight + (rows - 1) * GridItemSpacing + GridPadding * 2f;
+        _gridRowElement.MinHeight.Value = height;
+        _gridRowElement.PreferredHeight.Value = height;
     }
 
     protected void SetupCheckbox(UIBuilder ui, Sync<bool> field, string label)
@@ -282,6 +326,9 @@ public abstract class ImportDialog : Component
     // with rounded corners, centered label. - xlinka
     protected void GridButton(UIBuilder ui, string label, Action onClick, color? tint = null)
     {
+        _gridButtonCount++;
+        GrowGridRow();
+
         var slot = ui.Current.AddSlot(label);
         slot.AttachComponent<RectTransform>();
         var le = slot.AttachComponent<LayoutElement>();

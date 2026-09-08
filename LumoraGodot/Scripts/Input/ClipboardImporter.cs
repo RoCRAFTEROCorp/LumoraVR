@@ -472,9 +472,16 @@ public partial class ClipboardImporter : Node
             localUri = await _localDB.ImportLocalAssetAsync(filePath, LocalDB.ImportLocation.Copy);
         }
 
+        // TWO-SIDED VIA THE MATERIAL, NOT VIA A SECOND QUAD.
+        //
+        // QuadMesh.DualSided builds a SECOND quad rotated 180 degrees about up, which is exactly
+        // coplanar with the first. Two overlapping surfaces at identical depth is the classic setup for
+        // the picture flickering between two versions of itself as the viewer moves, and the second one
+        // is UV-mirrored so the two states look like two different images. It also doubles the geometry
+        // for something the material can do for free. -xlinka
         var quadMesh = imageSlot.AttachComponent<LumoraMeshes.QuadMesh>();
         quadMesh.Size.Value = new float2(1.0f, 1.0f);
-        quadMesh.DualSided.Value = true;
+        quadMesh.DualSided.Value = false;
 
         var meshRenderer = imageSlot.AttachComponent<MeshRenderer>();
         meshRenderer.Mesh.Target = quadMesh;
@@ -495,9 +502,8 @@ public partial class ClipboardImporter : Node
 
         var material = imageSlot.AttachComponent<UnlitMaterial>();
         material.Texture.Target = imageProvider;
-        material.TextureScale.Value = new float2(-1f, 1f);
-        material.TextureOffset.Value = new float2(1f, 0f);
         material.BlendMode.Value = BlendMode.Transparent;
+        material.Culling.Value = Culling.None;
         meshRenderer.Material.Target = material;
 
         GD.Print($"ClipboardImporter: Image populated with visual components from {localUri ?? filePath}");
@@ -531,19 +537,39 @@ public partial class ClipboardImporter : Node
         });
     }
 
+    // An import is not over when the last component is attached. Every MeshProvider the importer leaves
+    // behind still has a file to read and decode, and that tail is where the time and the memory go - so
+    // this holds the readout and this task open across it, and rides the TARGET SLOT's lifetime while it
+    // waits: delete the model, or leave the world, and the next world hop cancels instead of dropping
+    // chunks onto a corpse. -xlinka
     public async Task PopulateModelSlotAsync(Slot slot, string filePath, bool isAvatar, ModelImportSettings? settings = null)
     {
         GD.Print($"ClipboardImporter: Populating model slot as {(isAvatar ? "avatar" : "3D model")}: {filePath}");
 
+        var importWorld = slot?.World;
+        if (slot == null || slot.IsDestroyed || importWorld == null)
+        {
+            GD.PrintErr($"ClipboardImporter: import target for {filePath} is gone before the import started");
+            return;
+        }
+
+        // Opened here rather than left to the caller so every entry point (dialog, raw-file route, drop)
+        // gets the same owner. It has to happen before the first await: the async builder rewinds the
+        // execution context around the prologue, so the scope reaches this method's continuations only.
+        WorldContext.Enter(importWorld, slot);
+
         // Show an IN-WORLD progress indicator (3D, in front of the user), not a flat screen
         // overlay. It's non-modal: the game stays interactive while it loads (freeze fix) and the user sees a
         // floating title + percent + progress bar in the world. Driven straight off the importer's progress. -xlinka
-        var importWorld = slot.World;
         var title = isAvatar
             ? "Import.Title.Avatar".AsLocale("Importing avatar")
             : "Import.Title.Model".AsLocale("Importing model");
-        ModelImportIndicator.Show(importWorld, slot, title);
-        var progress = new Progress<ImportProgress>(u => ModelImportIndicator.Report(u));
+        var token = ModelImportIndicator.Show(importWorld, slot, title);
+        // The importer calls Complete when its last chunk lands, which is not a finish the meshes have
+        // reached yet. Hold that back to the mesh band so the bar cannot read 100% while nine files are
+        // still decoding - that readout is exactly what told the user "imported" before the machine died.
+        var progress = new Progress<ImportProgress>(u => ModelImportIndicator.Report(
+            u.Stage == ImportStage.Complete ? new ImportProgress(ImportStage.Meshes, MeshWaitStart) : u, token));
         bool finished = false;
         try
         {
@@ -558,24 +584,143 @@ public partial class ClipboardImporter : Node
             {
                 result = await ModelImporter.ImportModelAsync(filePath, slot, settings, _localDB, progress);
             }
-            if (result.Success)
-            {
-                ModelImportIndicator.Hide();
-                OnAssetImported?.Invoke(filePath, result.RootSlot);
-            }
-            else
+            if (!result.Success)
             {
                 // The readout says why and stays up long enough to read it. Without this the plate
                 // just vanished and a failed import looked identical to a finished one. -xlinka
-                ModelImportIndicator.Fail(result.ErrorMessage);
+                finished = true;
+                ModelImportIndicator.Fail(result.ErrorMessage, token);
                 GD.PrintErr($"ClipboardImporter: Model import failed: {result.ErrorMessage}");
+                return;
             }
+
+            var (loaded, failedMeshes) = await AwaitMeshesAsync(result.RootSlot, token);
             finished = true;
+            if (failedMeshes > 0)
+            {
+                var reason = $"{failedMeshes} of {loaded + failedMeshes} meshes failed to load";
+                ModelImportIndicator.Fail(reason, token);
+                GD.PrintErr($"ClipboardImporter: {reason} for {filePath}");
+                return;
+            }
+
+            ModelImportIndicator.Hide(token);
+            OnAssetImported?.Invoke(filePath, result.RootSlot);
+        }
+        catch (OperationCanceledException)
+        {
+            // The target slot was destroyed or its world went away. Nothing to finish, nobody to tell.
+            finished = true;
+            ModelImportIndicator.Dismiss(token);
+            GD.Print($"ClipboardImporter: import of {filePath} cancelled - its target is gone");
         }
         finally
         {
             if (!finished)
-                ModelImportIndicator.Fail(null!);
+                ModelImportIndicator.Fail(null!, token);
+        }
+    }
+
+    // Where the readout sits once the importer is done attaching and the mesh files are still loading.
+    private const float MeshWaitStart = 0.95f;
+
+    // No mesh has resolved either way for this long: stop waiting and call the rest failed. The files are
+    // local and already baked, so a minute and a half of no movement is a stuck load, not a slow one, and
+    // hanging the readout there forever is the same silence this whole change is about. -xlinka
+    private const long MeshStallMs = 90_000;
+
+    // A provider only starts loading once a renderer's AssetRef resolves and takes a reference, which
+    // lands a frame or more after the component is attached. Until this is up, an unreferenced provider
+    // counts as outstanding - treating it as "nothing is loading it" on the first poll would declare the
+    // whole import finished before a single mesh had been asked for. -xlinka
+    private const long MeshBindGraceMs = 3_000;
+
+    // Returns (loaded, failed). Polls one frame at a time instead of subscribing: the counts are a handful
+    // of field reads on a handful of providers, and the world hop is also the cancellation point that
+    // notices the target going away. -xlinka
+    private static async Task<(int loaded, int failed)> AwaitMeshesAsync(Slot rootSlot, object token)
+    {
+        // Resumes on the world thread, where reading the data model is legal, and throws once the owner
+        // is gone.
+        await WorldContext.NextUpdate();
+
+        if (rootSlot == null || rootSlot.IsDestroyed)
+            return (0, 0);
+
+        var providers = new List<MeshProvider>();
+        rootSlot.GetComponentsInChildren(providers);
+        if (providers.Count == 0)
+            return (0, 0);
+
+        int settled = -1;
+        long started = System.Environment.TickCount64;
+        long stallSince = started;
+        bool warnedUnbound = false;
+
+        while (true)
+        {
+            bool graceOver = System.Environment.TickCount64 - started > MeshBindGraceMs;
+            int waiting = 0;
+            int loaded = 0;
+            int failed = 0;
+            int unbound = 0;
+
+            foreach (var provider in providers)
+            {
+                if (provider == null || provider.IsDestroyed)
+                    continue;
+
+                if (provider.AssetReferenceCount == 0 && !provider.IsAssetAvailable)
+                {
+                    // Past the grace period nothing is ever going to ask for this one, so waiting on it
+                    // would hang the readout on a mesh no renderer wants.
+                    if (graceOver)
+                    {
+                        unbound++;
+                        continue;
+                    }
+                    waiting++;
+                    continue;
+                }
+
+                waiting++;
+                if (provider.IsAssetAvailable)
+                    loaded++;
+                else if (!AssetReadiness.IsPending(provider))
+                    failed++; // load ran and gave up; it is never arriving
+            }
+
+            if (unbound > 0 && !warnedUnbound)
+            {
+                warnedUnbound = true;
+                GD.PrintErr($"ClipboardImporter: {unbound} mesh provider(s) have no renderer holding them; not waiting on those");
+            }
+
+            if (waiting == 0)
+                return (loaded, failed);
+
+            int done = loaded + failed;
+            if (done != settled)
+            {
+                settled = done;
+                stallSince = System.Environment.TickCount64;
+            }
+
+            ModelImportIndicator.Report(new ImportProgress(
+                ImportStage.Meshes,
+                MeshWaitStart + (1f - MeshWaitStart) * done / waiting,
+                done, waiting), token);
+
+            if (done >= waiting)
+                return (loaded, failed);
+
+            if (System.Environment.TickCount64 - stallSince > MeshStallMs)
+            {
+                GD.PrintErr($"ClipboardImporter: {waiting - done} mesh(es) stopped making progress; giving up on them");
+                return (loaded, waiting - loaded);
+            }
+
+            await WorldContext.NextUpdate();
         }
     }
 

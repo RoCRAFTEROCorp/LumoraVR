@@ -24,9 +24,9 @@ namespace Lumora.Core.Components;
 // the file is the only one who needs a progress bar for it, and the model itself is what everybody
 // else sees arrive.
 //
-// Threading: Show/Hide/Fail marshal onto the world thread (they touch the data model). Report only
-// writes volatile fields, because it is called from the importer's background stages; OnUpdate reads
-// them back on the world thread and writes the visuals only when they actually changed. -xlinka
+// Threading: the static calls are safe from any thread because none of them touch the data model -
+// they write volatile fields on the import's ticket. Only Show marshals, to raise the plate. OnUpdate
+// reads the ticket back on the world thread and writes the visuals only when they actually changed. -xlinka
 [ComponentCategory("Assets/Import")]
 public class ModelImportIndicator : Component
 {
@@ -59,12 +59,9 @@ public class ModelImportIndicator : Component
     private static readonly color FailFillColor = new color(0.90f, 0.32f, 0.30f, 1f);
     private static readonly color StatusColor = new color(0.78f, 0.84f, 0.94f, 1f);
 
-    // Written from the importer's threads, read on the world thread. Reference writes are atomic and
-    // the readout is allowed to be one frame behind, so there is no lock here on purpose.
-    private volatile string _statusText = string.Empty;
-    private volatile bool _done;
-    private volatile bool _failed;
-    private float _progress;
+    // The import this plate reports on. Every cross-thread write lands on the ticket, never on the
+    // component, so the readout is allowed to be one frame behind and there is no lock here on purpose.
+    private ImportTicket _ticket = new ImportTicket();
 
     private LocaleText _title;
     private float _lingerTimer;
@@ -77,8 +74,28 @@ public class ModelImportIndicator : Component
     private LumoraMeshes.RoundedQuadRingMesh? _rimMesh;
     private LumoraMeshes.RoundedQuadMesh? _fillMesh;
 
-    // Imports run one at a time, so one live indicator is all there is to track.
+    // ONE PLATE, ONE TICKET PER IMPORT, AND THE TICKET IS THE TOKEN.
+    //
+    // A multi-file drop starts one import per file and the last Show takes the plate, so a call has to
+    // say which import it speaks for or the first one to finish puts "Done" on somebody else's
+    // still-running readout, which is the same lie as hiding early.
+    //
+    // The state lives on the ticket rather than on the plate, and that is what covers the window between
+    // Show returning a token and the plate actually existing on the world thread. A Report landing in
+    // there updates its own import instead of painting the plate still up from the last one, and a Hide
+    // or a Fail landing in there retires the import before it has a plate, so the plate is born finished
+    // or never born at all - rather than appearing afterwards with nothing left alive to hide it. -xlinka
+    private sealed class ImportTicket
+    {
+        public volatile string Status = string.Empty;
+        public volatile float Progress;
+        public volatile bool Done;
+        public volatile bool Failed;
+        public volatile bool Dismissed;
+    }
+
     private static ModelImportIndicator _current = null!;
+    private static volatile ImportTicket? _active;
 
     public ModelImportIndicator()
     {
@@ -188,22 +205,29 @@ public class ModelImportIndicator : Component
     {
         base.OnUpdate(delta);
 
-        UpdatePosition(delta);
-        ApplyState();
+        var ticket = _ticket;
+        if (ticket.Dismissed)
+        {
+            Slot?.Destroy();
+            return;
+        }
 
-        if (_done || _failed)
+        UpdatePosition(delta);
+        ApplyState(ticket);
+
+        if (ticket.Done || ticket.Failed)
         {
             _lingerTimer += delta;
-            if (_lingerTimer >= (_failed ? LingerOnFail : LingerOnDone))
+            if (_lingerTimer >= (ticket.Failed ? LingerOnFail : LingerOnDone))
                 Slot?.Destroy();
         }
     }
 
-    private void ApplyState()
+    private void ApplyState(ImportTicket ticket)
     {
-        float progress = _failed ? _appliedProgress : System.Math.Clamp(_progress, 0f, 1f);
-        string status = _statusText ?? string.Empty;
-        bool failState = _failed;
+        bool failState = ticket.Failed;
+        float progress = failState ? _appliedProgress : System.Math.Clamp(ticket.Progress, 0f, 1f);
+        string status = ticket.Status ?? string.Empty;
 
         if (failState != _appliedFailState)
         {
@@ -271,23 +295,37 @@ public class ModelImportIndicator : Component
 
     // STATIC API - safe from any thread
 
-    public static void Show(World world, Slot anchor, LocaleText title)
+    // The returned token identifies THIS import. Pass it back to Report/Hide/Fail/Dismiss so a call
+    // that arrives after another import has taken the plate is dropped rather than applied to it.
+    public static object Show(World world, Slot anchor, LocaleText title)
     {
+        var ticket = new ImportTicket();
         if (world == null)
-            return;
+            return ticket;
 
+        // Published before the hop, so a Report or a Fail from the importer's threads reaches THIS import
+        // from the moment its caller holds the token. It reaches the ticket, not whatever plate happens to
+        // be up, which is why publishing early is safe here.
+        _active = ticket;
         world.RunSynchronously(() =>
         {
             try
             {
+                // Superseded by a later Show, or already cancelled: no plate to raise. The plate that is
+                // up stays up, because whoever superseded us clears it when they raise theirs.
+                if (!ReferenceEquals(_active, ticket) || ticket.Dismissed)
+                    return;
+
                 var previous = _current;
                 if (previous != null && !previous.IsDestroyed)
                     previous.Slot?.Destroy();
+                _current = null!;
 
                 var slot = world.RootSlot.AddLocalSlot("Import Indicator");
                 slot.Persistent.Value = false;
                 var indicator = slot.AttachComponent<ModelImportIndicator>();
                 indicator._title = title;
+                indicator._ticket = ticket;
                 if (indicator.TitleText.Target != null && !title.IsEmpty)
                     indicator.TitleText.Target.Text.Value = title.Resolve();
                 if (anchor != null && !anchor.IsDestroyed)
@@ -299,49 +337,79 @@ public class ModelImportIndicator : Component
                 LumoraLogger.Error($"ModelImportIndicator.Show: {ex.Message}");
             }
         });
+        return ticket;
     }
 
-    public static void Report(in ImportProgress progress)
+    // A token from another Show still names its own import, so it is answered rather than dropped: its
+    // plate is gone but its ticket is not, and writing there cannot touch the live one. No token at all
+    // means "whichever import is current", which is what the template callers pass.
+    private static ImportTicket? Resolve(object? token)
+        => token as ImportTicket ?? (token == null ? _active : null);
+
+    // Retire the ticket so a later call with no token cannot land on a finished import.
+    private static void Retire(ImportTicket ticket)
     {
-        var indicator = _current;
-        if (indicator == null || indicator.IsDestroyed)
+        if (ReferenceEquals(_active, ticket))
+            _active = null;
+    }
+
+    public static void Report(in ImportProgress progress, object? token = null)
+    {
+        var ticket = Resolve(token);
+        if (ticket == null)
             return;
 
         if (progress.Fraction >= 0f)
-            indicator._progress = progress.Fraction;
+            ticket.Progress = progress.Fraction;
 
         var text = progress.Describe();
-        indicator._statusText = text.IsEmpty ? string.Empty : text.Resolve();
+        ticket.Status = text.IsEmpty ? string.Empty : text.Resolve();
     }
 
     // Finished cleanly: the bar completes and the plate goes away a beat later, so the eye gets to see
     // it land instead of the readout just blinking out.
-    public static void Hide()
+    public static void Hide(object? token = null)
     {
-        var indicator = _current;
-        _current = null!;
-        if (indicator == null || indicator.IsDestroyed)
+        var ticket = Resolve(token);
+        if (ticket == null)
             return;
-        indicator._progress = 1f;
+
+        ticket.Progress = 1f;
         var done = new ImportProgress(ImportStage.Complete, 1f).Describe();
-        indicator._statusText = done.Resolve();
-        indicator._done = true;
+        ticket.Status = done.Resolve();
+        ticket.Done = true;
+        Retire(ticket);
     }
 
     // Failed: say WHY, in the world, for long enough to read, then go. A silent disappearance is
     // indistinguishable from the import having worked and the model being somewhere else. -xlinka
-    public static void Fail(string reason)
+    public static void Fail(string reason, object? token = null)
     {
-        var indicator = _current;
-        _current = null!;
-        if (indicator == null || indicator.IsDestroyed)
+        var ticket = Resolve(token);
+        if (ticket == null)
             return;
 
         var label = string.IsNullOrWhiteSpace(reason)
             ? "Import.Failed".AsLocale("Import failed")
             : "Import.FailedReason".AsLocale("Import failed: {0}", reason);
-        indicator._statusText = label.Resolve();
-        indicator._failed = true;
+        ticket.Status = label.Resolve();
+        ticket.Failed = true;
+        Retire(ticket);
+    }
+
+    // Cancelled: whatever the readout was reporting on is gone (the target slot was deleted, or the
+    // world was left), so there is nothing to call finished and nobody to read a failure. Take the
+    // plate away rather than leaving it hanging in front of the user at "Meshes 3 of 9". -xlinka
+    public static void Dismiss(object? token = null)
+    {
+        var ticket = Resolve(token);
+        if (ticket == null)
+            return;
+
+        // The plate reads this on its own update and destroys itself; a plate that does not exist yet
+        // reads it in Show and is never raised.
+        ticket.Dismissed = true;
+        Retire(ticket);
     }
 
     public override void OnDestroy()

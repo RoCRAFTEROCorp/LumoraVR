@@ -48,6 +48,9 @@ public static class UniversalImporter
             case AssetClass.Shader:
                 SpawnShaderDialog(list, world, position, rotation, silent);
                 break;
+            case AssetClass.Package:
+                SpawnPackageDialog(list, world, position, rotation, silent);
+                break;
             case AssetClass.PointCloud:
             case AssetClass.Unknown:
             case AssetClass.Document:
@@ -257,6 +260,7 @@ public static class UniversalImporter
     private static string ClassDisplayName(AssetClass assetClass) => assetClass switch
     {
         AssetClass.PointCloud => "Point cloud",
+        AssetClass.Package => "Object package",
         AssetClass.Unknown => "This file type",
         _ => assetClass.ToString(),
     };
@@ -272,6 +276,26 @@ public static class UniversalImporter
         slot.GlobalRotation = rotation;
         slot.GlobalScale = float3.One;
         return slot;
+    }
+
+    // A package is read and measured before anything is built, so this dialog opens on a readout of
+    // what would convert rather than on an import button. Deliberately ignores `silent`: there is
+    // nothing safe to do without being asked, because a conversion between engines always drops
+    // something and the user should see what before it happens. -xlinka
+    private static void SpawnPackageDialog(List<string> files, World world, float3 position, floatQ rotation, bool silent)
+    {
+        int index = 0;
+        int rowSize = (int)System.Math.Max(1, System.Math.Ceiling(System.Math.Sqrt(files.Count)));
+        foreach (var file in files)
+        {
+            var offset = GridOffset(ref index, rowSize);
+            var slot = CreateDialogSlot(world, "Package Importer", position + rotation * offset, rotation);
+            var dialog = slot.AttachComponent<PackageImportDialog>();
+            dialog.TargetWorld = world;
+            dialog.Paths.Add(file);
+            dialog.SetLocalUserAsImporting();
+            if (silent) dialog.RunImport();
+        }
     }
 
     private static void SpawnFolderDialog(string folder, World world, float3 position, floatQ rotation)

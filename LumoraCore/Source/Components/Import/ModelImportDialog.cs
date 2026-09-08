@@ -121,7 +121,11 @@ public sealed class ModelImportDialog : ImportDialog
     private void MenuCustom(UIBuilder ui)
     {
         var body = SetupSection(ui, "Advanced Settings");
+        // The body lays its children out now, so the scroll area has to ask for the leftover height.
+        // Without this it takes its preferred height, which for a scroll viewport is nothing. -xlinka
+        body.PushStyle().FlexibleHeight(1f);
         body.ScrollRect(out _, fitVertical: false);
+        body.PopStyle();
         body.VerticalLayout(4f, 4f);
 
         SetupCheckbox(body, AutoScale, "Auto Scale");
@@ -171,7 +175,11 @@ public sealed class ModelImportDialog : ImportDialog
             if (handler != null)
             {
                 var pathCaptured = file;
-                _ = handler.ImportAsync(s, pathCaptured, request);
+                // Owned by the slot the model imports into, not dropped on the floor. The dialog destroys
+                // itself on the next line, so it cannot be the owner; the target can, and that is the
+                // thing whose disappearance should stop the import. A discarded Task also swallowed every
+                // exception the import threw - this one is watched and logged. -xlinka
+                s.StartTask(() => handler.ImportAsync(s, pathCaptured, request));
             }
             else
             {

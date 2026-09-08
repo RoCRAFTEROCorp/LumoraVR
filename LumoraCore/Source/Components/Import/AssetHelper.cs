@@ -64,6 +64,11 @@ public static class AssetHelper
         // Volume / cubemap
         { ".cube", AssetClass.Volume },
 
+        // Shared object packages from other platforms. Self-contained archives: every mesh, texture
+        // and clip the object references travels inside the file, so importing one never needs the
+        // network.
+        { ".resonitepackage", AssetClass.Package },
+
         // Shader
         { ".gdshader", AssetClass.Shader }, { ".lumshader", AssetClass.Shader }, { ".glsl", AssetClass.Shader },
         { ".hlsl", AssetClass.Shader }, { ".shader", AssetClass.Shader },
