@@ -26,7 +26,7 @@ public class SphereCollider : Collider
     {
         base.OnAwake();
         Radius.OnChanged += _ => RunApplyChanges();
-        LumoraLogger.Log($"SphereCollider: Initialized with Radius={Radius.Value}");
+        LumoraLogger.Debug($"SphereCollider: Initialized with Radius={Radius.Value}");
     }
 
     // ABSTRACT METHOD IMPLEMENTATIONS

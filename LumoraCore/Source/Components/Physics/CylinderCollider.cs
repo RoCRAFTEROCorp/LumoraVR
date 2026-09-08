@@ -29,7 +29,7 @@ public class CylinderCollider : Collider
         base.OnAwake();
         Radius.OnChanged += _ => RunApplyChanges();
         Height.OnChanged += _ => RunApplyChanges();
-        LumoraLogger.Log($"CylinderCollider: Initialized with Radius={Radius.Value}, Height={Height.Value}");
+        LumoraLogger.Debug($"CylinderCollider: Initialized with Radius={Radius.Value}, Height={Height.Value}");
     }
 
     // ABSTRACT METHOD IMPLEMENTATIONS

@@ -26,7 +26,7 @@ public class BoxCollider : Collider
     {
         base.OnAwake();
         Size.OnChanged += _ => RunApplyChanges();
-        LumoraLogger.Log($"BoxCollider: Initialized with Size={Size.Value}");
+        LumoraLogger.Debug($"BoxCollider: Initialized with Size={Size.Value}");
     }
 
     // ABSTRACT METHOD IMPLEMENTATIONS

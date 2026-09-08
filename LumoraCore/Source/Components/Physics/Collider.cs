@@ -130,7 +130,7 @@ public abstract class Collider : ImplementableComponent
                 _ownerSearchComplete = true;
                 if (_owner == null)
                 {
-                    LumoraLogger.Log($"Collider: No owner found after {_updatesSinceAwake} updates, creating standalone static body");
+                    LumoraLogger.Debug($"Collider: No owner found after {_updatesSinceAwake} updates, creating standalone static body");
                 }
             }
 
@@ -181,7 +181,7 @@ public abstract class Collider : ImplementableComponent
         _owner = null!;
 
         base.OnDestroy();
-        LumoraLogger.Log($"Collider: Destroyed {GetType().Name}");
+        LumoraLogger.Debug($"Collider: Destroyed {GetType().Name}");
     }
 }
 

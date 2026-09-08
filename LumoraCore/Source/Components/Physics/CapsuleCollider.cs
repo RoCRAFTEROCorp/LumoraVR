@@ -36,7 +36,7 @@ public class CapsuleCollider : Collider
         base.OnAwake();
         Height.OnChanged += _ => RunApplyChanges();
         Radius.OnChanged += _ => RunApplyChanges();
-        LumoraLogger.Log($"CapsuleCollider: Initialized with Height={Height.Value}, Radius={Radius.Value}");
+        LumoraLogger.Debug($"CapsuleCollider: Initialized with Height={Height.Value}, Radius={Radius.Value}");
     }
 
     // ABSTRACT METHOD IMPLEMENTATIONS

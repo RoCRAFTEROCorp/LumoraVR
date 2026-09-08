@@ -73,7 +73,7 @@ public class RigidBody : ImplementableComponent
     public override void OnAwake()
     {
         base.OnAwake();
-        LumoraLogger.Log($"RigidBody: Initialized on '{Slot.SlotName.Value}' with Mass={Mass.Value}kg");
+        LumoraLogger.Debug($"RigidBody: Initialized on '{Slot.SlotName.Value}' with Mass={Mass.Value}kg");
     }
 
     public override void OnInit()

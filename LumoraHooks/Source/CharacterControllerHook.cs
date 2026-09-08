@@ -10,10 +10,6 @@ using LumoraLogger = Lumora.Core.Logging.Logger;
 
 namespace Lumora.Godot.Hooks;
 
-/// <summary>
-/// Hook for CharacterController component -> Godot CharacterBody3D.
-/// Platform physics hook for Godot.
-/// </summary>
 // Motion model: every step the body is RE-BASED from the engine root (plus the
 // head reference's ground projection in room-scale), the move is simulated,
 // and only the delta physics produced is written back to the root. Root edits
@@ -37,7 +33,6 @@ public partial class CharacterControllerHook : ComponentHook<CharacterController
     private Vector3 _moveDirection;
     private bool _jumpRequested;
     private bool _simulationEnabled = true;
-    private bool _isLocalUser;
     private bool _isCrouching;
     private float _currentHeight;
     private float _targetHeight;
@@ -63,25 +58,6 @@ public partial class CharacterControllerHook : ComponentHook<CharacterController
     }
 
     public CharacterBody3D GodotCharacterBody => _characterBody;
-
-    private static volatile CharacterBody3D _localPlayerBody = null!;
-
-    /// <summary>
-    /// The local player's Godot CharacterBody3D - set when the local user's hook is initialised, cleared on
-    /// destroy. Read (on the main thread) by DesktopCameraController for third-person orbit. The getter VALIDATES
-    /// the node is still alive and returns null otherwise, so a caller can never act on a stale/freed reference
-    /// (e.g. across a rapid world reload) - the validation lives here, not at each call site, so a future reader
-    /// can't forget it. The backing field is volatile and only ever assigned an atomic reference, so reading it
-    /// across threads is safe. No public mutable static remains. -xlinka
-    /// </summary>
-    public static CharacterBody3D LocalPlayerBody
-    {
-        get
-        {
-            var body = _localPlayerBody; // atomic reference read
-            return (body != null && GodotObject.IsInstanceValid(body)) ? body : null!;
-        }
-    }
 
     public override void Initialize()
     {
@@ -113,14 +89,6 @@ public partial class CharacterControllerHook : ComponentHook<CharacterController
         _currentHeight = Owner!.StandingHeight;
         _targetHeight = Owner.StandingHeight;
         _isCrouching = false;
-
-        // Check if this is the local user
-        var userRoot = Owner.Slot.GetComponent<UserRoot>();
-        _isLocalUser = userRoot?.ActiveUser == Owner.World?.LocalUser;
-
-        // Expose body for DesktopCameraController third-person mode
-        if (_isLocalUser)
-            _localPlayerBody = _characterBody;
     }
 
     public override void ApplyChanges()
@@ -389,9 +357,6 @@ public partial class CharacterControllerHook : ComponentHook<CharacterController
         return _characterBody != null && _characterBody.IsOnFloor();
     }
 
-    /// <summary>
-    /// Set the crouching state. Updates target height for smooth transition.
-    /// </summary>
     public void SetCrouching(bool crouching)
     {
         if (_isCrouching == crouching)
@@ -399,12 +364,9 @@ public partial class CharacterControllerHook : ComponentHook<CharacterController
 
         _isCrouching = crouching;
         _targetHeight = crouching ? Owner.CrouchHeight : Owner.StandingHeight;
-        LumoraLogger.Log($"CharacterControllerHook: Crouch={crouching}, TargetHeight={_targetHeight}");
+        LumoraLogger.Debug($"CharacterControllerHook: Crouch={crouching}, TargetHeight={_targetHeight}");
     }
 
-    /// <summary>
-    /// Update all collider shapes to match current height.
-    /// </summary>
     private void UpdateColliderHeights()
     {
         foreach (var kvp in _collisionShapes)
@@ -477,10 +439,6 @@ public partial class CharacterControllerHook : ComponentHook<CharacterController
 
     public override void Destroy(bool destroyingWorld)
     {
-        // Compare/clear the raw field (not the validated getter) so teardown clears OUR slot even mid-free. -xlinka
-        if (_isLocalUser && _localPlayerBody == _characterBody)
-            _localPlayerBody = null!;
-
         if (!destroyingWorld && _characterBody != null && GodotObject.IsInstanceValid(_characterBody))
         {
             _characterBody.QueueFree();

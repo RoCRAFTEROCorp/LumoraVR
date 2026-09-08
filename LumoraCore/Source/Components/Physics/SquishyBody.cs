@@ -111,6 +111,11 @@ public class SquishyBody : Component, IInputUpdateReceiver, ISoftBodySpace, ISof
     private bool _worldNear;                              // broadphase: a world collider overlaps the body this frame
     private readonly List<Slot> _nearSlots = new();       // world colliders currently near - to detect one intruding
     private readonly List<float3> _nearPos = new();
+    private readonly List<floatQ> _nearRot = new();
+    private float3 _boundsCentre;                         // body AABB this frame, from the collider snapshot
+    private float3 _boundsSize;
+    private SoftBodyBudget? _budget;
+    private World? _budgetWorld;
 
     public SquishyBody()
     {
@@ -190,6 +195,7 @@ public class SquishyBody : Component, IInputUpdateReceiver, ISoftBodySpace, ISof
             _paused = false;
             _solver.ResetToRest(this);
             _uploadedLocal = null;
+            InvalidateContacts();
         }
 
         SnapshotColliders();
@@ -199,8 +205,14 @@ public class SquishyBody : Component, IInputUpdateReceiver, ISoftBodySpace, ISof
             return;
 
         PushSolverParameters();
-        var budget = SoftBodyBudget.For(World);
+        if (!ReferenceEquals(_budgetWorld, World))
+        {
+            _budgetWorld = World;
+            _budget = SoftBodyBudget.For(World);
+        }
+        var budget = _budget;
         _solver.Iterations = ScaleIterations(IterationsForDistance(), budget);
+        _queryMargin = MathF.Max(_solver.AverageEdgeLength * 2f, MathF.Max(ParticleRadius.Value, 0f));
 
         // CLAMPED delta, and never one big step. SmoothDelta is an average of the RAW frame time with no
         // ceiling on it, so one world-load hitch drags it to a fifth of a second and stays there for a
@@ -218,7 +230,10 @@ public class SquishyBody : Component, IInputUpdateReceiver, ISoftBodySpace, ISof
             steps = MaxSubsteps;
         float sub = dt / steps;
         for (int i = 0; i < steps; i++)
+        {
+            _stepIndex++;
             _solver.Step(sub, now, this, this);
+        }
         WriteBack();
         budget?.Report(World?.Time.UpdateIndex ?? 0UL,
             (System.Diagnostics.Stopwatch.GetTimestamp() - start) * 1000.0 / System.Diagnostics.Stopwatch.Frequency);
@@ -350,44 +365,88 @@ public class SquishyBody : Component, IInputUpdateReceiver, ISoftBodySpace, ISof
         // World collision wake: run the broadphase here too so a dormant body wakes the instant a world
         // collider (a grabbed/pushed object, or the player) enters its bounds or moves within them. Resting
         // on a STATIC box keeps the box in the near-set but unmoving -> no wake -> the body stays asleep.
-        _worldNear = false;
+        //
+        // The overlap query is the one thing a dormant body still pays for every frame, and it is not
+        // free: it builds a shape and a query object on the platform side and walks node metadata for
+        // every hit. A body that is asleep and otherwise undisturbed asks every other frame instead; the
+        // wake it would trigger lands one frame later, which nothing can see. An awake body asks every
+        // frame because its contact cache below depends on knowing what moved. -xlinka
         if (CollideWithWorld.Value && World?.Physics != null)
         {
-            _solver.ComputeBounds(MathF.Max(ParticleRadius.Value, 0f), out var bc, out var bs);
-            _worldNear = World.Physics.OverlapBox(bc, bs, floatQ.Identity, _overlapScratch) > 0;
-            if (NearSetChangedOrMoved())
-                moved = true;
+            bool probe = moved || _solver.IsAwake || ((World.Time?.UpdateIndex ?? 0UL) & 1UL) == 0UL;
+            if (probe)
+            {
+                _worldNear = World.Physics.OverlapBox(_boundsCentre, _boundsSize, floatQ.Identity, _overlapScratch) > 0;
+                if (NearSetChangedOrMoved(out float displacement, out bool rotated))
+                {
+                    moved = true;
+                    // A collider that only translated cannot have come closer to any particle than the
+                    // distance it travelled, so free-air answers survive it as a debt against their
+                    // clearance. Cached surfaces do not: the plane they hold is the old one. Anything
+                    // entering, leaving or turning throws everything out.
+                    if (rotated || displacement < 0f)
+                        InvalidateContacts();
+                    else
+                    {
+                        _nearMotion += displacement;
+                        _surfaceEpoch++;
+                    }
+                }
+            }
+        }
+        else
+        {
+            _worldNear = false;
         }
         return moved;
     }
 
     // True if the set of nearby world colliders changed (one entered/left) or any of them moved since last
     // frame - i.e. something is intruding on or shifting against the body and it must wake. Rebuilds the
-    // cached near-set as a side effect. -xlinka
-    private bool NearSetChangedOrMoved()
+    // cached near-set as a side effect. Reports the largest translation of a surviving member and whether
+    // any of them turned; a membership change comes back as a negative displacement. -xlinka
+    private bool NearSetChangedOrMoved(out float displacement, out bool rotated)
     {
-        bool changed = _overlapScratch.Count != _nearSlots.Count;
-        if (!changed)
+        displacement = 0f;
+        rotated = false;
+        bool membership = _overlapScratch.Count != _nearSlots.Count;
+        if (!membership)
         {
             for (int i = 0; i < _overlapScratch.Count; i++)
             {
                 var s = _overlapScratch[i];
                 int idx = _nearSlots.IndexOf(s);
-                if (idx < 0 || float3.DistanceSquared(s.GlobalPosition, _nearPos[idx]) > 1e-8f)
+                if (idx < 0)
                 {
-                    changed = true;
+                    membership = true;
                     break;
                 }
+                float moved = float3.Distance(s.GlobalPosition, _nearPos[idx]);
+                if (moved > 1e-4f)
+                    displacement = MathF.Max(displacement, moved);
+                var rot = s.GlobalRotation;
+                var was = _nearRot[idx];
+                float dot = rot.x * was.x + rot.y * was.y + rot.z * was.z + rot.w * was.w;
+                if (MathF.Abs(dot) < 0.99999f)
+                    rotated = true;
             }
         }
         _nearSlots.Clear();
         _nearPos.Clear();
+        _nearRot.Clear();
         for (int i = 0; i < _overlapScratch.Count; i++)
         {
-            _nearSlots.Add(_overlapScratch[i]);
-            _nearPos.Add(_overlapScratch[i].GlobalPosition);
+            var s = _overlapScratch[i];
+            _nearSlots.Add(s);
+            _nearPos.Add(s.GlobalPosition);
+            _nearRot.Add(s.GlobalRotation);
         }
-        return changed;
+        if (membership)
+        {
+            displacement = -1f;
+            return true;
+        }
+        return displacement > 0f || rotated;
     }
 
     private void ArmReadyRetry()
@@ -454,6 +513,9 @@ public class SquishyBody : Component, IInputUpdateReceiver, ISoftBodySpace, ISof
         _lastColliderPos = null;
         _nearSlots.Clear();
         _nearPos.Clear();
+        _nearRot.Clear();
+        _contacts = new WorldContact[n];
+        InvalidateContacts();
         _lastSlotPos = Slot.GlobalPosition;
         _lastSlotRot = Slot.GlobalRotation;
 
@@ -465,6 +527,10 @@ public class SquishyBody : Component, IInputUpdateReceiver, ISoftBodySpace, ISof
         _deformed = deformedSlot.GetComponent<DeformableMesh>() ?? deformedSlot.AttachComponent<DeformableMesh>();
         _deformed.SetGeometry((float3[])localPositions.Clone(), indices, uvs);
         var renderer = deformedSlot.GetComponent<MeshRenderer>() ?? deformedSlot.AttachComponent<MeshRenderer>();
+        // Cloth is a single thin layer, so its shadow has to be cast from both faces. Under the default
+        // mode the shadow pass culls back faces and the sheet stops casting the moment a light is on
+        // its far side - the shadow lands on the wrong side of the surface, or vanishes.
+        renderer.ShadowCastMode.Value = Components.ShadowCastMode.DoubleSided;
         renderer.Mesh.Target = _deformed;
         if (Material.Target != null)
             renderer.Material.Target = Material.Target;
@@ -503,14 +569,13 @@ public class SquishyBody : Component, IInputUpdateReceiver, ISoftBodySpace, ISof
     // cloth drape over a static box and STAY there instead of sinking through it one frame at a time.
     // It is gated on the broadphase computed in CheckPerturbed, so a body falling through empty air does
     // zero world queries. -xlinka
-    bool ISoftBodyCollisionHandler.ResolveParticle(ref float3 position, float radius)
+    bool ISoftBodyCollisionHandler.ResolveParticle(int index, ref float3 position, float radius)
     {
         bool hit = false;
 
-        if (CollideWithWorld.Value && _worldNear && World?.Physics != null
-            && World.Physics.ResolveSphere(position, radius, _selfExclude, out var corrected, out _))
+        if (_worldNear && CollideWithWorld.Value && World?.Physics != null
+            && ResolveAgainstWorld(index, ref position, radius))
         {
-            position = corrected;
             hit = true;
         }
 
@@ -521,6 +586,138 @@ public class SquishyBody : Component, IInputUpdateReceiver, ISoftBodySpace, ISof
                 hit = true;
         }
         return hit;
+    }
+
+    // WORLD CONTACT CACHE
+    //
+    // Every world resolve is a platform physics query: a rest-info call that hands back a dictionary,
+    // and on a hit a walk up the node tree reading metadata to find the slot. Called once per free
+    // particle per substep that was the whole cost of a curtain somebody stood next to - seven hundred
+    // queries a frame to learn that most of the sheet was hanging in open air, and the constraint
+    // budget could not touch it because none of it was constraint work.
+    //
+    // So each particle remembers the answer it got and how long it stays true. Every query is made with
+    // the sphere grown by a margin, which turns a miss into a distance: nothing within the margin, or
+    // the nearest surface is this far along its normal. A particle in open air then does not ask again
+    // until it has travelled that far, with any translation of a nearby collider charged against the
+    // same allowance. A particle ON a surface keeps the contact plane and resolves against it in
+    // arithmetic for a few steps, as long as it has not slid along the surface by more than a fraction
+    // of its own radius; the periodic refresh and the slide limit are what keep a particle from being
+    // held up by a phantom plane past the edge of the box it was resting on. Anything in the near set
+    // turning, entering or leaving throws all of it away, so a moving collider costs exactly what it
+    // cost before. -xlinka
+    private struct WorldContact
+    {
+        public float3 Point;
+        public float3 Normal;
+        public float3 QueriedAt;
+        public float Clearance;
+        public float MotionAtQuery;
+        public int Step;
+        public int Epoch;
+        public byte State;
+    }
+
+    private const byte ContactNone = 0;
+    private const byte ContactClear = 1;
+    private const byte ContactSurface = 2;
+
+    // Substeps a cached surface plane is trusted for before the world is asked again.
+    private const int SurfaceRefreshSteps = 8;
+
+    // Slide along a cached plane, as a fraction of the particle radius, past which it is asked again.
+    private const float SurfaceSlideFraction = 0.25f;
+
+    private WorldContact[] _contacts = Array.Empty<WorldContact>();
+    private int _clearEpoch;
+    private int _surfaceEpoch;
+    private int _stepIndex;
+    private float _nearMotion;
+    private float _queryMargin;
+
+    private void InvalidateContacts()
+    {
+        _clearEpoch++;
+        _surfaceEpoch++;
+        _nearMotion = 0f;
+    }
+
+    private bool ResolveAgainstWorld(int index, ref float3 position, float radius)
+    {
+        var contacts = _contacts;
+        if ((uint)index >= (uint)contacts.Length)
+        {
+            if (!World!.Physics!.ResolveSphere(position, radius, _selfExclude, out var direct, out _))
+                return false;
+            position = direct;
+            return true;
+        }
+
+        ref var c = ref contacts[index];
+        switch (c.State)
+        {
+            case ContactClear when c.Epoch == _clearEpoch:
+            {
+                float travelled = float3.Distance(position, c.QueriedAt) + (_nearMotion - c.MotionAtQuery);
+                if (travelled < c.Clearance)
+                    return false;
+                break;
+            }
+            case ContactSurface when c.Epoch == _surfaceEpoch && _stepIndex - c.Step < SurfaceRefreshSteps:
+            {
+                var offset = position - c.QueriedAt;
+                float along = float3.Dot(offset, c.Normal);
+                var slide = offset - c.Normal * along;
+                float limit = radius * SurfaceSlideFraction;
+                if (slide.LengthSquared < limit * limit)
+                {
+                    float depth = float3.Dot(position - c.Point, c.Normal);
+                    if (depth >= radius)
+                        return false;
+                    position += c.Normal * (radius - depth);
+                    return true;
+                }
+                break;
+            }
+        }
+        return QueryWorld(ref c, ref position, radius);
+    }
+
+    private bool QueryWorld(ref WorldContact c, ref float3 position, float radius)
+    {
+        float margin = _queryMargin;
+        c.Step = _stepIndex;
+        c.MotionAtQuery = _nearMotion;
+
+        if (!World!.Physics!.ResolveSphere(position, radius + margin, _selfExclude, out var corrected, out var normal))
+        {
+            c.State = ContactClear;
+            c.Epoch = _clearEpoch;
+            c.QueriedAt = position;
+            c.Clearance = margin;
+            return false;
+        }
+
+        // The grown sphere's rest point is the nearest surface point; how far it sits along the normal
+        // is the real clearance, and the push-out for the true radius follows from the same point.
+        var point = corrected - normal * (radius + margin);
+        float depth = float3.Dot(position - point, normal);
+        if (depth >= radius)
+        {
+            c.State = ContactClear;
+            c.Epoch = _clearEpoch;
+            c.QueriedAt = position;
+            c.Clearance = depth - radius;
+            return false;
+        }
+
+        position = point + normal * radius;
+        c.State = ContactSurface;
+        c.Epoch = _surfaceEpoch;
+        c.Point = point;
+        c.Normal = normal;
+        c.QueriedAt = position;
+        return true;
     }
 
     // COLLIDER SNAPSHOT
@@ -540,6 +737,11 @@ public class SquishyBody : Component, IInputUpdateReceiver, ISoftBodySpace, ISof
     private void SnapshotColliders()
     {
         _shapeCount = 0;
+        float radius = MathF.Max(ParticleRadius.Value, 0f);
+        _solver.ComputeBounds(radius, out var centre, out var size);
+        _boundsCentre = centre;
+        _boundsSize = size;
+
         var bones = CollideWithWorld.Value ? DynamicBoneManager.For(World) : null;
         bones?.EnsurePlayerColliders();
         int players = bones?.PlayerColliderCount ?? 0;
@@ -549,8 +751,6 @@ public class SquishyBody : Component, IInputUpdateReceiver, ISoftBodySpace, ISof
         if (_shapes.Length < count)
             _shapes = new DynamicBoneColliderShape[System.Math.Max(count, 4)];
 
-        float radius = MathF.Max(ParticleRadius.Value, 0f);
-        _solver.ComputeBounds(radius, out var centre, out var size);
         var half = size * 0.5f;
         var min = centre - half;
         var max = centre + half;

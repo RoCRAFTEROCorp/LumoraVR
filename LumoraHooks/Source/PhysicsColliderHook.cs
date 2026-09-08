@@ -67,7 +67,7 @@ namespace Lumora.Godot.Hooks
                 // If we already created a body (Type changed after init), destroy it
                 if (_bodyNode != null && GodotObject.IsInstanceValid(_bodyNode))
                 {
-                    LumoraLogger.Log($"PhysicsColliderHook: Destroying body - hasRigidBody={hasRigidBody}, Type={Owner.Type.Value}");
+                    LumoraLogger.Debug($"PhysicsColliderHook: Destroying body - hasRigidBody={hasRigidBody}, Type={Owner.Type.Value}");
                     DestroyBody(true);
                 }
                 return;
@@ -76,7 +76,7 @@ namespace Lumora.Godot.Hooks
             // Create body if needed (deferred from Initialize)
             if (_bodyNode == null || !GodotObject.IsInstanceValid(_bodyNode))
             {
-                LumoraLogger.Log($"PhysicsColliderHook: Creating body for {Owner.GetType().Name} on '{Owner.Slot.SlotName.Value}'");
+                LumoraLogger.Debug($"PhysicsColliderHook: Creating body for {Owner.GetType().Name} on '{Owner.Slot.SlotName.Value}'");
                 CreateBody();
                 // BuildShape and UpdateTransform run below on every path; no need to do them twice.
             }
@@ -99,7 +99,13 @@ namespace Lumora.Godot.Hooks
             // every write below is a marshalled call that dirties the body in the physics server. Push
             // only what actually changed. -xlinka
             uint worldBit = WorldHook.GetCollisionBitFor(Owner?.World);
-            bool enabled = Owner?.Enabled ?? false;
+
+            // A disabled slot turns off everything under it, and this body cannot rely on that the way a
+            // renderer can: it is parented under the WORLD ROOT, not under the slot, so Godot's visibility
+            // never reaches it. Asking only the component's own Enabled leaves a collider on a switched-off
+            // subtree fully solid - an imported avatar's swap meshes ship exactly like that, disabled at
+            // their root, and you walk into geometry that is not on screen. -xlinka
+            bool enabled = (Owner?.Enabled ?? false) && (Owner?.Slot?.IsActive ?? false);
             uint layer = enabled ? worldBit : 0u;
             // sensor only (Area3D). on physics layer for engine-side interaction, mask=0 so nothing
             // pushes against it - xlinka
@@ -383,7 +389,7 @@ namespace Lumora.Godot.Hooks
             _meshBakeIndexCount = totalIndexCount;
             _meshBakeScale = scale;
             _meshBakeConvex = convex;
-            LumoraLogger.Log($"PhysicsColliderHook: Built {(convex ? "convex" : "trimesh")} collision for '{Owner.Slot.SlotName.Value}' ({vertexCount} verts)");
+            LumoraLogger.Debug($"PhysicsColliderHook: Built {(convex ? "convex" : "trimesh")} collision for '{Owner.Slot.SlotName.Value}' ({vertexCount} verts)");
         }
 
         // Points only. The hull is solved in the component so every peer collides against the same
@@ -430,7 +436,7 @@ namespace Lumora.Godot.Hooks
             _hullBakeVersion = hullCollider.HullVersion;
             _hullBakePointCount = hull.Count;
             _hullBakeScale = scale;
-            LumoraLogger.Log($"PhysicsColliderHook: Built convex hull collision for '{Owner.Slot.SlotName.Value}' ({hull.Count} hull points, {hullCollider.LastResult})");
+            LumoraLogger.Debug($"PhysicsColliderHook: Built convex hull collision for '{Owner.Slot.SlotName.Value}' ({hull.Count} hull points, {hullCollider.LastResult})");
         }
 
         private void UpdateDebugVisualization()

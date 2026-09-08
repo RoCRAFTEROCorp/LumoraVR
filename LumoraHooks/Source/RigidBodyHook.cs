@@ -67,7 +67,7 @@ public class RigidBodyHook : ComponentHook<LumoraRigidBody>
         if (worldRoot != null)
         {
             worldRoot.AddChild(_rigidBody);
-            LumoraLogger.Log($"RigidBodyHook: Added to worldRoot as sibling of slot node");
+            LumoraLogger.Debug($"RigidBodyHook: Added to worldRoot as sibling of slot node");
         }
         else
         {
@@ -76,7 +76,7 @@ public class RigidBodyHook : ComponentHook<LumoraRigidBody>
             if (parent != null)
             {
                 parent.AddChild(_rigidBody);
-                LumoraLogger.Log($"RigidBodyHook: Added as sibling of attachedNode under '{parent.Name}'");
+                LumoraLogger.Debug($"RigidBodyHook: Added as sibling of attachedNode under '{parent.Name}'");
             }
             else
             {
@@ -97,7 +97,7 @@ public class RigidBodyHook : ComponentHook<LumoraRigidBody>
             _rigidBody.TreeEntered += OnTreeEntered;
         }
 
-        LumoraLogger.Log($"RigidBodyHook: Created RigidBody3D for '{Owner!.Slot.SlotName.Value}' with {_rigidBody.GetChildCount()} collision shapes (frozen until static colliders ready)");
+        LumoraLogger.Debug($"RigidBodyHook: Created RigidBody3D for '{Owner!.Slot.SlotName.Value}' with {_rigidBody.GetChildCount()} collision shapes (frozen until static colliders ready)");
     }
 
     private void OnTreeEntered()
@@ -120,7 +120,7 @@ public class RigidBodyHook : ComponentHook<LumoraRigidBody>
         _rigidBody.GlobalPosition = new Vector3(slotPos.x, slotPos.y, slotPos.z);
         _rigidBody.Quaternion = new Quaternion(slotRot.x, slotRot.y, slotRot.z, slotRot.w);
 
-        LumoraLogger.Log($"RigidBodyHook: Position set for '{Owner.Slot.SlotName.Value}' at ({slotPos.x:F2}, {slotPos.y:F2}, {slotPos.z:F2})");
+        LumoraLogger.Debug($"RigidBodyHook: Position set for '{Owner.Slot.SlotName.Value}' at ({slotPos.x:F2}, {slotPos.y:F2}, {slotPos.z:F2})");
     }
 
     private void AddCollidersFromSlot()
@@ -152,7 +152,7 @@ public class RigidBodyHook : ComponentHook<LumoraRigidBody>
             }
         }
         _hasCollisionShape = shapeCount > 0;
-        LumoraLogger.Log($"RigidBodyHook: Added {shapeCount} collision shapes for '{Owner.Slot.SlotName.Value}'");
+        LumoraLogger.Debug($"RigidBodyHook: Added {shapeCount} collision shapes for '{Owner.Slot.SlotName.Value}'");
     }
 
     private void AddBoxShape(BoxCollider box)
@@ -169,7 +169,7 @@ public class RigidBodyHook : ComponentHook<LumoraRigidBody>
         shape.Disabled = false;
         _rigidBody.AddChild(shape);
         AddDebugEdgesForBox(sizeVec, offset);
-        LumoraLogger.Log($"RigidBodyHook.AddBoxShape: size=({size.x}, {size.y}, {size.z}), disabled={shape.Disabled}, shapeValid={shape.Shape != null}");
+        LumoraLogger.Debug($"RigidBodyHook.AddBoxShape: size=({size.x}, {size.y}, {size.z}), disabled={shape.Disabled}, shapeValid={shape.Shape != null}");
     }
 
     private void AddSphereShape(SphereCollider sphere)
@@ -254,7 +254,7 @@ public class RigidBodyHook : ComponentHook<LumoraRigidBody>
             if (!Owner.IsKinematic.Value)
             {
                 _rigidBody.Freeze = false;
-                LumoraLogger.Log($"RigidBodyHook: Unfroze '{Owner.Slot.SlotName.Value}' at ({slotPos.x:F1}, {slotPos.y:F1}, {slotPos.z:F1})");
+                LumoraLogger.Debug($"RigidBodyHook: Unfroze '{Owner.Slot.SlotName.Value}' at ({slotPos.x:F1}, {slotPos.y:F1}, {slotPos.z:F1})");
             }
         }
 
@@ -423,8 +423,41 @@ public class RigidBodyHook : ComponentHook<LumoraRigidBody>
     private float _lastLinearDamp = float.NaN;
     private float _lastAngularDamp = float.NaN;
 
+    // Six checkboxes that did nothing.
+    //
+    // FreezePositionX/Y/Z and FreezeRotationX/Y/Z were declared, replicated, saved and shown in the
+    // inspector, and the hook read none of them - it only ever touched the body's whole-body Freeze,
+    // which is a different feature entirely. Ticking "Freeze Rotation Y" left the object spinning. The
+    // renderer has had the real per-axis constraints all along. -xlinka
+    private bool _lastFreezeWritten;
+    private bool _lastFpx, _lastFpy, _lastFpz, _lastFrx, _lastFry, _lastFrz;
+
+    private void PushAxisLocks()
+    {
+        bool fpx = Owner.FreezePositionX.Value, fpy = Owner.FreezePositionY.Value, fpz = Owner.FreezePositionZ.Value;
+        bool frx = Owner.FreezeRotationX.Value, fry = Owner.FreezeRotationY.Value, frz = Owner.FreezeRotationZ.Value;
+
+        if (_lastFreezeWritten
+            && fpx == _lastFpx && fpy == _lastFpy && fpz == _lastFpz
+            && frx == _lastFrx && fry == _lastFry && frz == _lastFrz)
+            return;
+
+        _rigidBody.AxisLockLinearX = fpx;
+        _rigidBody.AxisLockLinearY = fpy;
+        _rigidBody.AxisLockLinearZ = fpz;
+        _rigidBody.AxisLockAngularX = frx;
+        _rigidBody.AxisLockAngularY = fry;
+        _rigidBody.AxisLockAngularZ = frz;
+
+        _lastFpx = fpx; _lastFpy = fpy; _lastFpz = fpz;
+        _lastFrx = frx; _lastFry = fry; _lastFrz = frz;
+        _lastFreezeWritten = true;
+    }
+
     private void PushParameters()
     {
+        PushAxisLocks();
+
         float mass = Owner.Mass.Value;
         if (mass != _lastMass)
         {
