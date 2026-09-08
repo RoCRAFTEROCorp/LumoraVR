@@ -13,7 +13,8 @@ uniform vec4 outline_color : source_color = vec4(0.0, 0.0, 0.0, 1.0);
 // Metres of extrusion in MODEL space, so the border is a fixed thickness on the object and gets thinner
 // with distance the way a drawn line on a model does, rather than the constant screen width the flat
 // toon outline holds. On a scaled slot it scales with the slot. -xlinka
-uniform float outline_width : hint_range(0.0, 0.1) = 0.0;
+// Metres of model-space extrusion, so the useful range is millimetres. 0.1 here is ten centimetres.
+uniform float outline_width : hint_range(0.0, 0.005) = 0.0;
 
 void vertex() {
 	VERTEX += normalize(NORMAL) * outline_width;

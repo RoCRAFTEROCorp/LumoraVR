@@ -202,6 +202,18 @@ public class MaterialAssetHook : AssetHook, IMaterialAssetHook
                 _shaderMaterial.NextPass = _nextPassMaterial;
                 break;
 
+            case MaterialType.PBS_Specular:
+                _usesShaderMaterial = true;
+                _shaderMaterial = CreateShaderMaterial(SpecularShaderPath(Culling.Back), MaterialType.PBS_Specular);
+                break;
+
+            case MaterialType.XiexeToon:
+                _usesShaderMaterial = true;
+                _shaderMaterial = CreateShaderMaterial(XiexeShaderPath(Culling.Back), MaterialType.XiexeToon);
+                _nextPassMaterial = CreateShaderMaterial("res://Shaders/Mat_XiexeOutline.gdshader", MaterialType.XiexeToon);
+                _shaderMaterial.NextPass = _nextPassMaterial;
+                break;
+
             default:
                 _usesShaderMaterial = false;
                 _standardMaterial = new StandardMaterial3D();
@@ -353,9 +365,35 @@ public class MaterialAssetHook : AssetHook, IMaterialAssetHook
                 return;
             }
 
+            if (_materialType == MaterialType.XiexeToon)
+            {
+                SwapShader(XiexeShaderPath(culling));
+                return;
+            }
+
+            if (_materialType == MaterialType.PBS_Specular)
+            {
+                SwapShader(SpecularShaderPath(culling));
+                return;
+            }
+
             _shaderMaterial.SetShaderParameter("cull_mode", (int)culling);
         }
     }
+
+    private static string SpecularShaderPath(Culling culling) => culling switch
+    {
+        Culling.Front => "res://Shaders/Mat_PBS_SpecularFrontCull.gdshader",
+        Culling.None => "res://Shaders/Mat_PBS_SpecularDoubleSided.gdshader",
+        _ => "res://Shaders/Mat_PBS_Specular.gdshader"
+    };
+
+    private static string XiexeShaderPath(Culling culling) => culling switch
+    {
+        Culling.Front => "res://Shaders/Mat_XiexeFrontCull.gdshader",
+        Culling.None => "res://Shaders/Mat_XiexeDoubleSided.gdshader",
+        _ => "res://Shaders/Mat_Xiexe.gdshader"
+    };
 
     private static string ToonShaderPath(Culling culling) => culling switch
     {
@@ -518,7 +556,8 @@ public class MaterialAssetHook : AssetHook, IMaterialAssetHook
     {
         // Outline controls belong to the chained hull material, not the lit surface - the base shader
         // has no such uniforms and would swallow the write.
-        if (_nextPassMaterial != null && property is "OutlineWidth" or "OutlineColor")
+        if (_nextPassMaterial != null
+            && property is "OutlineWidth" or "OutlineColor" or "OutlineMask" or "UseOutlineMask")
         {
             MaterialPropertyApplicator.Apply(_nextPassMaterial, _materialType, property, value);
             return;
