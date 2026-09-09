@@ -61,11 +61,14 @@ public sealed class ReflectionProbeHook : NodeBackedComponentHook<LumoraProbe, G
         probe.MaxDistance = Owner.MaxDistance.Value;
         probe.EnableShadows = Owner.CaptureShadows.Value;
 
-        // 0 means "whatever the renderer defaults to", not "capture nothing", so leave the mask alone
-        // rather than writing a zero that would blank the probe.
+        // 0 means "whatever the renderer defaults to", not "capture nothing", so a zero never reaches
+        // the node. But the renderer default is ALL twenty layers, and the eye cameras deliberately
+        // strip the editor chrome layers - so a default probe was baking gizmos, overlay geometry, the
+        // free-cam marker and the dashboard's offscreen render into every surface it lit. Fall back to
+        // the same mask the eye uses instead. PRIVATE_LAYER is deliberately kept: an unfocused or
+        // private world renders on it, and masking it out would stop probes seeing their own world.
         int cullMask = Owner.CullMask.Value;
-        if (cullMask != 0)
-            probe.CullMask = (uint)cullMask;
+        probe.CullMask = (uint)(cullMask != 0 ? cullMask : Helpers.RenderHelper.PRIVATE_RENDER_MASK);
 
         probe.AmbientMode = Owner.AmbientMode.Value switch
         {
@@ -77,12 +80,21 @@ public sealed class ReflectionProbeHook : NodeBackedComponentHook<LumoraProbe, G
         probe.AmbientColor = new Color(ambient.r, ambient.g, ambient.b, ambient.a);
         probe.AmbientColorEnergy = Owner.AmbientEnergy.Value;
 
+        // The generation is consumed only where the rebake is ACTUALLY armed.
+        //
+        // It used to be taken unconditionally, one line above a gate that drops the request when the
+        // component is disabled or reflections are off in settings. A rebake pressed in either state
+        // was eaten and never replayed, which is the opposite of what this hook's own header promises.
+        // The settings-changed path re-marks the component dirty, so a request parked here replays on
+        // its own once the gate opens. -xlinka
         int generation = Owner.BakeGeneration.Value;
         bool rebakeRequested = generation != _lastBakeGeneration;
-        _lastBakeGeneration = generation;
 
         if (rebakeRequested && enabled && Owner.UpdateMode.Value == ProbeUpdateMode.Once)
+        {
+            _lastBakeGeneration = generation;
             BeginRebake(probe);
+        }
         else if (!_rebaking)
             probe.UpdateMode = Owner.UpdateMode.Value == ProbeUpdateMode.Always
                 ? GodotProbe.UpdateModeEnum.Always

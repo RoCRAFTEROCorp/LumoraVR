@@ -101,6 +101,7 @@ public abstract class MeshRendererHookBase<T, U> : ComponentHook<T>, ILodRangeTa
                     meshInstance = new MeshInstance3D();
                     ApplyInheritedRenderLayer(meshInstance);
                     gameObject.AddChild(meshInstance);
+                    _rangeApplied = false;
                 }
 
                 MeshRenderer = (gameObject as U)!;
@@ -124,22 +125,6 @@ public abstract class MeshRendererHookBase<T, U> : ComponentHook<T>, ILodRangeTa
                 if (UseMeshInstance && meshInstance != null)
                 {
                     meshInstance.Mesh = godotMesh;
-
-                    if (godotMesh is ArrayMesh arrayMesh && arrayMesh.GetSurfaceCount() > 0)
-                    {
-                        var arrays = arrayMesh.SurfaceGetArrays(0);
-                        var uvArray = arrays[(int)Mesh.ArrayType.TexUV];
-                        bool hasUvs = uvArray.VariantType != Variant.Type.Nil;
-                        LumoraLogger.Log($"MeshRendererHookBase: Mesh assigned, surface 0 has UV data: {hasUvs}");
-                        if (hasUvs)
-                        {
-                            var uvs = uvArray.AsVector2Array();
-                            if (uvs.Length > 0)
-                            {
-                                LumoraLogger.Log($"MeshRendererHookBase: UV sample[0] = {uvs[0]}");
-                            }
-                        }
-                    }
                 }
                 else
                 {
@@ -147,7 +132,16 @@ public abstract class MeshRendererHookBase<T, U> : ComponentHook<T>, ILodRangeTa
                 }
             }
 
-            bool enabled = Owner.Enabled;
+            ApplyBoundsOverride();
+
+            // A renderer with geometry and NO material must not draw.
+            //
+            // We hand Godot a null surface override when the list is empty and it quietly substitutes its
+            // own default white-grey, so the object shows up as a big pale untextured blob instead of not
+            // showing up at all. On an imported avatar whose material reference failed to wire, that blob
+            // follows the wearer into every world and looks like a bug in something else entirely.
+            // Drawing nothing is the honest result of having nothing to draw it with. -xlinka
+            bool enabled = Owner.Enabled && Owner.Materials.Count > 0;
             if (meshInstance != null && meshInstance.Visible != enabled)
             {
                 meshInstance.Visible = enabled;
@@ -159,9 +153,11 @@ public abstract class MeshRendererHookBase<T, U> : ComponentHook<T>, ILodRangeTa
                 meshInstance.ExtraCullMargin = Owner.ExtraCullMargin;
             }
 
+            bool renderQueueApplied = false;
             if (Owner.SortingOrder.GetWasChangedAndClear())
             {
                 ApplyRenderQueue();
+                renderQueueApplied = true;
             }
 
             if (Owner.ShadowCastMode.GetWasChangedAndClear())
@@ -185,7 +181,8 @@ public abstract class MeshRendererHookBase<T, U> : ComponentHook<T>, ILodRangeTa
                 Owner.SurfaceRenderPrioritiesChanged = false;
                 Owner.SurfaceAssignmentsChanged = false;
                 ApplyMaterials();
-                ApplyRenderQueue();
+                if (!renderQueueApplied)
+                    ApplyRenderQueue();
             }
 
             SyncPerSurfaceInstances();
@@ -200,6 +197,12 @@ public abstract class MeshRendererHookBase<T, U> : ComponentHook<T>, ILodRangeTa
     // LOD plumbing. A LodGroup decides the band; this only makes sure every instance the hook owns
     // carries it, including per-surface ones that get built after the group last spoke. -xlinka
     private LodVisibilityRange _lodRange = LodVisibilityRange.Unbounded;
+
+    // The band last written to the instances, so a re-apply that changed nothing about it (a mesh
+    // re-upload, a material swap) does not push five visibility properties through the marshalling
+    // layer again. Cleared whenever an instance is created, since a fresh one holds engine defaults.
+    private LodVisibilityRange _appliedRange = LodVisibilityRange.Unbounded;
+    private bool _rangeApplied;
 
     public void SetLodVisibilityRange(in LodVisibilityRange range)
     {
@@ -231,6 +234,10 @@ public abstract class MeshRendererHookBase<T, U> : ComponentHook<T>, ILodRangeTa
         var effective = LodVisibilityRange.Tightest(
             in _lodRange,
             LodVisibilityRange.To(Owner.MaxViewDistance, Owner.ViewDistanceFadeMargin));
+        if (_rangeApplied && _appliedRange.Equals(effective))
+            return;
+        _appliedRange = effective;
+        _rangeApplied = true;
         effective.ApplyTo(meshInstance);
         foreach (var inst in _perSurfaceInstances)
             effective.ApplyTo(inst);
@@ -278,6 +285,7 @@ public abstract class MeshRendererHookBase<T, U> : ComponentHook<T>, ILodRangeTa
                 ApplyInheritedRenderLayer(inst);
                 parent?.AddChild(inst);
                 _perSurfaceInstances.Add(inst);
+                _rangeApplied = false;
             }
 
             var single = new ArrayMesh();
@@ -309,16 +317,30 @@ public abstract class MeshRendererHookBase<T, U> : ComponentHook<T>, ILodRangeTa
         }
     }
 
+    // Set by GetSurfaceMaterial whenever it hands back the placeholder, read once per apply.
+    private bool _surfaceStillLoading;
+
     protected virtual void ApplyMaterials()
     {
         if (meshInstance == null) return;
 
         int count = GetSurfaceCount();
 
+        _surfaceStillLoading = false;
         for (int i = 0; i < count; i++)
         {
             meshInstance.SetSurfaceOverrideMaterial(i, GetSurfaceMaterial(i));
         }
+
+        // Come back until the real material lands.
+        //
+        // The comment on GetSurfaceMaterial says the swap "rides the asset-arrival notification that
+        // already re-drives this hook". It does not: ApplyChanges is queue-driven, a texture finishing
+        // its download dirties nothing, and so a surface that was still arriving at bind time kept the
+        // checker for the rest of the session unless some unrelated edit re-dirtied the hook. Re-queue
+        // while anything is still on the placeholder, and stop as soon as nothing is. -xlinka
+        if (_surfaceStillLoading && Owner is { IsDestroyed: false })
+            Owner.MarkChangeDirty();
 
         meshInstance.MaterialOverride = null;
         _lastSurfaceOverrideCount = count;
@@ -331,7 +353,7 @@ public abstract class MeshRendererHookBase<T, U> : ComponentHook<T>, ILodRangeTa
             {
                 if (meshInstance.GetSurfaceOverrideMaterial(i) != null) assigned++;
             }
-            LumoraLogger.Log(
+            LumoraLogger.Debug(
                 $"MeshRendererHook.ApplyMaterials[diag]: slot={Owner.Slot?.SlotName.Value} " +
                 $"surfaces={count} materials(list)={Owner.Materials.Count} " +
                 $"overrides(non-null)={assigned}");
@@ -339,6 +361,8 @@ public abstract class MeshRendererHookBase<T, U> : ComponentHook<T>, ILodRangeTa
     }
 
     private int _uiDiagLogged;
+
+    private readonly LoadingSkinWatch _loadingSkin = new();
 
     private Material GetSurfaceMaterial(int index)
     {
@@ -348,8 +372,12 @@ public abstract class MeshRendererHookBase<T, U> : ComponentHook<T>, ILodRangeTa
         // core-side latch makes sure it only happens once. -xlinka
         if (Owner.IsSurfaceLoading(index))
         {
+            _loadingSkin.Note(index, Owner.SurfaceMaterialProvider(index), Owner.Slot?.SlotName.Value);
+            _surfaceStillLoading = true;
             return LoadingPlaceholderMaterial.Get();
         }
+
+        _loadingSkin.Clear(index);
 
         var materialAsset = GetMaterialAsset(index);
         if (materialAsset == null)
@@ -441,6 +469,7 @@ public abstract class MeshRendererHookBase<T, U> : ComponentHook<T>, ILodRangeTa
         // Per-surface instances are children of the MeshRenderer node, so freeing it frees them too - just drop
         // our stale references so a fresh renderer rebuilds them. -xlinka
         _perSurfaceInstances.Clear();
+        _rangeApplied = false;
         if (!destroyingWorld && MeshRenderer != null && GodotObject.IsInstanceValid(MeshRenderer))
         {
             ((Node)MeshRenderer).QueueFree();
@@ -459,6 +488,26 @@ public abstract class MeshRendererHookBase<T, U> : ComponentHook<T>, ILodRangeTa
     protected virtual bool IsMeshAssetAvailable()
     {
         return Owner.Mesh.Target != null;
+    }
+
+    // ProceduralMesh.OverrideBoundingBox was a field nothing read. It matters for any mesh whose
+    // shader moves vertices far from the authored geometry: Godot culls on the mesh AABB, so the
+    // bubble field vanished the moment its origin left the frustum. A zero Aabb clears the override. -xlinka
+    private void ApplyBoundsOverride()
+    {
+        if (meshInstance == null) return;
+
+        var aabb = new Aabb();
+        if (Owner.Mesh.Target is LumoraMeshes.ProceduralMesh proceduralMesh && proceduralMesh.OverrideBoundingBox.Value)
+        {
+            var box = proceduralMesh.OverridenBoundingBox.Value;
+            var min = box.Min;
+            var size = box.Max - box.Min;
+            aabb = new Aabb(new Vector3(min.x, min.y, min.z), new Vector3(size.x, size.y, size.z));
+        }
+
+        if (meshInstance.CustomAabb != aabb)
+            meshInstance.CustomAabb = aabb;
     }
 
     protected virtual Mesh GetGodotMeshFromAsset()
@@ -518,6 +567,19 @@ public abstract class MeshRendererHookBase<T, U> : ComponentHook<T>, ILodRangeTa
         meshInstance.SortingOffset = effectiveQueue;
     }
 
+    // Only answers for the native material path, which is what the primitives and the cloth actually
+    // use. A shader material carries its culling in the shader variant it was built from, so it is not
+    // readable here - those set their cast mode explicitly instead.
+    private bool IsDoubleSidedSurface()
+    {
+        if (meshInstance == null)
+            return false;
+
+        var material = meshInstance.MaterialOverride as StandardMaterial3D
+                       ?? meshInstance.GetActiveMaterial(0) as StandardMaterial3D;
+        return material != null && material.CullMode == BaseMaterial3D.CullModeEnum.Disabled;
+    }
+
     protected virtual void ApplyShadowCastMode(ShadowCastMode shadowCastMode)
     {
         if (meshInstance != null)
@@ -528,7 +590,16 @@ public abstract class MeshRendererHookBase<T, U> : ComponentHook<T>, ILodRangeTa
                     meshInstance.CastShadow = GeometryInstance3D.ShadowCastingSetting.Off;
                     break;
                 case ShadowCastMode.On:
-                    meshInstance.CastShadow = GeometryInstance3D.ShadowCastingSetting.On;
+                    // A DOUBLE-SIDED SURFACE HAS TO CAST A DOUBLE-SIDED SHADOW.
+                    //
+                    // The renderer culls back faces during the shadow pass under On, so a surface whose
+                    // material draws both sides still casts from one of them. On thin geometry - cloth,
+                    // a quad, a disc - that means the shadow disappears or lands on the wrong side the
+                    // moment the light is behind it, which reads as the shadow being broken rather than
+                    // as a mode being wrong. Promote it rather than making every caller remember. -xlinka
+                    meshInstance.CastShadow = IsDoubleSidedSurface()
+                        ? GeometryInstance3D.ShadowCastingSetting.DoubleSided
+                        : GeometryInstance3D.ShadowCastingSetting.On;
                     break;
                 case ShadowCastMode.ShadowOnly:
                     meshInstance.CastShadow = GeometryInstance3D.ShadowCastingSetting.ShadowsOnly;

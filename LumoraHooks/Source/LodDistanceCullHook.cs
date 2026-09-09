@@ -12,7 +12,10 @@ namespace Lumora.Godot.Hooks;
 [ImplementableHook(typeof(LodDistanceCull))]
 public sealed class LodDistanceCullHook : ComponentHook<LodDistanceCull>
 {
-    private readonly HashSet<ILodRangeTarget> _applied = new();
+    private HashSet<ILodRangeTarget> _applied = new();
+    // Swapped with _applied after every pass instead of allocating a fresh set per apply; a scale
+    // change on a moving cull root lands here every frame.
+    private HashSet<ILodRangeTarget> _current = new();
     private readonly List<Component> _scratch = new();
     private bool _subscribed;
 
@@ -39,7 +42,8 @@ public sealed class LodDistanceCullHook : ComponentHook<LodDistanceCull>
             ? new LodVisibilityRange(0f, 0f, Owner.ScaledDistance, fade, fade > 0f)
             : LodVisibilityRange.Unbounded;
 
-        var current = new HashSet<ILodRangeTarget>();
+        var current = _current;
+        current.Clear();
         _scratch.Clear();
         slot.GetComponentsInChildren(_scratch);
         foreach (var component in _scratch)
@@ -80,8 +84,8 @@ public sealed class LodDistanceCullHook : ComponentHook<LodDistanceCull>
         }
 
         _applied.Clear();
-        foreach (var target in current)
-            _applied.Add(target);
+        _current = _applied;
+        _applied = current;
     }
 
     private void OnBandInvalidated()

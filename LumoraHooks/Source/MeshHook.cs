@@ -7,6 +7,7 @@ using Lumora.Core.Components.Meshes;
 using Lumora.Core.Phos;
 using Lumora.Core.Logging;
 using System;
+using System.Runtime.CompilerServices;
 
 namespace Lumora.Godot.Hooks;
 
@@ -46,7 +47,14 @@ public class MeshHook : ComponentHook<ProceduralMesh>
     private float[]? _tanBuf;
     private Color[]? _colBuf;
     private Vector2[]? _uvBuf;
+    private Vector2[]? _uv1Buf;
     private int[]? _idxBuf;
+
+    // The surface-array container handed to AddSurfaceFromArrays, reused across uploads. It is a native
+    // container behind a finalizable wrapper, and a fresh one per submesh per upload was one more
+    // finalizer-queue entry every frame for every deforming mesh. Cleared and re-sized per submesh so a
+    // channel the previous upload carried cannot leak into one that does not. -xlinka
+    private global::Godot.Collections.Array? _surfaceArrays;
 
     // Factory method for creating mesh hooks.
     public static IHook<ProceduralMesh> Constructor()
@@ -56,7 +64,7 @@ public class MeshHook : ComponentHook<ProceduralMesh>
 
     public override void Initialize()
     {
-        Lumora.Core.Logging.Logger.Log($"MeshHook.Initialize: Starting for component on slot '{Owner?.Slot?.SlotName?.Value}'");
+        Lumora.Core.Logging.Logger.Debug($"MeshHook.Initialize: Starting for component on slot '{Owner?.Slot?.SlotName?.Value}'");
 
         godotMesh = new ArrayMesh();
 
@@ -85,7 +93,7 @@ public class MeshHook : ComponentHook<ProceduralMesh>
             _meshSlotHook = hook;
             parentNode = _meshSlotHook.RequestNode3D();
             parentNode.AddChild(meshInstance);
-            Lumora.Core.Logging.Logger.Log($"MeshHook: Successfully added mesh to slot '{Owner.Slot.SlotName.Value}'");
+            Lumora.Core.Logging.Logger.Debug($"MeshHook: Successfully added mesh to slot '{Owner.Slot.SlotName.Value}'");
         }
         else
         {
@@ -129,12 +137,91 @@ public class MeshHook : ComponentHook<ProceduralMesh>
         {
             bool otherRenderer = Owner.Slot?.GetComponent<Lumora.Core.Components.MeshRenderer>() != null
                 || Owner.Slot?.GetComponent<Lumora.Core.Components.SquishyBody>() != null
-                || ChildRendersThisMesh(Owner.Slot);
+                || ChildRendersThisMesh(Owner.Slot)
+                || ParticleSystemDrawsThisMesh()
+                // An imported package parks every mesh it ships on one tagged library slot. Nothing there
+                // is meant to be looked at, and the tests above all fail for a bare mesh component with
+                // no renderer beside it, so the preview stayed up as a full-scale grey solid at the
+                // import root. -xlinka
+                || Owner.Slot?.Tag.Value == Lumora.Core.Assets.Interop.PackageObjectImporter.AssetLibraryTag;
             if (meshInstance.Visible != !otherRenderer)
             {
                 meshInstance.Visible = !otherRenderer;
             }
         }
+    }
+
+    // A mesh drawn per-particle has no MeshRenderer anywhere, and its component does not have to live on
+    // a slot with anything else on it at all.
+    //
+    // An imported package keeps meshes and materials in a flat top-level asset list rather than in the
+    // object tree, and the importer lands that whole list on ONE holder slot. A procedural mesh in there
+    // has no renderer beside it and no child below it, so every test above fails and this hook's default
+    // instance stays up: a lit grey copy of the mesh sitting at the import root, at the object's full
+    // scale. On a real avatar that was a two-and-a-half metre grey disc standing next to it - a circle
+    // whose only real job was to be drawn a few centimetres wide, once per water particle. -xlinka
+    private bool _drawnByParticles;
+
+    private const double ParticleScanInterval = 0.5;
+
+    private sealed class ParticleMeshScan
+    {
+        public double NextScan;
+        public readonly System.Collections.Generic.HashSet<Lumora.Core.Component> Drawn = new();
+    }
+
+    // One scan per WORLD per window. The window used to live on each hook, which bounded each hook to one
+    // walk per half second but bounded nothing about the frame: a hundred renderer-less meshes re-applying
+    // together still walked the whole tree a hundred times, because none of them could see that a sibling
+    // had just done it. The result is now shared through the world, so the first hook to ask pays for the
+    // walk and the rest read the answer. Weak-keyed so a destroyed world takes its entry with it. -xlinka
+    private static readonly ConditionalWeakTable<World, ParticleMeshScan> _particleScans = new();
+
+    private bool ParticleSystemDrawsThisMesh()
+    {
+        // Once true it stays true; a system does not normally stop drawing the mesh it was built around.
+        if (_drawnByParticles)
+            return true;
+
+        // This walks the WHOLE WORLD, so it has to be bounded - but bounded by TIME, not by a count of
+        // calls. It was a count of 120 ApplyChanges originally, which never elapsed because ApplyChanges
+        // is drained from a deduped queue rather than called per frame, so the scan ran once, missed,
+        // and never ran again. Removing the bound entirely fixed that and created a worse problem: a
+        // world full of renderer-less procedural meshes then walked the whole tree once per mesh per
+        // re-apply, which measured 211 ms in a single hook phase.
+        //
+        // A short time window gets both: the scan re-runs soon enough to catch a system wired a frame
+        // later, and a hundred meshes re-applying in the same breath share one walk. The importer and
+        // ParticleSystem also poke the mesh directly when they point at it, so this is the fallback
+        // rather than the main path. -xlinka
+        var world = Owner?.World;
+        if (world == null || Owner == null)
+            return false;
+
+        var scan = _particleScans.GetValue(world, static _ => new ParticleMeshScan());
+        double now = world.Time?.TotalTime ?? 0.0;
+        if (now >= scan.NextScan)
+        {
+            scan.NextScan = now + ParticleScanInterval;
+            scan.Drawn.Clear();
+            var root = world.RootSlot;
+            if (root != null)
+            {
+                foreach (var system in root.GetComponentsInChildren<Lumora.Core.Components.ParticleSystem>())
+                {
+                    if (system.IsDestroyed)
+                        continue;
+                    var target = system.ParticleMesh.Target;
+                    if (target != null)
+                        scan.Drawn.Add(target);
+                }
+            }
+        }
+
+        if (!scan.Drawn.Contains(Owner))
+            return false;
+        _drawnByParticles = true;
+        return true;
     }
 
     // A renderer for this mesh does not have to sit on the mesh's own slot. TextRenderer keeps its
@@ -165,9 +252,13 @@ public class MeshHook : ComponentHook<ProceduralMesh>
     {
         if (child == null || child.IsDestroyed)
             return false;
-        foreach (var renderer in child.GetComponents<Lumora.Core.Components.MeshRenderer>())
+        // Indexed rather than GetComponents<T>(): that is a LINQ OfType and allocates its iterator on
+        // every apply of every mesh that has no renderer on its own slot.
+        var components = child.Components;
+        for (int i = 0; i < components.Count; i++)
         {
-            if (ReferenceEquals(renderer.Mesh.Target, Owner))
+            if (components[i] is Lumora.Core.Components.MeshRenderer renderer
+                && ReferenceEquals(renderer.Mesh.Target, Owner))
                 return true;
         }
         return false;
@@ -192,6 +283,8 @@ public class MeshHook : ComponentHook<ProceduralMesh>
             }
         }
 
+        _surfaceArrays?.Dispose();
+        _surfaceArrays = null;
         meshInstance = null;
         godotMesh = null;
         _meshSlotHook = null;
@@ -257,12 +350,15 @@ public class MeshHook : ComponentHook<ProceduralMesh>
         if (godotMesh == null) return;
         if (submesh.IndexCount <= 0) return;
 
-        var arrays = new global::Godot.Collections.Array();
+        var arrays = _surfaceArrays ??= new global::Godot.Collections.Array();
+        arrays.Clear();
         arrays.Resize((int)Mesh.ArrayType.Max);
 
         // Upload positions (ALWAYS required, regardless of hint)
+        bool hasVertices = false;
         if (phosMesh.VertexCount > 0 && phosMesh.RawPositions != null)
         {
+            hasVertices = true;
             EnsureExact(ref _posBuf, phosMesh.VertexCount);
             var positions = _posBuf!;
             bool hadBadPosition = false;
@@ -351,6 +447,23 @@ public class MeshHook : ComponentHook<ProceduralMesh>
             arrays[(int)Mesh.ArrayType.TexUV] = uvs;
         }
 
+        // UV1 rides to the GPU as TexUV2. Vertex-animated meshes (BubbleFieldMesh) keep their shape
+        // parameters here and their instance index in UV0, so a shader can rebuild the surface from
+        // two floats without a per-instance draw. Asset meshes already did this; procedural ones
+        // dropped the channel on the floor. -xlinka
+        if (phosMesh.HasUV1s && uploadHint[MeshUploadHint.Flag.UV1])
+        {
+            EnsureExact(ref _uv1Buf, phosMesh.VertexCount);
+            var uvs = _uv1Buf!;
+            var raw = phosMesh.RawUV1s;
+            for (int i = 0; i < phosMesh.VertexCount; i++)
+            {
+                var uv = raw[i];
+                uvs[i] = new Vector2(uv.x, uv.y);
+            }
+            arrays[(int)Mesh.ArrayType.TexUV2] = uvs;
+        }
+
         // Upload indices (ALWAYS required for triangle meshes)
         bool hasIndices = submesh.IndexCount > 0 && submesh.RawIndices != null;
         if (hasIndices)
@@ -390,9 +503,11 @@ public class MeshHook : ComponentHook<ProceduralMesh>
             arrays[(int)Mesh.ArrayType.Index] = indices;
         }
 
-        // Only add surface if we have valid vertex data
-        var vertexArray = arrays[(int)Mesh.ArrayType.Vertex];
-        if (vertexArray.VariantType != Variant.Type.Nil && vertexArray.AsVector3Array() != null)
+        // Only add surface if we have valid vertex data. Tracked on the managed side: reading the
+        // entry back out of the container converts the whole packed vertex array into a fresh managed
+        // copy just to compare it with null, which for a deforming mesh was a full vertex buffer of
+        // garbage per submesh per frame. -xlinka
+        if (hasVertices)
         {
             if (!hasIndices && (phosMesh.VertexCount % 3) != 0)
             {
@@ -404,7 +519,7 @@ public class MeshHook : ComponentHook<ProceduralMesh>
                 return;
             }
             godotMesh.AddSurfaceFromArrays(Mesh.PrimitiveType.Triangles, arrays);
-            // Lumora.Core.Logging.Logger.Log($"MeshHook.UploadTriangleSubmesh: Uploaded {submesh.IndexCount / 3} triangles");
+            // Lumora.Core.Logging.Logger.Debug($"MeshHook.UploadTriangleSubmesh: Uploaded {submesh.IndexCount / 3} triangles");
         }
         else
         {

@@ -28,6 +28,12 @@ public class SkinnedMeshHook : ComponentHook<SkinnedMeshRenderer>, ILodRangeTarg
     }
 
     private MeshInstance3D _meshInstance = null!;
+
+    // Both the mesh instance and the skeleton are platform nodes that can be freed underneath us - by a
+    // teardown, or by SkeletonHook rebuilding its skeleton - and a null check does NOT catch a freed
+    // one. Every entry point revalidates instead of trusting the cached pointer. -xlinka
+    private bool MeshInstanceAlive => _meshInstance != null && GodotObject.IsInstanceValid(_meshInstance);
+    private bool SkeletonAlive => _skeleton != null && GodotObject.IsInstanceValid(_skeleton);
     private ArrayMesh _arrayMesh = null!;
     private SkeletonHook _skeletonHook = null!;
     private Skeleton3D _skeleton = null!;
@@ -56,7 +62,7 @@ public class SkinnedMeshHook : ComponentHook<SkinnedMeshRenderer>, ILodRangeTarg
 
         // Added under the slot node first; TryBindToSkeleton reparents it under the Skeleton3D once that exists.
         attachedNode.AddChild(_meshInstance);
-        LumoraLogger.Log($"SkinnedMeshHook: Initialized and added mesh to '{Owner.Slot.SlotName.Value}'");
+        LumoraLogger.Debug($"SkinnedMeshHook: Initialized and added mesh to '{Owner.Slot.SlotName.Value}'");
 
         TryBindToSkeleton();
 
@@ -68,7 +74,7 @@ public class SkinnedMeshHook : ComponentHook<SkinnedMeshRenderer>, ILodRangeTarg
 
     public override void ApplyChanges()
     {
-        if (_meshInstance == null)
+        if (!MeshInstanceAlive)
             return;
 
         // Zero-mapping rebind only retries when the bone list actually changed. Retrying every
@@ -77,12 +83,30 @@ public class SkinnedMeshHook : ComponentHook<SkinnedMeshRenderer>, ILodRangeTarg
         // the whole mesh. -xlinka
         bool zeroMapRetry = _skeletonBound && _boneIndexMap.Count == 0 && Owner.BoneNames.Count > 0
             && Owner.BoneNames.Count != _lastBindAttemptBoneCount;
+
+        // A bound skeleton can go STALE: SkeletonHook disposes and recreates its Skeleton3D whenever the
+        // bone list changes, and our cached pointer then refers to a freed object. Touching it throws
+        // ObjectDisposedException out of the hook update. Anything that builds a skeleton after the
+        // renderers already exist - importing an avatar, for one - hits this every time. -xlinka
+        bool skeletonStale = _skeletonBound && !SkeletonAlive;
+        if (skeletonStale)
+        {
+            _skeletonBound = false;
+            _skeleton = null!;
+            _boneIndexMap.Clear();
+            _meshApplied = false;
+        }
+
         if (!_skeletonBound || zeroMapRetry)
         {
             TryBindToSkeleton();
         }
 
+        // Consume the flag. Nothing cleared it before, so `shouldApplyMesh` was true on EVERY pass for
+        // the rest of the session - harmless while ApplyChanges ran rarely, and a full mesh rebuild per
+        // frame the moment anything started dirtying this hook regularly. -xlinka
         bool shouldApplyMesh = Owner.MeshDataChanged || !_meshApplied;
+        Owner.MeshDataChanged = false;
         if (shouldApplyMesh && (Owner.Vertices.Count > 0 || Owner.MeshAsset.Target != null))
         {
             ApplyMesh();
@@ -102,7 +126,9 @@ public class SkinnedMeshHook : ComponentHook<SkinnedMeshRenderer>, ILodRangeTarg
 
         // Update material if changed (target reassigned), or keep retrying while the real asset is still loading
         // so the neutral fallback gets replaced the moment the PBS material is valid (MAT-3 race fix). -xlinka
-        if (Owner.Material.GetWasChangedAndClear())
+        bool materialsChanged = Owner.MaterialsChanged;
+        Owner.MaterialsChanged = false;
+        if (materialsChanged | Owner.Material.GetWasChangedAndClear())
         {
             _realMaterialApplied = false;
             ApplyMaterial();
@@ -111,6 +137,27 @@ public class SkinnedMeshHook : ComponentHook<SkinnedMeshRenderer>, ILodRangeTarg
         {
             ApplyMaterial();
         }
+
+        // Keep asking until the real material lands, WHICHEVER branch just painted the placeholder.
+        //
+        // ApplyChanges is QUEUE-driven, not per-frame: it runs when something dirties this hook and not
+        // otherwise. A texture finishing its download dirties nothing here: the material re-binds itself
+        // (its texture refs are direct members, so their arrival marks it dirty), but the renderer holds
+        // that material in the Materials LIST, and a list element's change event has no listener - all
+        // the arrival does on the renderer is set MaterialsChanged, which nobody reads until the hook
+        // runs again. So every path that can leave a surface on the checker has to re-queue, not just the
+        // retry branch above. It used to be only that branch: a surface that went on the placeholder
+        // from the materials-changed branch, or from the mesh finalize, was stuck with no retry and no
+        // "stuck" warning (the watch fires only on a repeat visit). On the dog import that was the
+        // Fluff mane: its mesh finalized while its 4096-square albedo was still decoding, went on the
+        // checker, and nothing ever came back for it. The body, same material type and same texture
+        // format, escaped - most likely because its morph build (17k verts x 307 shapes against the
+        // mane's 8k x 23) finalizes so much later that the texture is already there by then. It is a
+        // race either way, and which surfaces lose it changes with the machine.
+        //
+        // Re-queueing while a surface is still on the placeholder costs one pass per hook per frame for
+        // as long as the load takes, and stops the moment every surface is latched. -xlinka
+        RequeueWhilePlaceholderShown();
 
         // Cheap path: blendshape weights changed (blink/viseme/expression) - reapply, no rebuild.
         if (Owner.BlendWeightsChanged)
@@ -140,39 +187,89 @@ public class SkinnedMeshHook : ComponentHook<SkinnedMeshRenderer>, ILodRangeTarg
             _meshInstance.SetBlendShapeValue(i, i < weights ? Owner.GetEffectiveBlendShapeWeight(i) : 0f);
     }
 
+    // Every surface gets its own material now. Painting only surface 0 left a multi-surface mesh -
+    // a body with a separate face or eyes - showing one material where it should show several. -xlinka
     private void ApplyMaterial()
     {
-        if (_meshInstance == null || _arrayMesh == null) return;
+        if (!MeshInstanceAlive || _arrayMesh == null) return;
+
+        int surfaces = _arrayMesh.GetSurfaceCount();
+        if (surfaces <= 0) return;
+
+        bool allApplied = true;
+        for (int surface = 0; surface < surfaces; surface++)
+            allApplied &= ApplySurfaceMaterial(surface);
+
+        _realMaterialApplied = allApplied;
+    }
+
+    // True once this surface is wearing its final material and needs no further retry.
+    private bool ApplySurfaceMaterial(int surface)
+    {
+        var provider = Owner.MaterialFor(surface);
 
         // Nothing assigned is AUTHORED, not loading: no override, no loading skin, and latched so the
         // retry loop stops asking. It used to paint a flat tan guess here, which is a claim about a
         // material that does not exist. -xlinka
-        if (Owner.Material.Target == null)
+        if (provider == null)
         {
-            _meshInstance.SetSurfaceOverrideMaterial(0, null);
-            _realMaterialApplied = true;
+            _meshInstance!.SetSurfaceOverrideMaterial(surface, null);
+            return true;
+        }
+
+        var materialAsset = provider.Asset;
+        bool loading = Owner.IsSurfaceLoading(surface);
+        if (!loading && materialAsset != null && materialAsset.GodotMaterial is Material godotMaterial)
+        {
+            _meshInstance!.SetSurfaceOverrideMaterial(surface, godotMaterial);
+            _loadingSkin.Clear(surface);
+            return true;
+        }
+
+        _loadingSkin.Note(surface, provider, Owner.Slot?.SlotName.Value);
+
+        // Assigned but still arriving (the material asset, or its textures). Wear the shared loading
+        // skin and DON'T latch it - leave the flag false so the arrival notification's re-drive swaps
+        // in the real material. An avatar used to get stuck in the tan. -xlinka
+        _meshInstance!.SetSurfaceOverrideMaterial(surface, LoadingPlaceholderMaterial.Get());
+        return false;
+    }
+
+    private readonly LoadingSkinWatch _loadingSkin = new();
+
+    // One more ApplyChanges next frame while any surface wears the loading skin. Safe from the deferred
+    // mesh finalize too: the datamodel write goes through the world's synchronous queue rather than
+    // straight into the change buckets from a Godot callback, the same route the blendshape-name mirror
+    // in that finalize already takes. A no-op once every surface holds its real material. -xlinka
+    private void RequeueWhilePlaceholderShown()
+    {
+        if (_realMaterialApplied || !_meshApplied)
+            return;
+
+        var owner = Owner;
+        if (owner == null || owner.IsDestroyed)
+            return;
+
+        var world = owner.World;
+        if (world == null)
+        {
+            owner.MarkChangeDirty();
             return;
         }
 
-        var materialAsset = Owner.Material.Asset;
-        bool loading = Owner.IsSurfaceLoading();
-        if (!loading && materialAsset != null && materialAsset.GodotMaterial is Material godotMaterial)
+        world.RunSynchronously(() =>
         {
-            _meshInstance.SetSurfaceOverrideMaterial(0, godotMaterial);
-            _realMaterialApplied = true;
-        }
-        else
-        {
-            // Assigned but still arriving (the material asset, or its textures). Wear the shared loading
-            // skin and DON'T latch it - leave _realMaterialApplied false so the arrival notification's
-            // re-drive swaps in the real material. An avatar used to get stuck in the tan. -xlinka
-            _meshInstance.SetSurfaceOverrideMaterial(0, LoadingPlaceholderMaterial.Get());
-            _realMaterialApplied = false;
-        }
+            if (!owner.IsDestroyed)
+                owner.MarkChangeDirty();
+        });
     }
 
     private void TryBindToSkeleton()
     {
+        // Called from the stale-skeleton path too, by which point the instance itself may be gone.
+        if (!MeshInstanceAlive)
+            return;
+
         if (Owner.Skeleton.Target != null)
         {
             _skeletonHook = (Owner.Skeleton.Target.Hook as SkeletonHook)!;
@@ -206,22 +303,23 @@ public class SkinnedMeshHook : ComponentHook<SkinnedMeshRenderer>, ILodRangeTarg
             }
         }
 
-        if (_skeleton == null || !GodotObject.IsInstanceValid(_skeleton))
+        if (!SkeletonAlive)
         {
             if (!_meshInstance.IsInsideTree())
             {
                 attachedNode.AddChild(_meshInstance);
-                LumoraLogger.Log("SkinnedMeshHook: No skeleton found - added mesh as static");
+                LumoraLogger.Debug("SkinnedMeshHook: No skeleton found - added mesh as static");
             }
             return;
         }
 
-        if (_skeleton.GetBoneCount() == 0)
+        // SkeletonAlive already proved this non-null; the analyser cannot see through the property.
+        if (_skeleton!.GetBoneCount() == 0)
         {
             if (!_meshInstance.IsInsideTree())
             {
                 attachedNode.AddChild(_meshInstance);
-                LumoraLogger.Log("SkinnedMeshHook: Skeleton has no bones - added mesh as static");
+                LumoraLogger.Debug("SkinnedMeshHook: Skeleton has no bones - added mesh as static");
             }
             return;
         }
@@ -232,25 +330,33 @@ public class SkinnedMeshHook : ComponentHook<SkinnedMeshRenderer>, ILodRangeTarg
         {
             if (_meshInstance.GetParent() != _skeleton)
             {
-                var global = _meshInstance.GlobalTransform;
                 _meshInstance.GetParent().RemoveChild(_meshInstance);
                 _skeleton.AddChild(_meshInstance);
-                _meshInstance.GlobalTransform = global;
-                LumoraLogger.Log("SkinnedMeshHook: Reparented mesh under skeleton");
+                LumoraLogger.Debug("SkinnedMeshHook: Reparented mesh under skeleton");
             }
         }
         else
         {
             _skeleton.AddChild(_meshInstance);
-            LumoraLogger.Log("SkinnedMeshHook: Added mesh as child of skeleton");
+            LumoraLogger.Debug("SkinnedMeshHook: Added mesh as child of skeleton");
         }
+
+        // IDENTITY, and not the transform this instance carried under its own slot. A skinned vertex
+        // lands at skeleton * skinMatrix * vertex, and the skin's inverse binds already carry mesh
+        // space -> bone space, so anything left on the instance is applied a SECOND time and slides
+        // the body off its armature. This used to preserve the global transform across the reparent,
+        // which is exactly that bug: any model whose mesh node carries an offset - most Blender and
+        // FBX exports, where the mesh hangs under an Armature node with its own transform - rendered
+        // its mesh away from its bones. A skinned mesh node's own transform is ignored by definition;
+        // the armature places the mesh, not the node it was authored under. -xlinka
+        _meshInstance.Transform = Transform3D.Identity;
 
         // ".." because the mesh was just parented under the skeleton.
         _meshInstance.Skeleton = new NodePath("..");
 
         _skeletonBound = true;
         _lastBindAttemptBoneCount = Owner.BoneNames.Count;
-        LumoraLogger.Log($"SkinnedMeshHook: Bound to skeleton '{_skeleton.Name}' with {_skeleton.GetBoneCount()} bones, mapped {_boneIndexMap.Count} mesh bones");
+        LumoraLogger.Debug($"SkinnedMeshHook: Bound to skeleton '{_skeleton.Name}' with {_skeleton.GetBoneCount()} bones, mapped {_boneIndexMap.Count} mesh bones");
 
         // Re-apply mesh now that we have skeleton with proper bone mapping / Skin. Skip when nothing
         // mapped (a rigid mesh renders fine without a Skin) - rebuilding then is churn for no gain.
@@ -293,7 +399,7 @@ public class SkinnedMeshHook : ComponentHook<SkinnedMeshRenderer>, ILodRangeTarg
                     LumoraLogger.Warn($"SkinnedMeshHook: Bone '{boneName}' not found in skeleton, mapping to bone 0");
                 }
             }
-            LumoraLogger.Log($"SkinnedMeshHook: Built bone map from names - {_boneIndexMap.Count} mappings");
+            LumoraLogger.Debug($"SkinnedMeshHook: Built bone map from names - {_boneIndexMap.Count} mappings");
             return;
         }
 
@@ -321,7 +427,7 @@ public class SkinnedMeshHook : ComponentHook<SkinnedMeshRenderer>, ILodRangeTarg
                     _boneIndexMap[meshBoneIdx] = 0;
                 }
             }
-            LumoraLogger.Log($"SkinnedMeshHook: Built bone map from slots - {_boneIndexMap.Count} mappings");
+            LumoraLogger.Debug($"SkinnedMeshHook: Built bone map from slots - {_boneIndexMap.Count} mappings");
             return;
         }
 
@@ -338,7 +444,7 @@ public class SkinnedMeshHook : ComponentHook<SkinnedMeshRenderer>, ILodRangeTarg
                     _boneIndexMap[meshBoneIdx] = skelBoneIdx;
                 }
             }
-            LumoraLogger.Log($"SkinnedMeshHook: Built bone map from SkeletonBuilder - {_boneIndexMap.Count} mappings");
+            LumoraLogger.Debug($"SkinnedMeshHook: Built bone map from SkeletonBuilder - {_boneIndexMap.Count} mappings");
             return;
         }
 
@@ -346,7 +452,7 @@ public class SkinnedMeshHook : ComponentHook<SkinnedMeshRenderer>, ILodRangeTarg
         {
             _boneIndexMap[i] = i;
         }
-        LumoraLogger.Log($"SkinnedMeshHook: Using direct bone index mapping (fallback)");
+        LumoraLogger.Debug($"SkinnedMeshHook: Using direct bone index mapping (fallback)");
     }
 
     // returns 0 for invalid indices to prevent Godot errors
@@ -369,14 +475,14 @@ public class SkinnedMeshHook : ComponentHook<SkinnedMeshRenderer>, ILodRangeTarg
 
     private void ApplyMesh()
     {
-        if (_meshInstance == null)
+        if (!MeshInstanceAlive)
             return;
 
         // A full mesh rebuild re-uploads the ArrayMesh and re-registers the instance with lights/shadows,
         // which reads as a visible shadow/light pop on the whole avatar. Rebuilds should be RARE (import,
         // mesh data change, skeleton rebind) - if this line spams in the log while an avatar blinks or
         // idles, something upstream is tripping MeshDataChanged per frame and that's the bug. - xlinka
-        LumoraLogger.Log($"SkinnedMeshHook: full mesh rebuild on '{Owner.Slot?.SlotName.Value}'");
+        LumoraLogger.Debug($"SkinnedMeshHook: full mesh rebuild on '{Owner.Slot?.SlotName.Value}'");
 
         // Phos asset path (the universal pipeline): geometry + bone bindings + bind poses come from a
         // content-hashed MeshDataAsset, and skinning is driven by an explicit Skin. Takes precedence over the
@@ -392,7 +498,7 @@ public class SkinnedMeshHook : ComponentHook<SkinnedMeshRenderer>, ILodRangeTarg
 
         if (Owner.Vertices.Count == 0 || Owner.Indices.Count == 0)
         {
-            LumoraLogger.Log("SkinnedMeshHook: No mesh data");
+            LumoraLogger.Debug("SkinnedMeshHook: No mesh data");
             _meshInstance.Mesh = null;
             _meshApplied = false;
             return;
@@ -456,6 +562,7 @@ public class SkinnedMeshHook : ComponentHook<SkinnedMeshRenderer>, ILodRangeTarg
         if (Owner.Indices.Count > 0 && (maxIndex >= Owner.Vertices.Count || minIndex < 0))
         {
             LumoraLogger.Error($"SkinnedMeshHook: Index range [{minIndex}, {maxIndex}] invalid for vertex count {Owner.Vertices.Count} on slot '{Owner.Slot?.SlotName?.Value}' - surface skipped");
+            arrays.Dispose();
             return;
         }
         arrays[(int)Mesh.ArrayType.Index] = indices;
@@ -464,7 +571,7 @@ public class SkinnedMeshHook : ComponentHook<SkinnedMeshRenderer>, ILodRangeTarg
         // errors on bone indices that don't exist yet.
         bool hasBoneData = Owner.BoneIndices.Count == Owner.Vertices.Count &&
                            Owner.BoneWeights.Count == Owner.Vertices.Count;
-        bool hasValidMappings = _boneIndexMap.Count > 0 && _skeleton != null && _skeleton.GetBoneCount() > 0;
+        bool hasValidMappings = _boneIndexMap.Count > 0 && SkeletonAlive && _skeleton.GetBoneCount() > 0;
 
         if (hasBoneData && hasValidMappings)
         {
@@ -491,11 +598,11 @@ public class SkinnedMeshHook : ComponentHook<SkinnedMeshRenderer>, ILodRangeTarg
             }
             arrays[(int)Mesh.ArrayType.Weights] = boneWeights;
 
-            LumoraLogger.Log($"SkinnedMeshHook: Added bone data for {Owner.Vertices.Count} vertices with {_boneIndexMap.Count} bone mappings");
+            LumoraLogger.Debug($"SkinnedMeshHook: Added bone data for {Owner.Vertices.Count} vertices with {_boneIndexMap.Count} bone mappings");
         }
         else if (hasBoneData)
         {
-            LumoraLogger.Log($"SkinnedMeshHook: Skipping bone data - skeleton not ready (mappings={_boneIndexMap.Count}, skelBones={_skeleton?.GetBoneCount() ?? 0})");
+            LumoraLogger.Debug($"SkinnedMeshHook: Skipping bone data - skeleton not ready (mappings={_boneIndexMap.Count}, skelBones={_skeleton?.GetBoneCount() ?? 0})");
         }
         else
         {
@@ -509,6 +616,7 @@ public class SkinnedMeshHook : ComponentHook<SkinnedMeshRenderer>, ILodRangeTarg
         int shapeCount = Owner.BlendShapeNames.Count;
         bool hasBlendShapes = shapeCount > 0 && Owner.BlendShapeVertices.Count == shapeCount * vertexCount;
         global::Godot.Collections.Array<global::Godot.Collections.Array> blendShapes = null!;
+        var shapeArrayPool = new List<global::Godot.Collections.Array>();
         if (hasBlendShapes)
         {
             _arrayMesh.ClearBlendShapes();
@@ -530,11 +638,17 @@ public class SkinnedMeshHook : ComponentHook<SkinnedMeshRenderer>, ILodRangeTarg
             bool hasMorphNormals = Owner.HasBlendShapeNormals;
 
             blendShapes = new global::Godot.Collections.Array<global::Godot.Collections.Array>();
+
+            // One staging buffer per stream, reused by every shape: the assignment into shapeArrays
+            // marshals a copy, and both loops overwrite every element. -xlinka
+            var sv = new Vector3[vertexCount];
+            var sn = baseHasNormals ? new Vector3[vertexCount] : null;
+
             for (int s = 0; s < shapeCount; s++)
             {
                 var shapeArrays = new global::Godot.Collections.Array();
                 shapeArrays.Resize((int)Mesh.ArrayType.Max);
-                var sv = new Vector3[vertexCount];
+                shapeArrayPool.Add(shapeArrays);
                 int baseIdx = s * vertexCount;
                 for (int i = 0; i < vertexCount; i++)
                 {
@@ -543,9 +657,8 @@ public class SkinnedMeshHook : ComponentHook<SkinnedMeshRenderer>, ILodRangeTarg
                 }
                 shapeArrays[(int)Mesh.ArrayType.Vertex] = sv;
 
-                if (baseHasNormals)
+                if (sn != null)
                 {
-                    var sn = new Vector3[vertexCount];
                     for (int i = 0; i < vertexCount; i++)
                     {
                         if (hasMorphNormals)
@@ -587,6 +700,14 @@ public class SkinnedMeshHook : ComponentHook<SkinnedMeshRenderer>, ILodRangeTarg
             _arrayMesh.AddSurfaceFromArrays(Mesh.PrimitiveType.Triangles, arrays);
         }
 
+        // The surface holds its own copies; these only hand back their native storage when told to.
+        for (int i = 0; i < shapeArrayPool.Count; i++)
+            shapeArrayPool[i].Dispose();
+        // Array<T> is a typed view over an untyped Array; the untyped one is what owns the storage.
+        if (blendShapes != null)
+            ((global::Godot.Collections.Array)blendShapes).Dispose();
+        arrays.Dispose();
+
         _meshInstance.Mesh = _arrayMesh;
         ApplyBlendShapeWeights();
 
@@ -594,7 +715,8 @@ public class SkinnedMeshHook : ComponentHook<SkinnedMeshRenderer>, ILodRangeTarg
         ApplyMaterial();
 
         _meshApplied = true;
-        LumoraLogger.Log($"SkinnedMeshHook: Applied mesh with {Owner.Vertices.Count} vertices, {Owner.Indices.Count / 3} triangles");
+        RequeueWhilePlaceholderShown();
+        LumoraLogger.Debug($"SkinnedMeshHook: Applied mesh with {Owner.Vertices.Count} vertices, {Owner.Indices.Count / 3} triangles");
     }
 
     // Per-vertex tangents (xyz + handedness w) via the standard accumulate-per-triangle + Gram-Schmidt method.
@@ -657,12 +779,28 @@ public class SkinnedMeshHook : ComponentHook<SkinnedMeshRenderer>, ILodRangeTarg
     // returns quietly (leaving _meshApplied false) until then so the update loop re-enters. -xlinka
     private void ApplyMeshFromAsset(PhosMesh mesh, MeshDataAsset asset)
     {
-        if (_skeleton == null || _skeleton.GetBoneCount() == 0)
+        // IsInstanceValid before ANY call on it - a null check alone does not cover a disposed node.
+        if (!MeshInstanceAlive)
         {
             _meshApplied = false;
             return;
         }
-        if (mesh.Submeshes.Count == 0 || mesh.Submeshes[0].IndexCount == 0)
+
+        // A skeleton is only required if the MESH IS ACTUALLY SKINNED. Content routinely puts an
+        // unskinned mesh on a skinned renderer - a swappable alternate body, a toggled accessory - and
+        // demanding a skeleton for those meant they rendered nothing at all, forever, with no error.
+        // With no bone data there is nothing to skin: build it and let it ride the slot transform.
+        if (asset.BoneCount > 0 && (!SkeletonAlive || _skeleton.GetBoneCount() == 0))
+        {
+            _meshApplied = false;
+            return;
+        }
+        bool anyIndices = false;
+        foreach (var sm in mesh.Submeshes)
+        {
+            if (sm.IndexCount > 0) { anyIndices = true; break; }
+        }
+        if (!anyIndices)
         {
             _meshApplied = false;
             return;
@@ -701,13 +839,18 @@ public class SkinnedMeshHook : ComponentHook<SkinnedMeshRenderer>, ILodRangeTarg
     // (0 if Godot rejected the morph surface). -xlinka
     private ArrayMesh BuildArrayMeshCore(PhosMesh mesh, out int shapeCount)
     {
-        var submesh = mesh.Submeshes[0];
         int vcount = mesh.VertexCount;
 
         var arrayMesh = new ArrayMesh();
 
+        // Every Godot.Collections.Array below owns NATIVE storage, and AddSurfaceFromArrays copies out of
+        // it rather than taking ownership. Left undisposed the native buffers only come back at
+        // finalization, so an avatar with hundreds of morph targets sits on a second full copy of its
+        // geometry for as long as the GC feels like it - on top of the peak that already put the machine
+        // into swap. Collected here and released at the single exit below. -xlinka
         var arrays = new global::Godot.Collections.Array();
         arrays.Resize((int)Mesh.ArrayType.Max);
+        var shapeArrayPool = new List<global::Godot.Collections.Array>();
 
         var rp = mesh.RawPositions;
         var positions = new Vector3[vcount];
@@ -796,17 +939,29 @@ public class SkinnedMeshHook : ComponentHook<SkinnedMeshRenderer>, ILodRangeTarg
             arrays[(int)Mesh.ArrayType.Weights] = weights;
         }
 
-        var ri = submesh.RawIndices;
-        var indices = new int[submesh.IndexCount];
-        System.Array.Copy(ri, indices, submesh.IndexCount);
-        arrays[(int)Mesh.ArrayType.Index] = indices;
+        // Every submesh's indices together, for the tangent pass - tangents are a per-VERTEX property and
+        // a vertex can be used by any surface, so deriving them from one submesh leaves the rest with a
+        // garbage basis.
+        int totalIndices = 0;
+        foreach (var sm in mesh.Submeshes)
+            totalIndices += sm.IndexCount;
+
+        var allIndices = new int[totalIndices];
+        int writeAt = 0;
+        foreach (var sm in mesh.Submeshes)
+        {
+            if (sm.IndexCount <= 0)
+                continue;
+            System.Array.Copy(sm.RawIndices, 0, allIndices, writeAt, sm.IndexCount);
+            writeAt += sm.IndexCount;
+        }
 
         // No source tangents but we have normals + UVs: GENERATE them. Without tangents a normal-mapped
         // material renders with a garbage tangent basis - the speckled "white cracks" on detailed areas like a
         // muzzle, and unstable/dark lighting when a blendshape (e.g. a blink) perturbs the mesh. -xlinka
-        if (!baseHasTangents && nrmArr != null && uvArr != null && indices.Length >= 3)
+        if (!baseHasTangents && nrmArr != null && uvArr != null && allIndices.Length >= 3)
         {
-            arrays[(int)Mesh.ArrayType.Tangent] = ComputeTangents(positions, nrmArr, uvArr, indices);
+            arrays[(int)Mesh.ArrayType.Tangent] = ComputeTangents(positions, nrmArr, uvArr, allIndices);
             baseHasTangents = true;
         }
 
@@ -823,13 +978,20 @@ public class SkinnedMeshHook : ComponentHook<SkinnedMeshRenderer>, ILodRangeTarg
                 arrayMesh.AddBlendShape(mesh.BlendShapes[s].Name);
 
             blendShapes = new global::Godot.Collections.Array<global::Godot.Collections.Array>();
+
+            // ONE staging buffer for every shape. Assigning it into shapeArrays marshals it into a packed
+            // Godot array, which is a copy, so the managed buffer is dead the moment the assignment returns
+            // and a fresh Vector3[vcount] per shape was 756 * 58,030 * 12 bytes of pure garbage on the
+            // avatar that started this. Every element is overwritten below, so no clear is needed. -xlinka
+            var sv = new Vector3[vcount];
+
             for (int s = 0; s < shapeCount; s++)
             {
                 var frame = mesh.BlendShapes[s].Frames.Length > 0 ? mesh.BlendShapes[s].Frames[0] : null;
                 var shapeArrays = new global::Godot.Collections.Array();
                 shapeArrays.Resize((int)Mesh.ArrayType.Max);
+                shapeArrayPool.Add(shapeArrays);
 
-                var sv = new Vector3[vcount];
                 var sp = frame?.positions;
                 for (int i = 0; i < vcount; i++)
                     sv[i] = (sp != null && i < sp.Length) ? new Vector3(sp[i].x, sp[i].y, sp[i].z) : Vector3.Zero;
@@ -855,22 +1017,59 @@ public class SkinnedMeshHook : ComponentHook<SkinnedMeshRenderer>, ILodRangeTarg
             }
         }
 
-        if (shapeCount > 0)
+        // ONE SURFACE PER SUBMESH. Only the first was ever built before, which on a character that
+        // splits its body across several material groups means most of it simply is not there - the test
+        // avatar draws 960 of its 82,540 triangles and reads as a shapeless blob. The vertex arrays are
+        // shared; only the index array changes per surface, which is also exactly what the per-surface
+        // materials on the renderer are for. -xlinka
+        foreach (var sm in mesh.Submeshes)
         {
-            int before = arrayMesh.GetSurfaceCount();
-            arrayMesh.AddSurfaceFromArrays(Mesh.PrimitiveType.Triangles, arrays, blendShapes);
-            if (arrayMesh.GetSurfaceCount() == before)
+            if (sm == null || sm.IndexCount <= 0)
+                continue;
+
+            var indices = new int[sm.IndexCount];
+            System.Array.Copy(sm.RawIndices, indices, sm.IndexCount);
+            arrays[(int)Mesh.ArrayType.Index] = indices;
+
+            if (shapeCount > 0)
             {
-                LumoraLogger.Warn($"SkinnedMeshHook: Phos blend-shape surface rejected ({shapeCount} shapes) - rendering without morphs so the mesh still shows.");
-                arrayMesh.ClearBlendShapes();
+                int before = arrayMesh.GetSurfaceCount();
+                arrayMesh.AddSurfaceFromArrays(Mesh.PrimitiveType.Triangles, arrays, blendShapes);
+                if (arrayMesh.GetSurfaceCount() == before)
+                {
+                    // Godot rejected the morph surface. Drop morphs for the WHOLE mesh and restart -
+                    // blend shapes are declared per mesh, so a half-morphed mesh is not a valid state.
+                    LumoraLogger.Warn($"SkinnedMeshHook: Phos blend-shape surface rejected ({shapeCount} shapes) - rendering without morphs so the mesh still shows.");
+                    arrayMesh.ClearSurfaces();
+                    arrayMesh.ClearBlendShapes();
+                    shapeCount = 0;
+                    // blendShapes stays referenced, unread, so the release below still frees it.
+                    foreach (var retry in mesh.Submeshes)
+                    {
+                        if (retry == null || retry.IndexCount <= 0)
+                            continue;
+                        var retryIndices = new int[retry.IndexCount];
+                        System.Array.Copy(retry.RawIndices, retryIndices, retry.IndexCount);
+                        arrays[(int)Mesh.ArrayType.Index] = retryIndices;
+                        arrayMesh.AddSurfaceFromArrays(Mesh.PrimitiveType.Triangles, arrays);
+                    }
+                    break;
+                }
+            }
+            else
+            {
                 arrayMesh.AddSurfaceFromArrays(Mesh.PrimitiveType.Triangles, arrays);
-                shapeCount = 0;
             }
         }
-        else
-        {
-            arrayMesh.AddSurfaceFromArrays(Mesh.PrimitiveType.Triangles, arrays);
-        }
+
+        // Surfaces own their copies now. This is the only exit; a throw on the way here is caught by the
+        // caller, which rebuilds from scratch, so the rare leak on that path costs nothing that survives.
+        for (int i = 0; i < shapeArrayPool.Count; i++)
+            shapeArrayPool[i].Dispose();
+        // Array<T> is a typed view over an untyped Array; the untyped one is what owns the storage.
+        if (blendShapes != null)
+            ((global::Godot.Collections.Array)blendShapes).Dispose();
+        arrays.Dispose();
 
         return arrayMesh;
     }
@@ -959,36 +1158,78 @@ public class SkinnedMeshHook : ComponentHook<SkinnedMeshRenderer>, ILodRangeTarg
         _appliedMeshVcount = mesh.VertexCount;
         _meshApplied = true;
         Owner.HookBindingComplete = true;
+
+        // HookBindingComplete above switches off the component's per-update re-drive, so from here on
+        // nothing asks this hook to run again unless something else touches the renderer. If the
+        // ApplyMaterial just above left a surface on the loading skin, this is the only thing that
+        // brings the real material in when its textures land. -xlinka
+        RequeueWhilePlaceholderShown();
         double _finalizeMs = (System.Diagnostics.Stopwatch.GetTimestamp() - _finalizeStart) * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
-        LumoraLogger.Log($"SkinnedMeshHook: Applied skinned mesh - {mesh.VertexCount} verts, {mesh.BlendShapeCount} shapes, {asset.BoneCount} bones | offThreadBuild={offThreadOk}, mainThreadFinalize={_finalizeMs:F0}ms");
+
+        // One line per skinned mesh, at Log. A mesh can build, skin and pass every check and still not
+        // appear - wrong visibility, an empty surface, or bounds the renderer culls against - and none
+        // of that is visible from the outside. This is the line that says which. -xlinka
+        var aabb = _meshInstance.GetAabb();
+        int surfaces = _arrayMesh?.GetSurfaceCount() ?? 0;
+        int skeletonBones = (_skeleton != null && GodotObject.IsInstanceValid(_skeleton)) ? _skeleton.GetBoneCount() : -1;
+        LumoraLogger.Log($"SkinnedMeshHook '{Owner.Slot?.SlotName.Value}': {mesh.VertexCount} verts, {surfaces} surface(s), "
+                       + $"{mesh.BlendShapeCount} shapes, {asset.BoneCount} bind bones vs {skeletonBones} skeleton bones | "
+                       + $"visible={_meshInstance.Visible} enabled={Owner.Enabled} materials={Owner.Materials.Count} "
+                       + $"aabb=({aabb.Size.X:F2},{aabb.Size.Y:F2},{aabb.Size.Z:F2}) at ({aabb.Position.X:F2},{aabb.Position.Y:F2},{aabb.Position.Z:F2}) "
+                       // WHERE the Godot node actually is, and on which layers. A mesh reporting
+                       // visible=True still photographs as nothing if its instance sits somewhere else
+                       // or renders on a layer the viewing camera does not include. -xlinka
+                       + $"node=({_meshInstance!.GlobalPosition.X:F2},{_meshInstance.GlobalPosition.Y:F2},{_meshInstance.GlobalPosition.Z:F2}) "
+                       + $"scale=({_meshInstance.Scale.X:F2},{_meshInstance.Scale.Y:F2},{_meshInstance.Scale.Z:F2}) "
+                       + $"layers={_meshInstance.Layers} | "
+                       + $"offThreadBuild={offThreadOk}, finalize={_finalizeMs:F0}ms");
     }
 
     // Map every mesh bone (in the asset's bone table) to its skeleton bone BY NAME and stamp the asset's bind
     // pose, so the surface's mesh-space bone indices resolve to the right skeleton bone on the GPU. -xlinka
     private void BuildAndAssignSkinFromAsset(MeshDataAsset asset)
     {
-        if (_skeleton == null || asset.BoneCount == 0)
+        // Runs deferred, after an off-thread mesh build - the skeleton can have been rebuilt (and the
+        // old node freed) in the meantime, so revalidate rather than trusting the cached pointer.
+        if (!SkeletonAlive || !MeshInstanceAlive || asset.BoneCount == 0)
             return;
+
+        // Names that differ only by decoration, a duplicate suffix or a typo still mean the same joint,
+        // so fall back to a fuzzy match rather than collapsing the bone to the root. A real avatar binds
+        // "Left_FirstToe" against a slot called "Left_FirstToey" - one stray character, and without this
+        // the toe verts get yanked to the origin. Ambiguous matches are refused, not guessed.
+        var matcher = new Lumora.Core.Assets.BoneNameMatcher();
+        for (int b = 0; b < _skeleton.GetBoneCount(); b++)
+            matcher.Add(_skeleton.GetBoneName(b), b);
 
         var skin = new Skin();
         skin.SetBindCount(asset.BoneCount);
         int unresolved = 0;
+        int fuzzy = 0;
         for (int i = 0; i < asset.BoneCount; i++)
         {
             string boneName = asset.GetBoneName(i) ?? string.Empty;
-            int skelBone = _skeleton.FindBone(boneName);
-            if (skelBone < 0)
+            if (!matcher.TryResolve(boneName, out int skelBone, out var kind))
             {
-                // Bone name not in the Godot skeleton -> collapsing to bone 0 yanks its verts to the root (spikes).
-                // Usually an FBX pivot ("_$AssimpFbx$") or suffixed-name mismatch. Log instead of failing silently. -xlinka
+                // Nothing plausible in the skeleton -> collapsing to bone 0 yanks its verts to the root
+                // (spikes). Usually an FBX pivot ("_$AssimpFbx$") or a genuinely absent bone. Log it
+                // instead of failing silently. -xlinka
                 unresolved++;
                 if (unresolved <= 8)
                     LumoraLogger.Warn($"SkinnedMeshHook: bind bone '{boneName}' not in skeleton - collapsing to bone 0 (will deform wrong).");
                 skelBone = 0;
             }
+            else if (kind != Lumora.Core.Assets.BoneNameMatcher.MatchKind.Exact)
+            {
+                fuzzy++;
+                if (fuzzy <= 8)
+                    LumoraLogger.Log($"SkinnedMeshHook: bind bone '{boneName}' matched '{_skeleton.GetBoneName(skelBone)}' by {kind} - names differ, joint is the same.");
+            }
             skin.SetBindBone(i, skelBone);
             skin.SetBindPose(i, asset.GetBoneBindPose(i).ToGodot());
         }
+        if (fuzzy > 8)
+            LumoraLogger.Log($"SkinnedMeshHook: {fuzzy} bind bones matched by name normalization.");
         if (unresolved > 0)
             LumoraLogger.Warn($"SkinnedMeshHook: {unresolved}/{asset.BoneCount} bind bones unresolved against skeleton '{_skeleton.Name}' ({_skeleton.GetBoneCount()} bones).");
 
@@ -1013,7 +1254,7 @@ public class SkinnedMeshHook : ComponentHook<SkinnedMeshRenderer>, ILodRangeTarg
         if (badBones > 0)
             LumoraLogger.Warn($"SkinnedMeshHook[skin-check]: {badBones}/{asset.BoneCount} bones FAIL rest*bind==identity on mesh '{Owner.Slot?.SlotName.Value}'.");
         else
-            LumoraLogger.Log($"SkinnedMeshHook[skin-check]: all {asset.BoneCount} bones OK at rest on mesh '{Owner.Slot?.SlotName.Value}'.");
+            LumoraLogger.Debug($"SkinnedMeshHook[skin-check]: all {asset.BoneCount} bones OK at rest on mesh '{Owner.Slot?.SlotName.Value}'.");
 
         _meshInstance.Skin = skin;
     }

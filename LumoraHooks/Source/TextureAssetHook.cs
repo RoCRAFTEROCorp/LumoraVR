@@ -23,7 +23,9 @@ public class TextureAssetHook : AssetHook, ITextureAssetHook, IGodotTexture
 
     // bumping this invalidates every cached blob
     // 2: compressed caches written from bottom-up rows (before the decode flip was removed) are stale.
-    private const int GpuCacheVersion = 2;
+    // 3: the format is now chosen per texture (alpha, normal map, HDR) and per device capability;
+    //    a version-2 blob is BC7 for everything and would be handed back under the new policy.
+    private const int GpuCacheVersion = 3;
 
     public ImageTexture GodotTexture => _godotTexture;
 
@@ -116,7 +118,8 @@ public class TextureAssetHook : AssetHook, ITextureAssetHook, IGodotTexture
         if (cachePath != null && TryReadCache(cachePath, out var cached))
             return cached;
 
-        Image image = BuildSourceImage(levels, width, height, request.GenerateMipmaps);
+        Image image = BuildSourceImage(levels, width, height, request.GenerateMipmaps,
+            request.IsHdr ? Image.Format.Rgbah : Image.Format.Rgba8);
 
         if (request.AllowBlockCompression && TryCompress(image, request))
         {
@@ -127,7 +130,7 @@ public class TextureAssetHook : AssetHook, ITextureAssetHook, IGodotTexture
         return image;
     }
 
-    private static Image BuildSourceImage(byte[][] levels, int width, int height, bool generateMipmaps)
+    private static Image BuildSourceImage(byte[][] levels, int width, int height, bool generateMipmaps, Image.Format format)
     {
         // A supplied chain is only usable as-is when it runs all the way to 1x1, which is the layout
         // the renderer expects behind a single buffer. A partial chain is not an error, it just means
@@ -148,41 +151,207 @@ public class TextureAssetHook : AssetHook, ITextureAssetHook, IGodotTexture
                 Buffer.BlockCopy(level, 0, packed, offset, level.Length);
                 offset += level.Length;
             }
-            return Image.CreateFromData(width, height, true, Image.Format.Rgba8, packed);
+            return Image.CreateFromData(width, height, true, format, packed);
         }
 
-        var image = Image.CreateFromData(width, height, false, Image.Format.Rgba8, levels[0]);
+        var image = Image.CreateFromData(width, height, false, format, levels[0]);
         if (generateMipmaps || levels.Length > 1)
             image.GenerateMipmaps();
         return image;
     }
 
+    // WHAT THIS DEVICE CAN SAMPLE.
+    //
+    // Asked once, on the main thread, before any texture is built. RenderingServer.HasOsFeature is
+    // the renderer's own answer for "s3tc", "bptc", "etc2" and "astc": on the RenderingDevice
+    // backends it is TextureIsFormatSupportedForUsage against each family's representative block
+    // format, on the GL backend it is the extension list. Hardcoding by OS name got this wrong in
+    // both directions: an ARM laptop or a software renderer has no BC family, and a desktop-class
+    // Vulkan driver often has ETC2 as well.
+    //
+    // The query says nothing about whether the ENCODER for a format is compiled into this binary,
+    // so the compress call still checks its own result and steps down the plan. The query decides
+    // what is worth trying; compress-and-see covers what this build can produce. Both are honest
+    // about different things. -xlinka
+    public sealed class DeviceFormats
+    {
+        public bool S3tc;
+        public bool Bptc;
+        public bool Etc2;
+        public bool Astc;
+        public bool PreferMobileFamily;
+        public bool Queried;
+
+        public override string ToString()
+        {
+            var parts = new System.Collections.Generic.List<string>(4);
+            if (S3tc) parts.Add("s3tc");
+            if (Bptc) parts.Add("bptc");
+            if (Etc2) parts.Add("etc2");
+            if (Astc) parts.Add("astc");
+            return parts.Count == 0 ? "none" : string.Join("-", parts);
+        }
+    }
+
+    private static readonly object _deviceLock = new();
+    private static DeviceFormats _device = new();
+
+    public static DeviceFormats Device
+    {
+        get
+        {
+            var device = _device;
+            if (device.Queried)
+                return device;
+            lock (_deviceLock)
+            {
+                if (!_device.Queried)
+                    QueryDeviceFormats();
+                return _device;
+            }
+        }
+    }
+
+    public static DeviceFormats QueryDeviceFormats()
+    {
+        var device = new DeviceFormats { Queried = true };
+        try
+        {
+            device.S3tc = RenderingServer.HasOsFeature("s3tc");
+            device.Bptc = RenderingServer.HasOsFeature("bptc");
+            device.Etc2 = RenderingServer.HasOsFeature("etc2");
+            device.Astc = RenderingServer.HasOsFeature("astc");
+        }
+        catch (Exception ex)
+        {
+            // No renderer to ask (headless, or a harness without a rendering server). Every flag
+            // stays false, which means every texture stays uncompressed, which is the only answer
+            // that cannot be wrong.
+            LumoraLogger.Warn($"TextureAssetHook: could not query texture format support ({ex.Message}); uploading uncompressed");
+        }
+        device.PreferMobileFamily = OS.GetName() is "Android" or "iOS";
+        lock (_deviceLock)
+            _device = device;
+        return device;
+    }
+
+    // Part of the GPU cache key. A blob baked in one format must never be handed to a device
+    // expecting another, so the tag names the format families this device offers plus a policy
+    // number: bump the number whenever the choice below changes for the same inputs, or a blob
+    // baked under the old policy is handed back under the new one. -xlinka
+    private const int FormatPolicyVersion = 3;
+
+    public static string CompressionTag() => $"p{FormatPolicyVersion}-{Device}";
+
+    // One thing to try, in the order the plan lists them.
+    private readonly record struct CompressAttempt(Image.CompressMode Mode, Image.UsedChannels Channels);
+
+    // THE FORMAT DECISION, from the same five inputs the source platform reads: device, HDR, alpha,
+    // normal map, and colour profile (which only picks the compress-source hint here, since the
+    // runtime encoders do not branch on it).
+    //
+    // Desktop: BC1 for opaque colour (4 bpp, the source platform's choice), BC7 where alpha or a
+    // normal map needs the extra channel (8 bpp, the same bytes as the source platform's BC3 and
+    // BC3nm at strictly higher quality), BC6H for HDR. Normal maps keep three channels rather than
+    // taking Godot's RG-only route because our material shaders sample normal.rgb; an RG block
+    // would hand them a zero blue.
+    //
+    // Mobile: ETC2 RGB8 for opaque colour (4 bpp, the floor both GLES3 and Vulkan guarantee), ASTC
+    // 4x4 where alpha or a normal map needs it (8 bpp, the same bytes as ETC2 RGBA8 at better
+    // quality) with ETC2 RGBA8 behind it, and HDR stays uncompressed half float, which is what the
+    // source platform ships on Android too. ASTC 8x8 is deliberately not used: it is 2 bpp and
+    // below the ETC2 floor in quality, and Godot exposes no block size between the two.
+    //
+    // HDR never enters an LDR block format. If BC6H is not on offer the texture stays RGBAH and
+    // pays full price rather than lose its range. -xlinka
+    private static System.Collections.Generic.List<CompressAttempt> PlanCompression(TextureUploadRequest request, DeviceFormats device)
+    {
+        var plan = new System.Collections.Generic.List<CompressAttempt>(3);
+        bool needsFourth = request.HasAlpha || request.IsNormalMap;
+        var channels = request.HasAlpha && !request.IsNormalMap ? Image.UsedChannels.Rgba : Image.UsedChannels.Rgb;
+
+        if (request.IsHdr)
+        {
+            if (device.Bptc)
+                plan.Add(new CompressAttempt(Image.CompressMode.Bptc, Image.UsedChannels.Rgb));
+            return plan;
+        }
+
+        void DesktopFamily()
+        {
+            if (needsFourth)
+            {
+                if (device.Bptc) plan.Add(new CompressAttempt(Image.CompressMode.Bptc, channels));
+                if (device.S3tc) plan.Add(new CompressAttempt(Image.CompressMode.S3Tc, channels));
+            }
+            else
+            {
+                if (device.S3tc) plan.Add(new CompressAttempt(Image.CompressMode.S3Tc, channels));
+                if (device.Bptc) plan.Add(new CompressAttempt(Image.CompressMode.Bptc, channels));
+            }
+        }
+
+        void MobileFamily()
+        {
+            if (needsFourth)
+            {
+                if (device.Astc) plan.Add(new CompressAttempt(Image.CompressMode.Astc, channels));
+                if (device.Etc2) plan.Add(new CompressAttempt(Image.CompressMode.Etc2, channels));
+            }
+            else
+            {
+                if (device.Etc2) plan.Add(new CompressAttempt(Image.CompressMode.Etc2, channels));
+                if (device.Astc) plan.Add(new CompressAttempt(Image.CompressMode.Astc, channels));
+            }
+        }
+
+        if (device.PreferMobileFamily)
+        {
+            MobileFamily();
+            DesktopFamily();
+        }
+        else
+        {
+            DesktopFamily();
+            MobileFamily();
+        }
+        return plan;
+    }
+
     // Block-compress in place. Returns true only when the format actually changed, so a device that
-    // cannot do BPTC silently keeps the uncompressed image instead of failing the load.
+    // cannot compress silently keeps the uncompressed image instead of failing the load.
     private static bool TryCompress(Image image, TextureUploadRequest request)
     {
         // Below one full block there is nothing to compress and Godot rejects it outright.
         if (image.GetWidth() < 4 || image.GetHeight() < 4)
             return false;
 
-        var source = request.IsNormalMap
-            ? Image.CompressSource.Normal
-            : (request.SRgb == true ? Image.CompressSource.Srgb : Image.CompressSource.Generic);
+        var plan = PlanCompression(request, Device);
+        if (plan.Count == 0)
+            return false;
 
         try
         {
             var before = image.GetFormat();
-            var error = image.Compress(Image.CompressMode.Bptc, source);
-            if (error != Error.Ok)
+            foreach (var attempt in plan)
             {
-                LumoraLogger.Log($"TextureAssetHook: BPTC unavailable for {image.GetWidth()}x{image.GetHeight()} ({error}); keeping RGBA8");
-                return false;
+                // The channel set comes from the sidecar's pixel scan rather than Godot's own
+                // DetectUsedChannels, which would walk every texel of the full-resolution image
+                // again to learn a fact the engine already measured once. -xlinka
+                // The format check is the real verdict: an encoder that is not in this build returns
+                // an error and leaves the image alone, and either sign on its own is enough to move
+                // to the next attempt.
+                image.CompressFromChannels(attempt.Mode, attempt.Channels, Image.AstcFormat.Format4X4);
+                if (image.GetFormat() != before)
+                    return true;
             }
-            return image.GetFormat() != before;
+
+            LumoraLogger.Log($"TextureAssetHook: no encoder in this build for {plan[0].Mode} on {image.GetWidth()}x{image.GetHeight()}; keeping {before}");
+            return false;
         }
         catch (Exception ex)
         {
-            LumoraLogger.Warn($"TextureAssetHook: compression failed, keeping RGBA8: {ex.Message}");
+            LumoraLogger.Warn($"TextureAssetHook: compression failed, keeping {image.GetFormat()}: {ex.Message}");
             return false;
         }
     }
@@ -317,6 +486,11 @@ public class TextureAssetHook : AssetHook, ITextureAssetHook, IGodotTexture
         Image.Format.RgtcR => TextureFormatKind.BC4_R,
         Image.Format.RgtcRg => TextureFormatKind.BC5_RG,
         Image.Format.BptcRgba => TextureFormatKind.BC7_RGBA,
+        Image.Format.BptcRgbf or Image.Format.BptcRgbfu => TextureFormatKind.BC6H_RGB,
+        Image.Format.Etc2Rgb8 => TextureFormatKind.ETC2_RGB8,
+        Image.Format.Etc2Rgba8 => TextureFormatKind.ETC2_RGBA8,
+        Image.Format.Astc4X4 => TextureFormatKind.ASTC_4x4,
+        Image.Format.Rgbah => TextureFormatKind.RGBA16F,
         _ => TextureFormatKind.Unknown,
     };
 
@@ -332,7 +506,10 @@ public class TextureAssetHook : AssetHook, ITextureAssetHook, IGodotTexture
             // Raw RGBA8 pixel data - create without mipmaps first (we only have base level data)
             image = Image.CreateFromData(width, height, false, Image.Format.Rgba8, pixels);
 
-            if (hasMipmaps)
+            // KTX and DDS arrive already block-compressed, and the renderer refuses to generate mipmaps
+            // on a compressed format - it prints its own error and carries on, so this is pure noise in
+            // the log rather than a failure. Skip it for those, they ship their own chain.
+            if (hasMipmaps && !image.IsCompressed())
             {
                 image.GenerateMipmaps();
             }
@@ -356,6 +533,31 @@ public class TextureAssetHook : AssetHook, ITextureAssetHook, IGodotTexture
             if (error != Error.Ok)
             {
                 error = image.LoadBmpFromBuffer(pixels);
+            }
+
+            // TGA is everywhere in model texture sets, KTX and DDS arrive already block-compressed,
+            // and SVG is listed as an importable type elsewhere in the engine. All four ship with the
+            // renderer and cost nothing to try; not calling them was the only reason they failed. -xlinka
+            if (error != Error.Ok)
+            {
+                error = image.LoadTgaFromBuffer(pixels);
+            }
+
+            if (error != Error.Ok)
+            {
+                error = image.LoadKtxFromBuffer(pixels);
+            }
+
+            if (error != Error.Ok)
+            {
+                error = image.LoadDdsFromBuffer(pixels);
+            }
+
+            // SVG last: it is text, so every binary sniffer above fails on it instantly and a real
+            // binary file never reaches the XML parser. 1.0 is the document's own size.
+            if (error != Error.Ok)
+            {
+                error = image.LoadSvgFromBuffer(pixels, 1.0f);
             }
 
             if (error != Error.Ok)

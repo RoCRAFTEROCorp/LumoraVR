@@ -4,6 +4,7 @@
 using System;
 using System.Collections.Generic;
 using System.Runtime.CompilerServices;
+using System.Threading.Tasks;
 using Helio.UI;
 using Lumora.Core.Assets;
 using Lumora.Core.Input;
@@ -63,6 +64,43 @@ public sealed class ParticleSystem : ImplementableComponent, IInputUpdateReceive
     // Sheet for the billboards. With a ParticleFlipbook attached this is the grid it steps through;
     // without one the whole image modulates every particle. Untextured is the default and additive
     // white dots are what most of these effects want.
+    // Draw this MESH per particle instead of the built-in billboard/sphere.
+    //
+    // The platform this imports from does not have one particle look: a style names a renderer, and that
+    // renderer either billboards a sprite or draws an arbitrary mesh per particle. Splashes, drips and
+    // debris are all the second kind, and without somewhere to put that mesh every one of them arrived as
+    // a ball. Unset keeps the existing behaviour exactly.
+    //
+    // Two references for one mesh, and they are not redundant - they carry the two ways a mesh can exist.
+    //
+    // A PROCEDURAL mesh is a component that builds its own geometry through its own hook; pointing at it
+    // is all that is needed. An IMPORTED mesh comes from a provider backed by an asset, and a provider
+    // decodes nothing while its reference count is zero - so it needs a real AssetRef, not a bare SyncRef,
+    // exactly as SkinnedMeshRenderer.MeshAsset spells out. Pointed at with a SyncRef alone the mesh is
+    // assigned, never loads, and the renderer quietly keeps drawing the sphere. Set whichever fits; the
+    // asset wins when both are. -xlinka
+    public readonly SyncRef<Component> ParticleMesh = new();
+
+    public readonly AssetRef<MeshDataAsset> ParticleMeshAsset = new();
+
+    // Draw with THIS material rather than the engine particle shader.
+    //
+    // The platform this imports from has no particle shader at all: a style names a renderer, the renderer
+    // names an ordinary material, and the particles are drawn with it like any other geometry. Ours grew
+    // the other way round, from one fixed additive shader outward, which is fine for sparks and wrong for
+    // everything an artist actually authored - a drip is a coloured mesh, not a glowing sprite. When a
+    // material is set it is used as-is; when it is not, the built-in shader still runs, so nothing that
+    // works today changes. -xlinka
+    public readonly AssetRef<MaterialAsset> Material = new();
+
+    // How these particles blend with what is behind them.
+    //
+    // Additive is right for sparks and glows and is what everything authored here has always had. It is
+    // wrong for anything textured whose dark parts are meant to STAY dark: under additive, black is
+    // transparent, so an imported splash or drip arrives with half of itself missing. Blending is a
+    // compile-time render_mode, so this picks a shader variant rather than setting a uniform. -xlinka
+    public readonly Sync<Lumora.Core.Assets.BlendMode> BlendMode = new();
+
     public readonly AssetRef<TextureAsset> Texture = new();
 
     // Separate image for the trail/ribbon ribbons, because a streak's texture is almost never the
@@ -96,6 +134,78 @@ public sealed class ParticleSystem : ImplementableComponent, IInputUpdateReceive
     // Per-world capacity accounting. Attached to the World rather than held in a static dictionary so a
     // closed world takes its budget with it instead of leaking an entry forever. -xlinka
     private static readonly ConditionalWeakTable<World, WorldParticleBudget> WorldBudgets = new();
+
+    // Step every system in a world together, on the pool, instead of one after another on the world
+    // thread.
+    //
+    // A simulation step touches nothing outside its own simulation: no slots, no sync fields, no
+    // platform calls. The only thing one simulation ever hands another is a sub-emission batch, and
+    // that goes through a lock on the receiving side. So sixteen small systems that each cost two
+    // hundred microseconds a frame serially cost one fifth of that spread over the cores, and the
+    // pictures they produce are the same pictures: each simulation still runs its own steps in its
+    // own order on its own seed. The stepping is deferred to the end of the world's synchronous
+    // drain so every system has had its parameters pushed first and nothing that runs after can
+    // observe a half-stepped world. Off means every system steps inline where it always did. -xlinka
+    public static bool ParallelSystemStepping = true;
+
+    private static readonly ConditionalWeakTable<World, WorldStepBatch> StepBatches = new();
+
+    private sealed class WorldStepBatch
+    {
+        private readonly World _world;
+        private readonly List<ParticleSystem> _pending = new();
+        private readonly Action _flush;
+        private readonly Action<int> _stepOne;
+        private ulong _frame = ulong.MaxValue;
+        private bool _scheduled;
+
+        public WorldStepBatch(World world)
+        {
+            _world = world;
+            _flush = Flush;
+            _stepOne = StepOne;
+        }
+
+        public void Enqueue(ParticleSystem system, ulong frame)
+        {
+            // The flush runs inside the same drain that queued it, so a batch left over from an earlier
+            // frame means that drain never came back for it. Settle it here rather than let those
+            // systems fall a frame behind for good.
+            if (_scheduled && frame != _frame && _pending.Count > 0)
+                Flush();
+            _frame = frame;
+            _pending.Add(system);
+            if (!_scheduled)
+            {
+                _scheduled = true;
+                _world.RunSynchronously(_flush);
+            }
+        }
+
+        private void Flush()
+        {
+            _scheduled = false;
+            int count = _pending.Count;
+            if (count == 0)
+                return;
+            if (count >= 2 && ParallelSystemStepping)
+            {
+                Parallel.For(0, count, _stepOne);
+            }
+            else
+            {
+                for (int i = 0; i < count; i++)
+                    StepOne(i);
+            }
+            _pending.Clear();
+        }
+
+        private void StepOne(int index) => _pending[index].RunQueuedStep();
+    }
+
+    private WorldStepBatch? _stepBatch;
+    private World? _stepBatchWorld;
+    private float _queuedDelta;
 
     private sealed class WorldParticleBudget
     {
@@ -237,12 +347,29 @@ public sealed class ParticleSystem : ImplementableComponent, IInputUpdateReceive
     public override void OnStart()
     {
         base.OnStart();
+
+        // Pointing at a mesh has to POKE that mesh, because the mesh is what has to react.
+        //
+        // A ProceduralMesh with no renderer beside it puts up its own lit-grey instance so it is visible
+        // at all, and takes it down again the moment something else draws it - a particle system counts.
+        // But that test lives in the mesh hook's ApplyChanges, and ApplyChanges is queue-driven, not per
+        // frame: a static mesh gets one call, at startup, and that call lands before the wiring does. So
+        // an import or an inspector edit points at a mesh that is never asked the question again, and the
+        // grey copy stands there at full scale forever. Re-drive it here, on the edge where the answer
+        // actually changes. -xlinka
+        ParticleMesh.OnTargetChange += RedriveMeshHook;
+
         var input = Engine.Current?.InputInterface;
         if (input != null)
         {
             input.RegisterInputEventReceiver(this);
             _registered = true;
         }
+    }
+
+    private static void RedriveMeshHook(SyncRef<Component> reference)
+    {
+        (reference.Target as ImplementableComponent)?.RunApplyChanges();
     }
 
     public override void OnDestroy()
@@ -337,8 +464,41 @@ public sealed class ParticleSystem : ImplementableComponent, IInputUpdateReceive
         PushSystemParameters(dt);
         PushSubsystemParameters(dt);
 
-        sim.Update(dt);
-        RenderVersion = sim.RenderVersion;
+        var world = World;
+        if (world == null || world.State != World.WorldState.Running || world.IsDisposed)
+        {
+            // Outside a running world the receiver callback is not queued through the drain either, so
+            // there is no drain to hand the step to. Step here, as before.
+            sim.Update(dt);
+            RenderVersion = sim.RenderVersion;
+            return;
+        }
+
+        if (!ReferenceEquals(_stepBatchWorld, world))
+        {
+            _stepBatchWorld = world;
+            _stepBatch = StepBatches.GetValue(world, static w => new WorldStepBatch(w));
+        }
+        _queuedDelta = dt;
+        _stepBatch!.Enqueue(this, world.Time.UpdateIndex);
+    }
+
+    // The deferred step. Runs on a pool thread when the world's batch goes parallel, so it touches the
+    // simulation and this one integer and nothing else.
+    private void RunQueuedStep()
+    {
+        var sim = _sim;
+        if (sim == null || sim.IsDisposed || IsDestroyed)
+            return;
+        try
+        {
+            sim.Update(_queuedDelta);
+            RenderVersion = sim.RenderVersion;
+        }
+        catch (Exception ex)
+        {
+            Logging.Logger.Error($"ParticleSystem: simulation step failed: {ex.Message}");
+        }
     }
 
     // Distance is measured from the local user's HEAD, not the camera node, because that is the thing the
@@ -504,14 +664,35 @@ public sealed class ParticleSystem : ImplementableComponent, IInputUpdateReceive
         }
     }
 
+    private WorldParticleBudget? _worldBudget;
+    private World? _worldBudgetWorld;
+    private int _lastRequest = -1;
+
     private void PushSystemParameters(float dt)
     {
         var sim = _sim!;
 
         int request = System.Math.Clamp(MaxParticles.Value, 1, MaxParticlesPerSystem);
-        _grantedCapacity = World != null
-            ? WorldBudgets.GetValue(World, static _ => new WorldParticleBudget()).Reserve(this, request)
-            : request;
+        if (World == null)
+        {
+            _grantedCapacity = request;
+        }
+        else
+        {
+            if (!ReferenceEquals(_worldBudgetWorld, World))
+            {
+                _worldBudgetWorld = World;
+                _worldBudget = WorldBudgets.GetValue(World, static _ => new WorldParticleBudget());
+                _lastRequest = -1;
+            }
+            // Re-reserve only when the request changes: the grant can only shrink when another system
+            // arrives, and that system's own reservation is what records it.
+            if (request != _lastRequest || (_grantedCapacity < request && _worldBudget!.Total < MaxParticlesPerWorld))
+            {
+                _lastRequest = request;
+                _grantedCapacity = _worldBudget!.Reserve(this, request);
+            }
+        }
         sim.MaxParticleCount = System.Math.Max(1, _grantedCapacity);
 
         sim.FixedTimeStep = System.Math.Clamp(FixedTimeStep.Value, 0f, 0.1f);

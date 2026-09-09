@@ -61,11 +61,23 @@ public class Light : ImplementableComponent, IPrimaryColorSource
     public readonly Sync<float> DistanceFadeBegin = new();
     public readonly Sync<float> DistanceFadeLength = new();
 
-    // masks/projects this light; null = no cookie
-    public readonly AssetRef<TextureAsset> Cookie = new();
+    // Drop this light's SHADOW before dropping the light itself, in metres from the viewer.
+    //
+    // The cheapest lever there is for a room full of lamps: an unshadowed light is close to free while
+    // its shadow is six cube-face renders, so a lamp across the room can keep lighting the scene and
+    // stop casting long before it stops being submitted at all. 0 keeps the shadow for as long as the
+    // light lives, which is the old behaviour. -xlinka
+    public readonly Sync<float> ShadowFadeDistance = new();
 
-    // directional lights only
-    public readonly Sync<float> CookieSize = new();
+    // Masks and tints this light, projector-style: the texture is multiplied into the light before it
+    // hits anything, so a window frame, a gobo or a caustic pattern costs one texture instead of
+    // geometry. Alpha masks, RGB tints. Null = no cookie.
+    //
+    // POINT AND SPOT ONLY. There is no directional-light projector in this renderer at all, so a cookie
+    // on a directional light is dropped and says so once in the log rather than quietly doing nothing.
+    // The old CookieSize field existed purely to size a directional cookie and has been removed for the
+    // same reason. -xlinka
+    public readonly AssetRef<TextureAsset> Cookie = new();
 
     public override void OnInit()
     {
@@ -79,15 +91,15 @@ public class Light : ImplementableComponent, IPrimaryColorSource
         SpotAngle.Value         = 30f;
         Shadows.Value           = ShadowType.Hard;
         ShadowStrength.Value    = 1f;
+        ShadowFadeDistance.Value = 0f;
         ShadowBias.Value        = 0.05f;
         ShadowNormalBias.Value  = 0.4f;
         ShadowNearPlane.Value   = 0.2f;
-        ShadowMaxDistance.Value = 60f;
-        ShadowSplits.Value      = ShadowSplitMode.Four;
+        ShadowMaxDistance.Value = 40f;
+        ShadowSplits.Value      = ShadowSplitMode.Two;
         DistanceFadeBegin.Value = 0f;
         DistanceFadeLength.Value = 0f;
         // Cookie = default (C# default null, skip)
-        CookieSize.Value        = 10f;
     }
 
     public override void OnStart()

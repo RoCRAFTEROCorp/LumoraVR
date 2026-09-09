@@ -224,14 +224,43 @@ public class SkinnedMeshRenderer : ImplementableComponent
 
     public readonly Sync<ShadowCastMode> ShadowCastMode = new();
 
+    // Single material, kept as the whole-mesh assignment and as what every existing save and every
+    // caller already uses.
     public readonly AssetRef<MaterialAsset> Material = new();
+
+    // One material per submesh, for meshes that carry several. A skinned mesh routinely does - a body
+    // with a separate face or eye surface is the ordinary case - and with only the single Material
+    // above, every surface past the first was painted with the wrong material or none at all. When
+    // this list is empty the single Material applies to everything, so nothing that worked before
+    // changes. -xlinka
+    public readonly SyncAssetList<MaterialAsset> Materials = new();
+
+    // Same contract as MeshRenderer.MaterialsChanged: a list has no was-changed latch of its own, so
+    // the hook reads and clears this instead.
+    public bool MaterialsChanged { get; set; }
 
     private readonly LoadingSurfaceLatch _loadingSurfaces = new();
 
-    // Same contract as MeshRenderer.IsSurfaceLoading - one surface here, so one slot in the latch. An
-    // avatar arrives mesh-first and textures-later, which is exactly the case this covers. -xlinka
+    // The material that governs a given surface: the per-surface entry when the list reaches that far,
+    // otherwise the single Material.
+    public IAssetProvider<MaterialAsset>? MaterialFor(int surfaceIndex)
+    {
+        if (surfaceIndex >= 0 && surfaceIndex < Materials.Count)
+        {
+            var perSurface = Materials[surfaceIndex];
+            if (perSurface != null)
+                return perSurface;
+        }
+        return Material.Target;
+    }
+
+    public int SurfaceMaterialCount => System.Math.Max(1, Materials.Count);
+
+    // Same contract as MeshRenderer.IsSurfaceLoading: one latch slot per surface, so a mesh whose face
+    // material arrives after its body material does not report the whole thing as ready. An avatar
+    // arrives mesh-first and textures-later, which is exactly the case this covers. -xlinka
     public bool IsSurfaceLoading(int surfaceIndex = 0)
-        => surfaceIndex == 0 && _loadingSurfaces.IsLoading(0, Material.Target);
+        => _loadingSurfaces.IsLoading(surfaceIndex, MaterialFor(surfaceIndex));
 
     public readonly Sync<bool> UpdateWhenOffscreen = new();
 
@@ -248,12 +277,40 @@ public class SkinnedMeshRenderer : ImplementableComponent
     // set by the hook when binding is complete
     public bool HookBindingComplete { get; set; }
 
+    private void OnMaterialsChanged(SyncAssetList<MaterialAsset> list) => MaterialsChanged = true;
+
+    private SkeletonBuilder? _watchedSkeleton;
+
+    // Assigning the ref and the skeleton being usable are two different moments: the builder's hook
+    // creates the platform skeleton later, and a mesh that tried to bind before that simply never
+    // builds. Listen for the ready signal instead of polling for it.
+    private void SubscribeToSkeleton()
+    {
+        var target = Skeleton.Target;
+        if (ReferenceEquals(target, _watchedSkeleton))
+            return;
+
+        if (_watchedSkeleton != null)
+            _watchedSkeleton.SkeletonReady -= OnSkeletonReady;
+
+        _watchedSkeleton = target;
+        if (_watchedSkeleton != null)
+            _watchedSkeleton.SkeletonReady += OnSkeletonReady;
+    }
+
+    private void OnSkeletonReady()
+    {
+        SkeletonChanged = true;
+        RunApplyChanges();
+    }
+
     public override void OnAwake()
     {
         base.OnAwake();
+        Materials.OnChanged += OnMaterialsChanged;
 
         // Subscribe to changes
-        Skeleton.OnChanged += (field) => { SkeletonChanged = true; RunApplyChanges(); };
+        Skeleton.OnChanged += (field) => { SkeletonChanged = true; SubscribeToSkeleton(); RunApplyChanges(); };
         MeshAsset.OnChanged += (field) => { MeshDataChanged = true; RunApplyChanges(); };
         Bones.OnChanged += (list) => { SkeletonChanged = true; RunApplyChanges(); };
         Vertices.OnChanged += (list) => { MeshDataChanged = true; RunApplyChanges(); };
@@ -263,7 +320,7 @@ public class SkinnedMeshRenderer : ImplementableComponent
         BoneIndices.OnChanged += (list) => { MeshDataChanged = true; RunApplyChanges(); };
         BoneWeights.OnChanged += (list) => { MeshDataChanged = true; RunApplyChanges(); };
 
-        LumoraLogger.Log($"SkinnedMeshRenderer: Awake on slot '{Slot.SlotName.Value}'");
+        LumoraLogger.Debug($"SkinnedMeshRenderer: Awake on slot '{Slot.SlotName.Value}'");
     }
 
     public override void OnInit()
@@ -294,8 +351,14 @@ public class SkinnedMeshRenderer : ImplementableComponent
 
     public override void OnDestroy()
     {
+        Materials.OnChanged -= OnMaterialsChanged;
+        if (_watchedSkeleton != null)
+        {
+            _watchedSkeleton.SkeletonReady -= OnSkeletonReady;
+            _watchedSkeleton = null;
+        }
         base.OnDestroy();
-        LumoraLogger.Log($"SkinnedMeshRenderer: Destroyed on slot '{Slot?.SlotName.Value}'");
+        LumoraLogger.Debug($"SkinnedMeshRenderer: Destroyed on slot '{Slot?.SlotName.Value}'");
     }
 
     // BONE SETUP

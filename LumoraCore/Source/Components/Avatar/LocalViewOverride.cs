@@ -5,37 +5,28 @@ using Lumora.Core.Math;
 
 namespace Lumora.Core.Components.Avatar;
 
-/// <summary>
-/// Overrides a slot's rendered transform when viewed from a specific rendering context.
-///
-/// Primary use: scale the local user's head to zero in UserView so the player
-/// doesn't see their own avatar head, while other users and floor shadows are unaffected.
-///
-/// Usage:
-///   var lvo = headVisual.AttachComponent<LocalViewOverride>();
-///   lvo.Context.Value          = ViewContext.UserView;
-///   lvo.HasScaleOverride.Value = true;
-///   lvo.ScaleOverride.Value    = float3.Zero;
-/// </summary>
+// Replaces part of a slot's rendered transform while a specific rendering context is the one drawing.
+//
+// It is applied on the LOCAL client only, so it never touches what anyone else sees: every peer holds
+// its own copy of the slot and the context test fails there. Position, rotation and scale each have
+// their own has-override flag; anything left off falls through to the slot's real transform.
+//
+// A scale override of zero is special-cased into shadows-only rendering rather than an actual zero
+// scale, because the reason you hide your own head is to stop seeing it, not to lose its shadow.
+// -xlinka
 [ComponentCategory("Users/Avatar")]
 public class LocalViewOverride : ImplementableComponent<IHook>
 {
-    /// <summary>Which rendering context activates this override.</summary>
+    // which rendering context activates this override
     public readonly Sync<ViewContext> Context = new();
 
-    /// <summary>When true, PositionOverride replaces the slot's normal position.</summary>
     public readonly Sync<bool>   HasPositionOverride = new();
     public readonly Sync<float3> PositionOverride    = new();
 
-    /// <summary>When true, RotationOverride replaces the slot's normal rotation.</summary>
     public readonly Sync<bool>   HasRotationOverride = new();
     public readonly Sync<floatQ> RotationOverride    = new();
 
-    /// <summary>
-    /// When true, ScaleOverride replaces the slot's normal scale.
-    /// Set to float3.Zero to make the slot invisible in the target context
-    /// while keeping shadow casting intact.
-    /// </summary>
+    // float3.Zero here means "hide from this context" - the mesh stops drawing but keeps casting
     public readonly Sync<bool>   HasScaleOverride = new();
     public readonly Sync<float3> ScaleOverride    = new();
 

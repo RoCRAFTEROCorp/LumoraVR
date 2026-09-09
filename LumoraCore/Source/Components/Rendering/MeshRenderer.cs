@@ -164,14 +164,27 @@ public class MeshRenderer : ImplementableComponent
     // re-drives the renderer, so nothing here runs per frame. -xlinka
     public bool IsSurfaceLoading(int surfaceIndex)
     {
+        int index = SurfaceMaterialIndex(surfaceIndex);
+        if (index < 0)
+            return false;
+        return _loadingSurfaces.IsLoading(index, Materials.GetElement(index).Target);
+    }
+
+    // The material that governs a given surface. Same clamp IsSurfaceLoading applies, so a diagnostic
+    // that asks what a surface is waiting on names the material that surface actually gets.
+    public IAssetProvider<MaterialAsset>? SurfaceMaterialProvider(int surfaceIndex)
+    {
+        int index = SurfaceMaterialIndex(surfaceIndex);
+        return index < 0 ? null : Materials.GetElement(index).Target;
+    }
+
+    // Surfaces past the end of the list share the last material, which is what the hook paints.
+    private int SurfaceMaterialIndex(int surfaceIndex)
+    {
         int count = Materials.Count;
         if (count == 0 || surfaceIndex < 0)
-            return false;
-
-        // Same clamp the hook uses to pick a material for a surface, so the answer lines up with the
-        // material that surface actually gets.
-        int index = surfaceIndex < count ? surfaceIndex : count - 1;
-        return _loadingSurfaces.IsLoading(index, Materials.GetElement(index).Target);
+            return -1;
+        return surfaceIndex < count ? surfaceIndex : count - 1;
     }
 
     public MeshRenderer()
@@ -196,7 +209,7 @@ public class MeshRenderer : ImplementableComponent
         // invisible. (The provider also pokes us via FlagSurfacesDirty once it uploads geometry.) -xlinka
         Mesh.OnObjectAvailable += OnMeshRefResolved;
         Mesh.OnTargetChange += OnMeshRefResolved;
-        LumoraLogger.Log($"MeshRenderer: Awake on slot '{Slot.SlotName.Value}'");
+        LumoraLogger.Debug($"MeshRenderer: Awake on slot '{Slot.SlotName.Value}'");
     }
 
     private void OnMeshRefResolved(SyncRef<Component> reference)
@@ -225,7 +238,7 @@ public class MeshRenderer : ImplementableComponent
         MaterialPropertyBlocks.OnChanged -= OnMaterialPropertyBlocksChanged;
         SurfaceRenderPriorities.OnChanged -= OnSurfaceRenderPrioritiesChanged;
         base.OnDestroy();
-        LumoraLogger.Log($"MeshRenderer: Destroyed on slot '{Slot?.SlotName.Value}'");
+        LumoraLogger.Debug($"MeshRenderer: Destroyed on slot '{Slot?.SlotName.Value}'");
     }
 }
 

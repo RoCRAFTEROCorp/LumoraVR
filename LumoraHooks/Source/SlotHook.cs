@@ -24,6 +24,25 @@ public class SlotHook : Hook<Slot>, ISlotHook
 	private WorldHook _worldHook = null!;
 	private bool _didDeferLog;
 
+	// LocalViewOverride pushes its per-view transform through here instead of writing the node itself.
+	// The slot stays the only writer of its own transform, so an override cannot lose a race with the
+	// slot's own update and flicker for a frame. Null falls through to the slot's real value. -xlinka
+	private float3? _overridePosition;
+	private floatQ? _overrideRotation;
+	private float3? _overrideScale;
+
+	// What this hook last pushed to the node. A flush lands here for every change event on the slot, and
+	// the silent write paths (IK bind-pose reset, stream playback, dynamic bones) fire that event without
+	// checking whether the value moved, so a resting avatar re-flushes every bone every frame with the
+	// numbers it already has. Comparing against the last push turns those into a compare and a return
+	// instead of three marshalled setters and three transform propagations through the node's subtree.
+	// The name is the same story with an allocation on top: reading Node.Name marshals a StringName and
+	// comparing it to a string marshals another, both finalizable, on every flush of every slot. -xlinka
+	private Vector3 _appliedPosition;
+	private Quaternion _appliedRotation;
+	private Vector3 _appliedScale;
+	private string _appliedName = null!;
+
 	private bool ShouldDeferHierarchy
 	{
 		get
@@ -117,7 +136,8 @@ public class SlotHook : Hook<Slot>, ISlotHook
 	private void GenerateNode3D()
 	{
 		GeneratedNode3D = new Node3D();
-		GeneratedNode3D.Name = SafeNodeName(Owner.SlotName.Value);
+		_appliedName = SafeNodeName(Owner.SlotName.Value);
+		GeneratedNode3D.Name = _appliedName;
 
 		_nodeToSlot[GeneratedNode3D] = Owner;
 
@@ -142,12 +162,12 @@ public class SlotHook : Hook<Slot>, ISlotHook
 		// during network decode when sync members haven't been decoded yet
 		if (Owner.IsParentUnknown)
 		{
-			Lumora.Core.Logging.Logger.Log($"SlotHook: Deferring hierarchy for '{Owner.SlotName.Value}' - parent ref not decoded yet");
+			Lumora.Core.Logging.Logger.Debug($"SlotHook: Deferring hierarchy for '{Owner.SlotName.Value}' - parent ref not decoded yet");
 			return;
 		}
 		if (Owner.HasPendingParent)
 		{
-			Lumora.Core.Logging.Logger.Log($"SlotHook: Deferring hierarchy for '{Owner.SlotName.Value}' - parent pending resolution");
+			Lumora.Core.Logging.Logger.Debug($"SlotHook: Deferring hierarchy for '{Owner.SlotName.Value}' - parent pending resolution");
 			return;
 		}
 
@@ -181,7 +201,7 @@ public class SlotHook : Hook<Slot>, ISlotHook
 						parentNode.AddChild(GeneratedNode3D);
 					}
 				}
-				Lumora.Core.Logging.Logger.Log($"SlotHook: Attached child slot '{Owner.SlotName.Value}' to parent '{_lastParent.SlotName.Value}'");
+				Lumora.Core.Logging.Logger.Debug($"SlotHook: Attached child slot '{Owner.SlotName.Value}' to parent '{_lastParent.SlotName.Value}'");
 			}
 			else
 			{
@@ -211,14 +231,14 @@ public class SlotHook : Hook<Slot>, ISlotHook
 							worldRoot.AddChild(GeneratedNode3D);
 						}
 					}
-					Lumora.Core.Logging.Logger.Log($"SlotHook: Attached root slot '{Owner.SlotName.Value}' to world root");
+					Lumora.Core.Logging.Logger.Debug($"SlotHook: Attached root slot '{Owner.SlotName.Value}' to world root");
 				}
 				else
 				{
 					// Not an error, just startup ordering: the root slot initializes before the world's own scene
 					// node exists (World.Initialize builds the root slot; the world hook creates the scene root and
 					// reparents this node right after). Fires on every world creation, so trace it, don't warn. - xlinka
-					Lumora.Core.Logging.Logger.Log($"SlotHook: root slot '{Owner.SlotName.Value}' waiting for world scene root (the world hook attaches it once created)");
+					Lumora.Core.Logging.Logger.Debug($"SlotHook: root slot '{Owner.SlotName.Value}' waiting for world scene root (the world hook attaches it once created)");
 				}
 			}
 			else
@@ -250,16 +270,34 @@ public class SlotHook : Hook<Slot>, ISlotHook
 								parentNode.AddChild(GeneratedNode3D);
 							}
 						}
-						Lumora.Core.Logging.Logger.Log($"SlotHook: Attached orphan slot '{Owner.SlotName.Value}' to RootSlot '{rootSlot.SlotName.Value}' (fallback)");
+						Lumora.Core.Logging.Logger.Debug($"SlotHook: Attached orphan slot '{Owner.SlotName.Value}' to RootSlot '{rootSlot.SlotName.Value}' (fallback)");
 					}
 				}
 				else
 				{
 					// Still waiting for parent decode or world not running yet
-					Lumora.Core.Logging.Logger.Log($"SlotHook: Deferring attachment for '{Owner.SlotName.Value}' - waiting for parent decode (ParentRef.Value={parentRefValue}, WorldRunning={worldIsRunning})");
+					Lumora.Core.Logging.Logger.Debug($"SlotHook: Deferring attachment for '{Owner.SlotName.Value}' - waiting for parent decode (ParentRef.Value={parentRefValue}, WorldRunning={worldIsRunning})");
 				}
 			}
 		}
+	}
+
+	// Set or clear the render-only transform override. Pass null for a component to leave that part of
+	// the transform alone. Callers must be on the main thread; this writes the node immediately so an
+	// override that changes without the slot changing still lands.
+	public void SetLocalTransformOverride(float3? position, floatQ? rotation, float3? scale)
+	{
+		if (SameOverride(_overridePosition, position)
+			&& SameOverride(_overrideRotation, rotation)
+			&& SameOverride(_overrideScale, scale))
+			return;
+
+		_overridePosition = position;
+		_overrideRotation = rotation;
+		_overrideScale = scale;
+
+		if (GeneratedNode3D != null && GodotObject.IsInstanceValid(GeneratedNode3D))
+			SetData();
 	}
 
 	private void SetData()
@@ -267,9 +305,12 @@ public class SlotHook : Hook<Slot>, ISlotHook
 		if (GeneratedNode3D == null) return;
 
 		GeneratedNode3D.Visible = Owner.ActiveSelf.Value;
-		GeneratedNode3D.Position = ToGodotVector3(Owner.LocalPosition.Value);
-		GeneratedNode3D.Quaternion = ToGodotQuaternion(Owner.LocalRotation.Value);
-		GeneratedNode3D.Scale = ToGodotVector3(Owner.LocalScale.Value);
+		_appliedPosition = ToGodotVector3(_overridePosition ?? Owner.LocalPosition.Value);
+		GeneratedNode3D.Position = _appliedPosition;
+		_appliedRotation = ToGodotQuaternion(_overrideRotation ?? Owner.LocalRotation.Value);
+		GeneratedNode3D.Quaternion = _appliedRotation;
+		_appliedScale = ToGodotVector3(_overrideScale ?? Owner.LocalScale.Value);
+		GeneratedNode3D.Scale = _appliedScale;
 	}
 
 	private void UpdateData()
@@ -283,27 +324,42 @@ public class SlotHook : Hook<Slot>, ISlotHook
 
 		if (Owner.LocalPosition.GetWasChangedAndClear())
 		{
-			var newPos = ToGodotVector3(Owner.LocalPosition.Value);
-			GeneratedNode3D.Position = newPos;
+			var position = ToGodotVector3(_overridePosition ?? Owner.LocalPosition.Value);
+			if (position != _appliedPosition)
+			{
+				_appliedPosition = position;
+				GeneratedNode3D.Position = position;
+			}
 		}
 
 		if (Owner.LocalRotation.GetWasChangedAndClear())
 		{
-			GeneratedNode3D.Quaternion = ToGodotQuaternion(Owner.LocalRotation.Value);
+			var rotation = ToGodotQuaternion(_overrideRotation ?? Owner.LocalRotation.Value);
+			if (rotation != _appliedRotation)
+			{
+				_appliedRotation = rotation;
+				GeneratedNode3D.Quaternion = rotation;
+			}
 		}
 
 		if (Owner.LocalScale.GetWasChangedAndClear())
 		{
-			GeneratedNode3D.Scale = ToGodotVector3(Owner.LocalScale.Value);
+			var scale = ToGodotVector3(_overrideScale ?? Owner.LocalScale.Value);
+			if (scale != _appliedScale)
+			{
+				_appliedScale = scale;
+				GeneratedNode3D.Scale = scale;
+			}
 		}
 
+		// Compared against what WE asked for, not what the node reports: siblings that share a name get
+		// uniquified by the engine on attach, and asking the node back and re-setting it on every flush
+		// only made it uniquify the same name again, forever. -xlinka
+		bool nameChanged = Owner.SlotName.GetWasChangedAndClear();
 		var slotName = SafeNodeName(Owner.SlotName.Value);
-		if (Owner.SlotName.GetWasChangedAndClear())
+		if (nameChanged || !string.Equals(_appliedName, slotName, System.StringComparison.Ordinal))
 		{
-			GeneratedNode3D.Name = slotName;
-		}
-		else if (GeneratedNode3D.Name != slotName)
-		{
+			_appliedName = slotName;
 			GeneratedNode3D.Name = slotName;
 		}
 	}
@@ -314,14 +370,14 @@ public class SlotHook : Hook<Slot>, ISlotHook
 		{
 			if (!_didDeferLog)
 			{
-				Lumora.Core.Logging.Logger.Log($"SlotHook.Initialize: Deferring Node3D creation for '{Owner.SlotName.Value}'");
+				Lumora.Core.Logging.Logger.Debug($"SlotHook.Initialize: Deferring Node3D creation for '{Owner.SlotName.Value}'");
 				_didDeferLog = true;
 			}
 			return;
 		}
 
 		GenerateNode3D();
-		Lumora.Core.Logging.Logger.Log($"SlotHook.Initialize: Created Node3D for slot '{Owner.SlotName.Value}'");
+		Lumora.Core.Logging.Logger.Debug($"SlotHook.Initialize: Created Node3D for slot '{Owner.SlotName.Value}'");
 	}
 
 	public override void ApplyChanges()
@@ -334,18 +390,18 @@ public class SlotHook : Hook<Slot>, ISlotHook
 			}
 
 			GenerateNode3D();
-		}
-
-		if (GeneratedNode3D != null && GodotObject.IsInstanceValid(GeneratedNode3D))
-		{
-			Slot parent = Owner.Parent;
-			if (parent != _lastParent)
+			if (GeneratedNode3D == null || !GodotObject.IsInstanceValid(GeneratedNode3D))
 			{
-				UpdateParent();
+				return;
 			}
-
-			UpdateData();
 		}
+
+		if (Owner.Parent != _lastParent)
+		{
+			UpdateParent();
+		}
+
+		UpdateData();
 	}
 
 	public override void Destroy(bool destroyingWorld)
@@ -362,6 +418,18 @@ public class SlotHook : Hook<Slot>, ISlotHook
 	private static Quaternion ToGodotQuaternion(floatQ q)
 	{
 		return new Quaternion(q.x, q.y, q.z, q.w);
+	}
+
+	private static bool SameOverride(float3? a, float3? b)
+	{
+		if (a.HasValue != b.HasValue) return false;
+		return !a.HasValue || a.Value == b!.Value;
+	}
+
+	private static bool SameOverride(floatQ? a, floatQ? b)
+	{
+		if (a.HasValue != b.HasValue) return false;
+		return !a.HasValue || a.Value == b!.Value;
 	}
 }
 

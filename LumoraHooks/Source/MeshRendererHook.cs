@@ -22,13 +22,15 @@ public class MeshRendererHook : MeshRendererHookBase<MeshRenderer, Node3D>
     protected override void OnAttachRenderer()
     {
         base.OnAttachRenderer();
-        LumoraLogger.Log($"MeshRendererHook: Attached renderer for slot '{Owner.Slot.SlotName.Value}'");
+        if (LumoraLogger.EnableDebug)
+            LumoraLogger.Debug($"MeshRendererHook: Attached renderer for slot '{Owner.Slot.SlotName.Value}'");
     }
 
     protected override void OnCleanupRenderer()
     {
         base.OnCleanupRenderer();
-        LumoraLogger.Log($"MeshRendererHook: Cleaned up renderer for slot '{Owner?.Slot?.SlotName.Value}'");
+        if (LumoraLogger.EnableDebug)
+            LumoraLogger.Debug($"MeshRendererHook: Cleaned up renderer for slot '{Owner?.Slot?.SlotName.Value}'");
     }
 
     public static IHook<MeshRenderer> Constructor()

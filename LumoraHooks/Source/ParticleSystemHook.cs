@@ -27,6 +27,37 @@ namespace Lumora.Godot.Hooks;
 public sealed partial class ParticleSystemHook : ComponentHook<LumoraParticleSystem>, ILodRangeTarget
 {
     private const string ShaderPath = "res://Shaders/EngineParticle.gdshader";
+
+    // One variant per blend mode; they differ by a single render_mode line over a shared body. Opaque and
+    // cutout have no particle meaning of their own and fall in with alpha, which is what a sprite with a
+    // hard-edged texture wants anyway.
+    private static string ShaderPathFor(Lumora.Core.Assets.BlendMode mode) => mode switch
+    {
+        Lumora.Core.Assets.BlendMode.Additive => "res://Shaders/EngineParticle.gdshader",
+        Lumora.Core.Assets.BlendMode.Multiply => "res://Shaders/EngineParticleMultiply.gdshader",
+        _ => "res://Shaders/EngineParticleAlpha.gdshader",
+    };
+
+    private Lumora.Core.Assets.BlendMode _appliedBlendMode = (Lumora.Core.Assets.BlendMode)(-1);
+
+    private void ApplyBlendMode()
+    {
+        var mode = Owner.BlendMode.Value;
+        if (mode == _appliedBlendMode || _material == null)
+            return;
+        _appliedBlendMode = mode;
+
+        string path = ShaderPathFor(mode);
+        if (!ResourceLoader.Exists(path))
+        {
+            LumoraLogger.Warn($"ParticleSystemHook: particle shader not found at {path}");
+            return;
+        }
+
+        var shader = GD.Load<Shader>(path);
+        if (shader != null && _material.Shader != shader)
+            _material.Shader = shader;   // uniform values persist across the swap
+    }
     private const int InstanceStride = 16; // 12 transform + 4 color
     private const int SheetStride = 20;    // ...+ 4 custom data, carrying the flipbook frame
 
@@ -52,6 +83,72 @@ public sealed partial class ParticleSystemHook : ComponentHook<LumoraParticleSys
     private int _sheetFrames = -1;
     private Texture2D? _sheetTexture;
     private bool _sheetBillboard;
+
+    // The authored per-particle mesh currently on the MultiMesh, or null while using the built-ins.
+    private Mesh? _authoredMesh;
+    private bool _authoredMeshLogged;
+
+    // Same resolution MeshRendererHookBase does: a MeshProvider hands over the ArrayMesh its asset hook
+    // already built, a procedural mesh component hands over its own. Null while an asset is still
+    // decoding, which is not an error - this re-runs every pass.
+    private int _meshWaitPasses;
+    private bool _meshWaitLogged;
+
+    // Says which link of the chain is missing, once, when an assigned mesh has failed to arrive for long
+    // enough that it is not simply still decoding. Provider -> asset -> hook -> ArrayMesh is four hops and
+    // a null at any of them looks identical from here: the sphere just keeps drawing. -xlinka
+    private void ReportMeshWait()
+    {
+        if (_meshWaitLogged || Owner.ParticleMeshAsset.Target == null)
+            return;
+        if (++_meshWaitPasses < 240)
+            return;
+
+        _meshWaitLogged = true;
+        var provider = Owner.ParticleMeshAsset.Target;
+        var asset = Owner.ParticleMeshAsset.Asset;
+        LumoraLogger.Warn(
+            $"ParticleSystemHook '{Owner.Slot?.SlotName.Value}': mesh assigned but never arrived - "
+            + $"provider={provider.GetType().Name} refCount={provider.AssetReferenceCount} "
+            + $"available={provider.IsAssetAvailable} asset={(asset == null ? "null" : asset.LoadState.ToString())} "
+            + $"hook={(asset?.Hook?.GetType().Name ?? "null")}");
+    }
+
+    private Mesh? ResolveParticleMesh()
+    {
+        // An imported mesh first: it is the reference that actually drives a decode, so if one is set it
+        // is the one the author meant.
+        if (Owner.ParticleMeshAsset.Asset?.Hook is MeshAssetHook assetHook && assetHook.IsValid)
+            return assetHook.GodotMesh;
+
+        // Otherwise a procedural mesh component, which builds itself and hands over the ArrayMesh its own
+        // hook made - the same resolution MeshRendererHookBase does.
+        if (Owner.ParticleMesh.Target is Lumora.Core.Components.Meshes.ProceduralMesh procedural
+            && !procedural.IsDestroyed
+            && procedural.Hook is MeshHook meshHook)
+        {
+            return meshHook.GetMeshInstance()?.Mesh;
+        }
+
+        return null;
+    }
+
+    // The authored material, when the system names one. Kept separate from the built-in shader so a system
+    // with no material of its own is untouched.
+    private Material? _authoredMaterial;
+
+    private void ApplyAuthoredMaterial()
+    {
+        if (_instance == null || !GodotObject.IsInstanceValid(_instance))
+            return;
+
+        var authored = Owner.Material.Asset?.GodotMaterial as Material;
+        if (ReferenceEquals(authored, _authoredMaterial))
+            return;
+
+        _authoredMaterial = authored;
+        _instance.MaterialOverride = authored ?? _material;
+    }
 
     private StrandSurface? _trails;
     private StrandSurface? _ribbons;
@@ -103,7 +200,15 @@ public sealed partial class ParticleSystemHook : ComponentHook<LumoraParticleSys
         var renderQueue = System.Math.Clamp(Owner.RenderQueue.Value, -100, 10000);
         _material.RenderPriority = System.Math.Clamp(renderQueue, -128, 127);
         _instance.SortingOffset = renderQueue;
-        _instance.Visible = Owner.Enabled.Value;
+        // The COMPONENT being enabled is not the same question as the object being on.
+        //
+        // A disabled slot anywhere up the chain turns everything under it off, and an imported avatar
+        // leans on that: a swap mesh like a wet-mode variant ships with its root slot Active=false and the
+        // whole subtree - renderers, emitters, particle systems - is simply not meant to be there. Reading
+        // only the component's own Enabled renders content the file explicitly turned off. -xlinka
+        _instance.Visible = Owner.Enabled.Value && (Owner.Slot?.IsActive ?? false);
+        ApplyBlendMode();
+        ApplyAuthoredMaterial();
         _material.SetShaderParameter("emission_strength", Owner.EmissionStrength.Value);
         ApplyBounds();
         ApplyLodRange();
@@ -180,7 +285,7 @@ public sealed partial class ParticleSystemHook : ComponentHook<LumoraParticleSys
         // Not the same question as "is the node visible": Godot's visibility range hides the mesh, but a
         // promoted light carries no range of its own and the simulation stops publishing out here, so
         // both of those have to be told separately.
-        bool visible = Owner.Enabled.Value && !Owner.IsBeyondViewDistance();
+        bool visible = Owner.Enabled.Value && (Owner.Slot?.IsActive ?? false) && !Owner.IsBeyondViewDistance();
 
         PullInstances();
         PullStrands(visible);
@@ -325,11 +430,81 @@ public sealed partial class ParticleSystemHook : ComponentHook<LumoraParticleSys
         if (Owner.Texture.Target?.Asset?.Hook is IGodotTexture hook && hook.IsValid)
             texture = hook.GodotTexture2D;
 
-        // The quad is only swapped in for a sheet. A sphere carries the sheet round itself and reads as
-        // nothing; every effect without a flipbook keeps the mesh it has always had, which is the point.
-        // Rotation wins over billboarding when the author has asked for it, because a system running an
-        // orientation module said what it wanted the particle to face. -xlinka
-        bool billboard = wantSheet && !Owner.HasRotations;
+        // An authored per-particle MESH beats everything below it.
+        //
+        // The source platform lets a style draw an arbitrary mesh per particle, and most effects on a real
+        // avatar do exactly that - splashes, drips, debris. There is nowhere for that to land in a
+        // billboard-or-sphere renderer, so all of them came out as balls. When one is set, hand it
+        // straight to the MultiMesh; the sprite path below is what everything else still uses. -xlinka
+        var authoredMesh = ResolveParticleMesh();
+        if (authoredMesh == null)
+            ReportMeshWait();
+        if (authoredMesh != null)
+        {
+            if (!ReferenceEquals(_authoredMesh, authoredMesh))
+            {
+                _authoredMesh = authoredMesh;
+                _multiMesh.Mesh = authoredMesh;
+                _sheetTexture = null;   // force the uniforms below to re-push for the new mesh
+
+                // Said once, when the mesh actually ARRIVES. Wiring it up and it decoding are two
+                // different events, and the gap between them is where this silently fell back to a sphere
+                // last time: the reference was set, the asset never loaded, and nothing said so. -xlinka
+                if (!_authoredMeshLogged)
+                {
+                    _authoredMeshLogged = true;
+                    // The AABB and a live particle size together, because the scale question can only be
+                    // answered by the pair. The built-in meshes are 2 units across by convention and the
+                    // instance transform multiplies that by the particle size directly; an authored mesh
+                    // carries whatever size its artist gave it, so the same size value lands somewhere
+                    // else entirely. -xlinka
+                    var aabb = authoredMesh.GetAabb();
+                    var sizes = Owner.RenderSizes;
+                    string firstSize = sizes != null && sizes.Length > 0
+                        ? $"{sizes[0].x:F3},{sizes[0].y:F3},{sizes[0].z:F3}"
+                        : "none yet";
+
+                    // The colour the SIM produced, and whether the material is set up to read it. White
+                    // particles are either a sim that was never given a colour or a material that ignores
+                    // the one it gets, and those are opposite fixes. -xlinka
+                    var cols = Owner.RenderColors;
+                    string firstColor = cols != null && cols.Length > 0
+                        ? $"{cols[0].r:F2},{cols[0].g:F2},{cols[0].b:F2},{cols[0].a:F2}"
+                        : "none yet";
+                    string readsColor = "n/a";
+                    if (Owner.Material.Asset?.GodotMaterial is ShaderMaterial shaderMat)
+                    {
+                        var flag = shaderMat.GetShaderParameter("use_vertex_color");
+                        readsColor = flag.VariantType == Variant.Type.Nil ? "no such uniform" : flag.ToString();
+                    }
+                    LumoraLogger.Log($"ParticleSystemHook '{Owner.Slot?.SlotName.Value}': drawing authored mesh "
+                                   + $"({authoredMesh.GetSurfaceCount()} surface(s)) "
+                                   + $"aabb={aabb.Size.X:F3}x{aabb.Size.Y:F3}x{aabb.Size.Z:F3} "
+                                   + $"particleSize=({firstSize}) slotScale={Owner.Slot?.GlobalScale.x:F3} "
+                                   + $"slotActive={Owner.Slot?.IsActive} visible={_instance?.Visible} "
+                                   + $"color=({firstColor}) useVertexColor={readsColor} material="
+                                   + $"{(Owner.Material.Asset?.GodotMaterial != null ? "authored" : "engine shader")}");
+                }
+            }
+        }
+        else if (_authoredMesh != null)
+        {
+            _authoredMesh = null;
+            _sheetTexture = null;
+        }
+
+        // ANY texture gets the quad, not just a flipbook.
+        //
+        // The sphere is what a particle falls back to when there is nothing else to draw, and for a long
+        // time it was the only thing here - which meant every textured system wrapped its sprite around a
+        // low-poly ball and every imported effect arrived as a cloud of beads. A sprite is a flat thing
+        // facing the viewer; that is what the texture was drawn for. Systems with NO texture keep the
+        // sphere exactly as before, so nothing that never had one changes.
+        //
+        // Rotation still wins over billboarding when the author asked for it, because a system running an
+        // orientation module has already said what it wants the particle to face. -xlinka
+        bool useQuad = wantSheet || texture != null;
+        bool billboard = useQuad && !Owner.HasRotations;
 
         if (columns == _sheetColumns && rows == _sheetRows && frames == _sheetFrames
             && ReferenceEquals(texture, _sheetTexture) && billboard == _sheetBillboard)
@@ -341,7 +516,11 @@ public sealed partial class ParticleSystemHook : ComponentHook<LumoraParticleSys
         _sheetTexture = texture;
         _sheetBillboard = billboard;
 
-        if (wantSheet)
+        if (_authoredMesh != null)
+        {
+            _multiMesh.Mesh = _authoredMesh;
+        }
+        else if (useQuad)
         {
             _sheetMesh ??= new QuadMesh { Size = new Vector2(2f, 2f) };
             _multiMesh.Mesh = _sheetMesh;
