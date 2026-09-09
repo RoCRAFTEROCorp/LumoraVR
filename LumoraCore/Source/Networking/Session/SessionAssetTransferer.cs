@@ -17,7 +17,7 @@ namespace Lumora.Core.Networking.Session;
 //
 // Protocol:
 //   Client -> AssetRequest(uri) -> Host/Owner
-//   Host -> AssetTransmissionStart(id, uri, totalBytes) -> Client
+//   Host -> AssetTransmissionStart(id, uri, totalBytes, format) -> Client
 //   Client -> AssetNextChunkRequest(id) -> Host   (first pull fetches 16 chunks)
 //   Host -> AssetChunk(id, offset, data) xN -> Client
 //   ...repeat until done...
@@ -52,6 +52,7 @@ public class SessionAssetTransferer : IDisposable
         public Uri AssetUri { get; }
 
         private readonly byte[] _data;
+        private readonly string _format;
         private int _offset;
         private bool _firstChunk = true;
 
@@ -68,6 +69,12 @@ public class SessionAssetTransferer : IDisposable
             Target = target;
             ID = id;
             AssetUri = assetUri;
+            // A local:// URI is a content hash and carries no format. The only machine that still knows
+            // what these bytes are is the one holding the file, and it knows because its cache file kept
+            // the extension, so send it. Without it the receiver has a nameless blob and every decoder
+            // that dispatches on extension - the mesh decoder above all - has nothing to dispatch on.
+            // -xlinka
+            _format = Path.GetExtension(filePath) ?? string.Empty;
             _data = File.ReadAllBytes(filePath);
         }
 
@@ -78,8 +85,11 @@ public class SessionAssetTransferer : IDisposable
             using var ms = new MemoryStream();
             using var w = new BinaryWriter(ms);
             w.Write(ID);
-            w.Write(AssetUri.ToString());
+            w.Write(AssetUri.OriginalString);
             w.Write(_data.Length);
+            // Appended after the fields a build without it wrote, so its reader stops cleanly at the
+            // length and simply gets no format.
+            w.Write(_format);
             msg.Payload = ms.ToArray();
             return msg;
         }
@@ -120,7 +130,11 @@ public class SessionAssetTransferer : IDisposable
         public int TotalBytes => _totalSize;
         public int ReceivedBytes => _received;
 
-        public FileReceiveJob(IConnection source, BinaryReader reader, string tempPath)
+        // tempPathFor is handed the sender's declared format so the file we land on disk keeps the
+        // extension the asset actually has. The temp name is what the local database then adopts, and
+        // the extension on that cache file is the only thing an extension-dispatching decoder has to go
+        // on later, so losing it here quietly breaks every load of that asset from then on. -xlinka
+        public FileReceiveJob(IConnection source, BinaryReader reader, Func<string, string> tempPathFor)
         {
             Source = source;
             ID = reader.ReadInt32();
@@ -133,8 +147,22 @@ public class SessionAssetTransferer : IDisposable
             if (_totalSize < 0 || _totalSize > NetworkLimits.MaxAssetTransferTotalBytes)
                 throw new InvalidDataException($"Asset transfer total size {_totalSize} out of bounds (cap {NetworkLimits.MaxAssetTransferTotalBytes}).");
 
+            // Absent on a build that predates the format field, which leaves the stream exactly here.
+            string? declaredFormat = null;
+            if (HasMore(reader))
+                declaredFormat = reader.ReadBoundedString(NetworkLimits.MaxAssetFormatBytes);
+            Format = SanitizeFormat(declaredFormat);
+
             _buffer = new byte[_totalSize];
-            _tempPath = tempPath;
+            _tempPath = tempPathFor(Format);
+        }
+
+        public string Format { get; }
+
+        private static bool HasMore(BinaryReader reader)
+        {
+            var stream = reader.BaseStream;
+            return stream.CanSeek && stream.Position < stream.Length;
         }
 
         public void ApplyChunk(BinaryReader reader)
@@ -175,11 +203,40 @@ public class SessionAssetTransferer : IDisposable
 
     private const int MaxTransmitJobs = 4;
 
+    // What an incoming asset is called when the sender declared no format, or declared one we refuse.
+    private const string UnknownFormat = ".asset";
+
+    // The declared format ends up in a filename, so it is a peer-controlled path fragment and gets no
+    // benefit of the doubt: a leading dot and a short run of ASCII alphanumerics, nothing else. That
+    // rules out separators, "..", drive letters and every unicode lookalike in one pass, and a refusal
+    // costs only the neutral extension plus the decoder's content sniff. -xlinka
+    private static string SanitizeFormat(string? format)
+    {
+        if (string.IsNullOrEmpty(format) || format![0] != '.' || format.Length < 2 || format.Length > 12)
+            return UnknownFormat;
+
+        for (int i = 1; i < format.Length; i++)
+        {
+            char c = format[i];
+            bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9');
+            if (!ok)
+                return UnknownFormat;
+        }
+
+        return format;
+    }
+
     // How many distinct unknown assets the host will chase down from owning peers at once. Caps the
     // damage a peer could do by requesting a flood of bogus URIs (each would open a receive job). -xlinka
     private const int MaxConcurrentRelays = 8;
 
     // Holds the completion callback plus an optional per-chunk progress callback for an in-flight fetch. -xlinka
+    // Uri.ToString() LOWERCASES the authority, and our machine ids are case-sensitive, so keying a
+    // request on it makes a client-imported asset unfindable while a host-imported one works. That is
+    // the same class of bug that once stopped peer meshes transferring at all; OriginalString is the
+    // spelling the sender actually replicated. -xlinka
+    private static string UriKey(Uri uri) => uri.OriginalString;
+
     private readonly struct GatherCallbacks
     {
         public readonly Action<Uri, string> OnGathered;
@@ -194,7 +251,10 @@ public class SessionAssetTransferer : IDisposable
     private readonly object _lock = new();
     private readonly Dictionary<JobID, FileTransmitJob> _transmitJobs = new();
     private readonly Dictionary<JobID, FileReceiveJob> _receiveJobs = new();
-    private readonly Dictionary<string, GatherCallbacks> _assetRequests = new();
+    // A LIST per URI, not one entry. Nine meshes of one avatar routinely resolve to the same asset, and
+    // dropping the second requester's callback left its gather task awaiting a completion that could
+    // never arrive - a permanent hang, not a slow load. Every waiter is answered from the one transfer.
+    private readonly Dictionary<string, List<GatherCallbacks>> _assetRequests = new();
 
     // Pending outbound transfers awaiting an initialize slot. Not a FIFO: RefreshJobs picks the job whose
     // target connection was served least recently, so one peer flooding requests can't starve another. -xlinka
@@ -260,9 +320,13 @@ public class SessionAssetTransferer : IDisposable
     {
         lock (_lock)
         {
-            var uriStr = assetUri.ToString();
-            if (_assetRequests.ContainsKey(uriStr))
-                return; // already in-flight
+            var uriStr = UriKey(assetUri);
+            if (_assetRequests.TryGetValue(uriStr, out var waiting))
+            {
+                // Already in flight: join the queue rather than being forgotten.
+                waiting.Add(new GatherCallbacks(onGathered, onProgress));
+                return;
+            }
 
             IConnection target;
             if (Session.World.IsAuthority)
@@ -289,7 +353,7 @@ public class SessionAssetTransferer : IDisposable
                 return;
             }
 
-            _assetRequests[uriStr] = new GatherCallbacks(onGathered, onProgress);
+            _assetRequests[uriStr] = new List<GatherCallbacks> { new GatherCallbacks(onGathered, onProgress) };
             SendAssetRequest(assetUri, target);
             LumoraLogger.Log($"AssetTransferer: requested {uriStr}");
         }
@@ -304,7 +368,7 @@ public class SessionAssetTransferer : IDisposable
         msg.Targets.Add(target);
         using var ms = new MemoryStream();
         using var w = new BinaryWriter(ms);
-        w.Write(assetUri.ToString());
+        w.Write(UriKey(assetUri));
         msg.Payload = ms.ToArray();
         Session.Sync.EnqueueForTransmission(msg);
     }
@@ -361,11 +425,12 @@ public class SessionAssetTransferer : IDisposable
             {
                 var job = _receiveJobs[key];
                 _receiveJobs.Remove(key);
-                var uriStr = job.AssetUri.ToString();
-                if (_assetRequests.TryGetValue(uriStr, out var cb))
+                var uriStr = UriKey(job.AssetUri);
+                if (_assetRequests.TryGetValue(uriStr, out var dropped))
                 {
                     _assetRequests.Remove(uriStr);
-                    cb.OnGathered(job.AssetUri, null!);
+                    foreach (var cb in dropped)
+                        cb.OnGathered(job.AssetUri, null!);
                 }
                 // We were relaying this asset FROM the peer that just dropped - fail everyone waiting. -xlinka
                 FailPendingRelays(uriStr);
@@ -439,7 +504,7 @@ public class SessionAssetTransferer : IDisposable
     // them when they arrive (see ServePendingRelays). -xlinka
     private void RelayFromOwner(Uri assetUri, IConnection requester)
     {
-        var uriStr = assetUri.ToString();
+        var uriStr = UriKey(assetUri);
 
         // Already gathering this exact asset - either another requester's relay or our own in-flight
         // client fetch. Pile this requester on and let the one completion serve everyone. This is also
@@ -491,7 +556,7 @@ public class SessionAssetTransferer : IDisposable
 
     private void ServePendingRelays(Uri assetUri, string localPath)
     {
-        var uriStr = assetUri.ToString();
+        var uriStr = UriKey(assetUri);
         if (!_pendingRelays.TryGetValue(uriStr, out var requesters))
             return;
 
@@ -521,17 +586,18 @@ public class SessionAssetTransferer : IDisposable
 
     private void HandleTransmissionStart(ControlMessage message)
     {
-        // Get a unique temp file path from LocalDB, fall back to system temp
+        // The temp name is chosen from the format the sender declares, which is only known once the
+        // header is read, so the path is produced by callback rather than up front.
         var localDB = Engine.Current?.LocalDB;
-        string tempPath = localDB?.GetTempFilePath(".asset") ?? Path.GetTempFileName();
 
         using var ms = new MemoryStream(message.Payload);
         using var r = new BinaryReader(ms);
-        var job = new FileReceiveJob(message.Sender, r, tempPath);
+        var job = new FileReceiveJob(message.Sender, r, format =>
+            localDB?.GetTempFilePath(format) ?? Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N") + format));
         _receiveJobs[new JobID(message.Sender, job.ID)] = job;
 
         Session.Sync.EnqueueForTransmission(job.NextChunkRequest(message.Sender));
-        LumoraLogger.Log($"AssetTransferer: receiving {job.AssetUri} ({job.ID})");
+        LumoraLogger.Log($"AssetTransferer: receiving {job.AssetUri} as '{job.Format}' ({job.ID})");
     }
 
     private void HandleChunk(ControlMessage message)
@@ -550,23 +616,40 @@ public class SessionAssetTransferer : IDisposable
         {
             _receiveJobs.Remove(key);
             string path = job.FinalizeAndGetFile();
-            LumoraLogger.Log($"AssetTransferer: finished receiving {job.AssetUri} -> {path}");
 
-            var uriStr = job.AssetUri.ToString();
-            if (_assetRequests.TryGetValue(uriStr, out var cb))
+            // Adopt before the path goes anywhere. The file is already addressed - the hash is in the URI
+            // we asked for - so taking that address costs nothing, where re-deriving it means a second
+            // full read of a file we are about to decode anyway.
+            //
+            // It also has to happen here rather than in each consumer. Both of the two below can be live
+            // at once (the host wanted this asset AND is relaying it), and whichever adopted first would
+            // move the temp file out from under the other, which then reads a path that no longer exists.
+            //
+            // The side effect is deliberate: a host that only relayed this now holds it, so the next
+            // joiner is served from the cache instead of the owner being asked all over again. -xlinka
+            var localDB = Engine.Current?.LocalDB;
+            string adopted = localDB?.AdoptGatheredAsset(job.AssetUri.OriginalString, path, job.Format) ?? path;
+            LumoraLogger.Log($"AssetTransferer: finished receiving {job.AssetUri} -> {adopted}");
+
+            var uriStr = UriKey(job.AssetUri);
+            if (_assetRequests.TryGetValue(uriStr, out var waiters))
             {
                 _assetRequests.Remove(uriStr);
-                cb.OnGathered(job.AssetUri, path);
+                foreach (var cb in waiters)
+                    cb.OnGathered(job.AssetUri, adopted);
             }
             // Hand the freshly gathered bytes to anyone the host was relaying this asset to. -xlinka
-            ServePendingRelays(job.AssetUri, path);
+            ServePendingRelays(job.AssetUri, adopted);
         }
         else
         {
             // Report progress per chunk so a requester can drive a download bar / detect a stall. -xlinka
-            var progressUri = job.AssetUri.ToString();
-            if (_assetRequests.TryGetValue(progressUri, out var pcb))
-                pcb.OnProgress?.Invoke(job.AssetUri, job.TotalBytes, job.ReceivedBytes);
+            var progressUri = UriKey(job.AssetUri);
+            if (_assetRequests.TryGetValue(progressUri, out var progressWaiters))
+            {
+                foreach (var pcb in progressWaiters)
+                    pcb.OnProgress?.Invoke(job.AssetUri, job.TotalBytes, job.ReceivedBytes);
+            }
 
             Session.Sync.EnqueueForTransmission(job.NextChunkRequest(message.Sender));
         }
@@ -604,10 +687,11 @@ public class SessionAssetTransferer : IDisposable
             uriStr = r.ReadBoundedString(NetworkLimits.MaxAssetUriBytes);
 
         LumoraLogger.Warn($"AssetTransferer: peer reported AssetNotAvailable for {uriStr}");
-        if (_assetRequests.TryGetValue(uriStr, out var cb))
+        if (_assetRequests.TryGetValue(uriStr, out var failed))
         {
             _assetRequests.Remove(uriStr);
-            cb.OnGathered(new Uri(uriStr), null!);
+            foreach (var cb in failed)
+                cb.OnGathered(new Uri(uriStr), null!);
         }
         // The owner we were relaying from doesn't have it either - pass the bad news on to the requesters. -xlinka
         FailPendingRelays(uriStr);

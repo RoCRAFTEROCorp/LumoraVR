@@ -482,6 +482,11 @@ public class InputInterface : IDisposable
 
     public IGamepadDriver GetGamepadDriver() => _gamepadDriver;
 
+    // Raised after a device is registered and initialized. A tracker arriving is the case this exists
+    // for: its saved mapping lives in local settings, so something has to put the two together at the
+    // moment the hardware shows up rather than only when somebody re-calibrates. -xlinka
+    public event Action<IInputDevice>? InputDeviceAdded;
+
     public void RegisterInputDevice(IInputDevice device, string name)
     {
         int deviceIndex = _inputDevices.Count;
@@ -489,6 +494,24 @@ public class InputInterface : IDisposable
         device.Initialize(this, deviceIndex, name);
 
         Logger.Log($"InputInterface: Registered device '{name}' (index {deviceIndex})");
+
+        // A tracker without its saved mapping is a puck that has forgotten it is a foot. Applied here so
+        // it happens on EVERY connect, not just the one where the user happened to calibrate: the store
+        // keeps mappings for absent trackers precisely so this can re-apply them.
+        if (device is ITracker tracker)
+        {
+            try
+            {
+                if (TrackerMappingStore.TryApply(tracker))
+                    Logger.Debug($"InputInterface: applied saved mapping to tracker '{name}'");
+            }
+            catch (Exception ex)
+            {
+                Logger.Error($"InputInterface: failed applying saved tracker mapping for '{name}': {ex.Message}");
+            }
+        }
+
+        InputDeviceAdded?.Invoke(device);
     }
 
     public T CreateDevice<T>(string name) where T : IInputDevice, new()
@@ -536,8 +559,71 @@ public class InputInterface : IDisposable
         UpdateInputs((float)deltaTime);
     }
 
+    // Per-receiver cost, keyed by component type.
+    //
+    // Every IInputUpdateReceiver - the particle sim, cloth, dynamic bones, both IK solvers, the pose
+    // drivers - is dispatched from here and then QUEUED onto the world via RunSynchronously, which never
+    // runs inline. So all of it actually executes inside World.Update's synchronous drain, landing in the
+    // phase labelled "sync (transport poll, queued actions)". A world full of particles therefore showed
+    // up in the profiler as a networking cost, and nothing anywhere broke it down by type. That is the
+    // single biggest thing the frame profiler could not see. -xlinka
+    private readonly Dictionary<string, ReceiverCost> _receiverCosts = new(StringComparer.Ordinal);
+    private readonly object _receiverCostLock = new();
+
+    public static bool ProfileReceivers;
+
+    private sealed class ReceiverCost
+    {
+        public double Ms;
+        public int Count;
+    }
+
+    public readonly struct ReceiverProfileEntry
+    {
+        public readonly string Name;
+        public readonly double Ms;
+        public readonly int Count;
+        public ReceiverProfileEntry(string name, double ms, int count) { Name = name; Ms = ms; Count = count; }
+    }
+
+    public void CollectReceiverProfile(List<ReceiverProfileEntry> into)
+    {
+        lock (_receiverCostLock)
+        {
+            foreach (var pair in _receiverCosts)
+                into.Add(new ReceiverProfileEntry(pair.Key, pair.Value.Ms, pair.Value.Count));
+        }
+    }
+
+    // Cleared when the callbacks are QUEUED and read after the world has drained them, which is the same
+    // frame: Engine.Update runs ProcessInput before WorldManager.Update.
+    private void ResetReceiverProfile()
+    {
+        lock (_receiverCostLock)
+            _receiverCosts.Clear();
+    }
+
+    private void RecordReceiverCost(IInputUpdateReceiver receiver, long ticks)
+    {
+        string name = receiver.GetType().Name + " (input)";
+        double ms = ticks * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+        lock (_receiverCostLock)
+        {
+            if (!_receiverCosts.TryGetValue(name, out var bucket))
+            {
+                bucket = new ReceiverCost();
+                _receiverCosts[name] = bucket;
+            }
+            bucket.Ms += ms;
+            bucket.Count++;
+        }
+    }
+
     public void UpdateInputs(float deltaTime)
     {
+        if (ProfileReceivers)
+            ResetReceiverProfile();
+
         SyncTrackingSpaceToFocusedLocalUser();
 
         foreach (var bucket in _inputDriverUpdateBuckets)
@@ -687,7 +773,7 @@ public class InputInterface : IDisposable
         return false;
     }
 
-    private static void InvokeInputReceiver(IInputUpdateReceiver receiver, bool before)
+    private void InvokeInputReceiver(IInputUpdateReceiver receiver, bool before)
     {
         void InvokeNow()
         {
@@ -701,10 +787,23 @@ public class InputInterface : IDisposable
             using var bypass = permissions?.EnterSystemBypass();
             try
             {
-                if (before)
+                if (ProfileReceivers)
+                {
+                    long start = System.Diagnostics.Stopwatch.GetTimestamp();
+                    if (before)
+                        receiver.BeforeInputUpdate();
+                    else
+                        receiver.AfterInputUpdate();
+                    RecordReceiverCost(receiver, System.Diagnostics.Stopwatch.GetTimestamp() - start);
+                }
+                else if (before)
+                {
                     receiver.BeforeInputUpdate();
+                }
                 else
+                {
                     receiver.AfterInputUpdate();
+                }
             }
             catch (Exception ex)
             {

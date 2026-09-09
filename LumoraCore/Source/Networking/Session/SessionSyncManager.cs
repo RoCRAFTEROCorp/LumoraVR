@@ -197,6 +197,13 @@ public class SessionSyncManager : IDisposable
     // rate. Cached in a volatile int because the sync loop reads it off-thread before it takes the data
     // model lock - resolving the component from there would race a main-thread attach. -xlinka
     private volatile int _syncRate = WorldSettings.DefaultTickRate;
+    // How long one cycle may hold the data model lock applying incoming messages before letting the
+    // world thread have it back. Eight milliseconds keeps a joining client rendering at a playable rate
+    // while the session streams in, instead of freezing until it is done. The minimum bite stops a
+    // trickle of tiny deltas from paying for a timestamp each. -xlinka
+    private const double MessageDrainBudgetMs = 8.0;
+    private const int MessageDrainMinBite = 4;
+
     public int SyncRate => _syncRate;
 
     internal void SetSyncRate(int rate)
@@ -434,6 +441,24 @@ public class SessionSyncManager : IDisposable
                 // delta-staleness guard does this) - we leave that message at the front and stop draining
                 // this cycle, so it gets reprocessed next cycle after our StateVersion has advanced.
                 // Dequeuing only on success is what makes that requeue free. -xlinka
+                // THE JOIN HITCH LIVES HERE.
+                //
+                // This drain used to run until the queue was empty, and it runs while holding the data
+                // model lock - which is Monitor.Enter on the SAME object World.Update takes as the
+                // implementer lock (HookManager.cs:64 and :83). So the main thread is not slow during a
+                // join, it is PARKED: it asks for the lock and waits however long it takes this thread to
+                // apply the entire world. Backlog replay right below has been bounded per cycle since it
+                // was written; this loop never was.
+                //
+                // Bounded by TIME, and the lock is dropped between chunks so the world thread gets to run
+                // frames while the rest of the session streams in. The peek-then-dequeue pairing already
+                // supports stopping mid-drain (that is how a deferred message stays at the front), so
+                // stopping on budget costs nothing and loses nothing: whatever is left is still queued and
+                // is picked up on the very next cycle. -xlinka
+                long drainStart = System.Diagnostics.Stopwatch.GetTimestamp();
+                double drainTicksToMs = 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+                int drained = 0;
+
                 while (_messagesToProcess.TryPeek(out var message))
                 {
                     ProcessingSyncMessage = message;
@@ -456,6 +481,15 @@ public class SessionSyncManager : IDisposable
                         // is racing the queue and our peek/process pairing is unsound - fail loud. -xlinka
                         throw new InvalidOperationException("Sync message queue front was modified outside the sync loop");
                     }
+
+                    // A minimum bite so a steady trickle of small deltas never pays the cost of a clock
+                    // read per message, and so progress is guaranteed even if one message alone is over
+                    // budget (a single huge FullBatch still applies whole; it cannot be split here).
+                    drained++;
+                    if (drained < MessageDrainMinBite)
+                        continue;
+                    if ((System.Diagnostics.Stopwatch.GetTimestamp() - drainStart) * drainTicksToMs >= MessageDrainBudgetMs)
+                        break;
                 }
 
                 DEBUG_SyncLoopStage = SyncLoopStage.ExitedMessageProcessing;
@@ -618,7 +652,7 @@ public class SessionSyncManager : IDisposable
                     // Log stream transmission summary periodically (every 60 ticks = ~1 sec at 60 fps)
                     if (streams.Count > 0 && World.SyncTick % 60 == 0)
                     {
-                        LumoraLogger.Log($"[Sync] [Stream] Gathered {streams.Count} messages, sent {sentCount} (LocalUser streams: {World.LocalUser?.StreamCount ?? 0})");
+                        LumoraLogger.Debug($"[Sync] [Stream] Gathered {streams.Count} messages, sent {sentCount} (LocalUser streams: {World.LocalUser?.StreamCount ?? 0})");
                     }
                 }
 

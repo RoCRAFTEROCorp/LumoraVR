@@ -141,12 +141,14 @@ public static class AssetFetcher
 
                 try
                 {
-                    var data = File.ReadAllBytes(localPath);
-
-                    // Cache into LocalDB so future requests are local
-                    if (localDB != null)
-                        _ = localDB.ImportLocalAssetAsync(localPath, LocalDB.ImportLocation.Move);
-
+                    // Adopt under the hash the URI already carries, before reading a byte. Importing
+                    // instead would re-read and re-hash the whole file to rediscover an address we were
+                    // handed, and it wrote the record asynchronously - so the decoder that runs straight
+                    // after this callback could look the asset up, find no record, and be unable to tell
+                    // what format it just received. Adoption is synchronous and keeps the extension the
+                    // sender declared, which is exactly what that lookup needs. -xlinka
+                    var cachedPath = localDB?.AdoptGatheredAsset(uri, localPath) ?? localPath;
+                    var data = File.ReadAllBytes(cachedPath);
                     callback(data);
                 }
                 catch (Exception ex)

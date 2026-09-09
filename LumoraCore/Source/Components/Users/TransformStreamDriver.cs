@@ -5,12 +5,6 @@ using Lumora.Core.Networking.Streams;
 
 namespace Lumora.Core.Components;
 
-/// <summary>
-/// Drives slot transforms from tracking streams and publishes local transforms to streams.
-/// - Uses SyncRef for stream references (synced over network)
-/// - For local user: reads slot position and writes to stream
-/// - For remote user: reads stream and writes to slot position
-/// </summary>
 [ComponentCategory("Users")]
 [DefaultUpdateOrder(-10000)]
 public class TransformStreamDriver : Component
@@ -21,9 +15,6 @@ public class TransformStreamDriver : Component
     public readonly SyncRef<Float3ValueStream> PositionStream = null!;
     public readonly SyncRef<FloatQValueStream> RotationStream = null!;
 
-    /// <summary>
-    /// Get the user that owns these streams.
-    /// </summary>
     public User? User
     {
         get
@@ -58,9 +49,6 @@ public class TransformStreamDriver : Component
         }
     }
 
-    /// <summary>
-    /// For local user: push slot transform to streams for network transmission.
-    /// </summary>
     private void UpdateLocalStreams()
     {
         var positionStream = PositionStream?.Target;
@@ -81,9 +69,6 @@ public class TransformStreamDriver : Component
         }
     }
 
-    /// <summary>
-    /// For remote user: apply stream data to slot transform.
-    /// </summary>
     private void ApplyRemoteStreams()
     {
         var positionStream = PositionStream?.Target;

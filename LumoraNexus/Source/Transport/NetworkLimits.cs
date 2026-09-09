@@ -29,6 +29,10 @@ public static class NetworkLimits
 
     public const int MaxAssetUriBytes = 4 * 1024; // 4 KB
 
+    // A file extension declared alongside a transferred asset. Real ones are four or five bytes; this
+    // only exists so a peer cannot make the reader allocate on a declared length.
+    public const int MaxAssetFormatBytes = 64;
+
     // Sized for codec frames (e.g. Opus 60 ms approx 960 B at 128 kbps); 4 KB leaves generous headroom.
     public const int MaxRawFrameBytes = 4 * 1024;
 
