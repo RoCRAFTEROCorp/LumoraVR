@@ -161,8 +161,24 @@ public abstract class SyncField<T> : ConflictingSyncElement, IField<T>
         InternalSetValue(in value);
     }
 
+    // Silent = no network traffic. It still fires the local change event, and that event is what queues
+    // the owning slot's hook flush.
+    //
+    // It had NO equality check, and every caller is a per-frame pose push: the IK solvers reset every
+    // bone to bind pose and then write the solved pose, dynamic bones and the tracking/stream drivers
+    // push a transform whether or not it moved, FaceLocalUser and PositionAtUser re-push the same
+    // rotation while nothing moves. So a RESTING avatar re-raised a change event for every bone every
+    // frame, and a measured capture of a mostly-static world showed 173 slot flushes per frame off the
+    // back of it.
+    //
+    // Callers that genuinely want an event for an unchanged value have ForceSet. Nothing here does: all
+    // thirty call sites are "push a computed value", where re-announcing a number that did not move is
+    // pure queue churn. -xlinka
     internal void SetValueSilently(T value, bool change = true)
     {
+        if (SyncCoder.Equals(_value, value))
+            return;
+
         InternalSetValue(in value, sync: false, change: change);
     }
 

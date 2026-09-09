@@ -182,6 +182,17 @@ public class Engine : IDisposable
 
     public static string Platform => Environment.OSVersion.Platform.ToString();
 
+    // What this build is actually RUNNING on, set once at startup by the platform layer.
+    //
+    // Environment.OSVersion.Platform above cannot answer this: it reports Unix for Linux AND for
+    // Android, which is precisely the distinction anything platform-gated needs. The core has no way to
+    // ask the renderer, so the renderer tells it, the same way the texture cache is told which block
+    // formats this device has. Defaults to the desktop case so a harness with no platform layer behaves
+    // as it always did. -xlinka
+    public static Lumora.Core.Platform CurrentPlatform { get; set; } = Lumora.Core.Platform.Windows;
+
+    public static bool IsMobilePlatform => CurrentPlatform == Lumora.Core.Platform.Android;
+
     public static bool IsEditor { get; set; } = false;
 
     #endregion
@@ -610,16 +621,31 @@ public class Engine : IDisposable
 
         try
         {
+            // Engine-level phase timing. The first capture showed 31% of the frame - 9 ms of a 30 ms
+            // frame - sitting in NO phase at all, because everything the world profile measures happens
+            // inside WorldManager.Update and this method does four other things around it. An unmeasured
+            // third of the frame is not a profiler. -xlinka
+            long _ts = System.Diagnostics.Stopwatch.GetTimestamp();
+            double _mspt = 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+            double Lap() { long n = System.Diagnostics.Stopwatch.GetTimestamp(); double ms = (n - _ts) * _mspt; _ts = n; return ms; }
+
             InputInterface?.ProcessInput(delta);
+            double msInput = Lap();
 
             CoroutineManager?.Update((float)delta);
+            double msCoroutines = Lap();
 
             WorldManager?.Update(delta);
+            double msWorlds = Lap();
 
             ProcessFixedUpdates(delta);
             InputInterface?.SyncTrackingSpaceToFocusedLocalUser();
+            double msFixed = Lap();
 
             AssetManager?.Update((float)delta);
+            double msAssets = Lap();
+
+            LastEnginePhases = new EnginePhaseProfile(msInput, msCoroutines, msWorlds, msFixed, msAssets);
         }
         catch (Exception ex)
         {
@@ -630,6 +656,33 @@ public class Engine : IDisposable
         OnPostUpdate?.Invoke(delta);
         _metrics.EndFrame(delta);
     }
+
+    // What Engine.Update spends its time on, outside any single world. Published every frame.
+    //
+    // InputMs is the input pass itself (driver polling, action evaluation, and QUEUEING the receiver
+    // callbacks) - the receivers' actual execution is charged to the world's sync phase, because
+    // RunSynchronously defers them there.
+    public readonly struct EnginePhaseProfile
+    {
+        public readonly double InputMs;
+        public readonly double CoroutinesMs;
+        public readonly double WorldsMs;
+        public readonly double FixedMs;
+        public readonly double AssetsMs;
+
+        public EnginePhaseProfile(double input, double coroutines, double worlds, double fixedUpdates, double assets)
+        {
+            InputMs = input;
+            CoroutinesMs = coroutines;
+            WorldsMs = worlds;
+            FixedMs = fixedUpdates;
+            AssetsMs = assets;
+        }
+
+        public double TotalMs => InputMs + CoroutinesMs + WorldsMs + FixedMs + AssetsMs;
+    }
+
+    public EnginePhaseProfile LastEnginePhases { get; private set; }
 
     private void ProcessFixedUpdates(double delta)
     {

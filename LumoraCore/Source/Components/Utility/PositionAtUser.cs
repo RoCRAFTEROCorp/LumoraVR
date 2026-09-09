@@ -15,10 +15,47 @@ public class PositionAtUser : Component
 {
     public readonly Sync<float> VerticalOffset = new();
 
+    // Follow THIS slot instead of the wearer's tracked head node, when it is set.
+    //
+    // HeadSlot is where the PERSON's head is, which on a two-legged avatar is also where the avatar's
+    // head is, so nothing ever needed to distinguish them. On an animal they are nowhere near each
+    // other: the wearer's head node stays at human standing height while the dog's head is out front
+    // and low, so the nameplate hung in the air over empty space. Anything that knows better points
+    // this at the avatar's own head bone. Null falls back to the tracked node, so an unworn or
+    // unrecognised avatar behaves exactly as before. -xlinka
+    public readonly SyncRef<Slot> Anchor = new();
+
     public override void OnInit()
     {
         base.OnInit();
         VerticalOffset.Value = 0.25f;
+    }
+
+    private Avatar.AvatarForm? _avatarForm;
+
+    // How much bigger the worn avatar is than the user root it hangs off.
+    //
+    // The avatar fit scale lives on the AVATAR slot here, while the user root stays at 1. That is the one
+    // place this diverges from the platform it mirrors, which scales the user root itself - and anything
+    // offset from the head by a fixed distance inherits the difference. A model scaled up to match its
+    // wearer gets a head nearly twice the size while the offset stays put, and the nameplate ends up
+    // inside it. Fold the avatar's own scale back in so the offset stays proportional to the body it is
+    // sitting above. Returns 1 for an unworn or unscaled user, so nothing else moves. -xlinka
+    private float AvatarFitScale(UserRoot userRoot)
+    {
+        if (_avatarForm == null || _avatarForm.IsDestroyed || _avatarForm.Slot == null || _avatarForm.Slot.IsDestroyed)
+            _avatarForm = userRoot.Slot?.GetComponentInChildren<Avatar.AvatarForm>();
+
+        var avatar = _avatarForm?.Slot;
+        if (avatar == null || avatar.IsDestroyed)
+            return 1f;
+
+        float root = userRoot.GlobalScale;
+        if (root < 1e-4f)
+            return 1f;
+
+        float fit = avatar.GlobalScale.x / root;
+        return fit > 1e-4f ? fit : 1f;
     }
 
     public override void OnUpdate(float delta)
@@ -26,12 +63,13 @@ public class PositionAtUser : Component
         base.OnUpdate(delta);
 
         var userRoot = Slot?.ActiveUserRoot;
-        var head = userRoot?.HeadSlot;
+        var anchor = Anchor.Target;
+        var head = anchor != null && !anchor.IsDestroyed ? anchor : userRoot?.HeadSlot;
         var parent = Slot?.Parent;
         if (head == null || head.IsDestroyed || parent == null)
             return;
 
-        float scale = userRoot!.GlobalScale;
+        float scale = userRoot!.GlobalScale * AvatarFitScale(userRoot);
         var target = head.GlobalPosition + float3.Up * (VerticalOffset.Value * scale);
         var local = parent.GlobalPointToLocal(target);
 

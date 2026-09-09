@@ -39,7 +39,7 @@ public static class GizmoRegistry
         }
 
         _initialized = true;
-        Logger.Log($"GizmoRegistry: Initialized with {_gizmoTypes.Count} gizmo types");
+        Logger.Debug($"GizmoRegistry: Initialized with {_gizmoTypes.Count} gizmo types");
     }
 
     private static readonly Assembly CoreAssembly = typeof(GizmoRegistry).Assembly;

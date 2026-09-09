@@ -51,7 +51,28 @@ public static class DataTreeCoder
             n => { var l = List(n); return new color(F(l, 0), F(l, 1), F(l, 2), F(l, 3)); });
         Reg(v => Components(((colorHDR)v).r, ((colorHDR)v).g, ((colorHDR)v).b, ((colorHDR)v).a),
             n => { var l = List(n); return new colorHDR(F(l, 0), F(l, 1), F(l, 2), F(l, 3)); });
+
+        // BoundingBox and int4 both replicate perfectly and had NO persistence coder, and
+        // SyncField<T>.Save THROWS on a type it cannot encode rather than skipping it. ProceduralMesh
+        // carries a Sync<BoundingBox> and every quad, sphere and box in the engine derives from it, so
+        // saving a world with any procedural mesh in it threw. Wire-encodable and save-encodable have to
+        // be the same set or a field works all session and dies at the one moment that matters. -xlinka
+        Reg(v => Components(((BoundingBox)v).Min.x, ((BoundingBox)v).Min.y, ((BoundingBox)v).Min.z,
+                            ((BoundingBox)v).Max.x, ((BoundingBox)v).Max.y, ((BoundingBox)v).Max.z),
+            n =>
+            {
+                var l = List(n);
+                return new BoundingBox(
+                    new float3(F(l, 0), F(l, 1), F(l, 2)),
+                    new float3(F(l, 3), F(l, 4), F(l, 5)));
+            });
+
+        Reg(v => Components(((int4)v).x, ((int4)v).y, ((int4)v).z, ((int4)v).w),
+            n => { var l = List(n); return new int4(I(l, 0), I(l, 1), I(l, 2), I(l, 3)); });
     }
+
+    private static int I(DataTreeList list, int index)
+        => index < list.Count ? ((DataTreeValue)list[index]).Extract<int>() : 0;
 
     public static bool IsSupported(Type type)
         => type.IsEnum || Encoders.ContainsKey(type);
@@ -93,6 +114,17 @@ public static class DataTreeCoder
     }
 
     private static DataTreeList Components(params float[] components)
+    {
+        var list = new DataTreeList();
+        foreach (var c in components)
+            list.Add(new DataTreeValue(c));
+        return list;
+    }
+
+    // Integers get their own overload rather than riding the float one: a float carries 24 bits of
+    // mantissa, so anything past about 16.7 million would come back off by one having gone out and in
+    // through a float. -xlinka
+    private static DataTreeList Components(params int[] components)
     {
         var list = new DataTreeList();
         foreach (var c in components)

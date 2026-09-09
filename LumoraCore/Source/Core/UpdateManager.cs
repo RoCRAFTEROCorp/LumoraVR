@@ -5,6 +5,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 
 namespace Lumora.Core;
 
@@ -13,6 +14,7 @@ public class UpdateManager
     private World _world;
     private readonly Queue<IImplementable> _pendingHookUpdates = new Queue<IImplementable>();
     private readonly Queue<IImplementable> _pendingSlotHookUpdates = new Queue<IImplementable>();
+    private readonly List<IImplementable> _slotFlushBatch = new List<IImplementable>();
     private readonly HashSet<IImplementable> _queuedHookUpdates = new HashSet<IImplementable>();
     private readonly object _hookUpdatesLock = new object();
 
@@ -155,7 +157,16 @@ public class UpdateManager
             try
             {
                 CurrentlyUpdating = component;
-                component.InternalRunLateUpdate(delta);
+                if (ProfilingEnabled)
+                {
+                    long start = Stopwatch.GetTimestamp();
+                    component.InternalRunLateUpdate(delta);
+                    RecordProfile(component, Stopwatch.GetTimestamp() - start, PhaseLate);
+                }
+                else
+                {
+                    component.InternalRunLateUpdate(delta);
+                }
             }
             catch (Exception ex)
             {
@@ -330,7 +341,16 @@ public class UpdateManager
         try
         {
             CurrentlyUpdating = updatable;
-            updatable.InternalRunStartup();
+            if (ProfilingEnabled)
+            {
+                long start = Stopwatch.GetTimestamp();
+                updatable.InternalRunStartup();
+                RecordProfile(updatable, Stopwatch.GetTimestamp() - start, PhaseStart);
+            }
+            else
+            {
+                updatable.InternalRunStartup();
+            }
             return updatable.IsStarted;
         }
         catch (Exception ex)
@@ -356,11 +376,6 @@ public class UpdateManager
         _currentDeltaTime = deltaTime;
 
         bool prof = ProfilingEnabled;
-        if (prof)
-        {
-            _profByType.Clear();
-            _profBySlot.Clear();
-        }
 
         EnsureBucketLists();
         for (int b = 0; b < _updateBucketList.Count; b++)
@@ -398,14 +413,23 @@ public class UpdateManager
         }
     }
 
-    private void RecordProfile(IUpdatable updatable, long ticks)
+    // Phase suffixes. Only OnUpdate goes in unsuffixed, because that is what the profiler has always
+    // meant and a bare type name should keep meaning it. Everything else is tagged, so a component that
+    // costs nothing per frame but two seconds on startup finally shows up as what it is. The SLOT view
+    // stays untagged on purpose: there you want a slot's whole cost, not it split six ways. -xlinka
+    private const string PhaseStart = " (start)";
+    private const string PhaseChanges = " (changes)";
+    private const string PhaseLate = " (late)";
+    private const string PhaseDestroy = " (destroy)";
+
+    private void RecordProfile(IUpdatable updatable, long ticks, string phaseSuffix = "")
     {
         if (updatable is not Component comp)
         {
             return;
         }
 
-        var typeName = comp.GetType().Name;
+        var typeName = comp.GetType().Name + phaseSuffix;
         if (!_profByType.TryGetValue(typeName, out var tb))
         {
             tb = new ProfBucket { Name = typeName };
@@ -468,7 +492,16 @@ public class UpdateManager
                 try
                 {
                     CurrentlyUpdating = updatable;
-                    updatable.InternalRunApplyChanges(_changeUpdateIndex);
+                    if (ProfilingEnabled)
+                    {
+                        long start = Stopwatch.GetTimestamp();
+                        updatable.InternalRunApplyChanges(_changeUpdateIndex);
+                        RecordProfile(updatable, Stopwatch.GetTimestamp() - start, PhaseChanges);
+                    }
+                    else
+                    {
+                        updatable.InternalRunApplyChanges(_changeUpdateIndex);
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -499,7 +532,16 @@ public class UpdateManager
             try
             {
                 CurrentlyUpdating = updatable;
-                updatable.InternalRunDestruction();
+                if (ProfilingEnabled)
+                {
+                    long start = Stopwatch.GetTimestamp();
+                    updatable.InternalRunDestruction();
+                    RecordProfile(updatable, Stopwatch.GetTimestamp() - start, PhaseDestroy);
+                }
+                else
+                {
+                    updatable.InternalRunDestruction();
+                }
             }
             catch (Exception ex)
             {
@@ -513,6 +555,46 @@ public class UpdateManager
     }
 
     private readonly Dictionary<Type, double> _hookMsByType = new();
+    private readonly Dictionary<Type, int> _hookCallsByType = new();
+
+    // One hash per dictionary instead of a lookup and a store each; this runs once per hook call.
+    private void AccumulateHookCost(Type hookType, double ms, int calls)
+    {
+        ref double totalMs = ref CollectionsMarshal.GetValueRefOrAddDefault(_hookMsByType, hookType, out _);
+        totalMs += ms;
+        ref int totalCalls = ref CollectionsMarshal.GetValueRefOrAddDefault(_hookCallsByType, hookType, out _);
+        totalCalls += calls;
+    }
+
+    // Hook cost used to be cleared at the top of every ProcessHookUpdates, and World runs that TWICE per
+    // frame (main pass, then again after late updates). So the numbers a reader saw depended entirely on
+    // when it looked: the slow-frame log reads before the late pass and gets the main pass, anything
+    // reading afterwards got ONLY the late pass and no way to know it. Clearing is now owned by the frame
+    // instead of the pass, so both passes accumulate into one honest per-frame total. -xlinka
+    public void BeginFrameProfiling()
+    {
+        _hookMsByType.Clear();
+        _hookCallsByType.Clear();
+
+        // The update profile used to clear itself at the top of RunUpdates. RunStartups runs BEFORE that
+        // inside the same UpdateComponents call, so a component's OnStart cost was recorded and then
+        // immediately wiped - startups were structurally unmeasurable, which is exactly the phase a world
+        // spends its first seconds in. Clearing belongs to the frame, not to one phase of it. -xlinka
+        _profByType.Clear();
+        _profBySlot.Clear();
+    }
+
+    // Per hook type, milliseconds and call count for the frame so far. A type costing 10 ms across 500
+    // calls is a different problem from one costing 10 ms in a single call, and the string form could
+    // never tell them apart.
+    public void CollectHookCost(List<ProfileEntry> into)
+    {
+        foreach (var pair in _hookMsByType)
+        {
+            _hookCallsByType.TryGetValue(pair.Key, out int calls);
+            into.Add(new ProfileEntry(pair.Key.Name, pair.Value, calls));
+        }
+    }
 
     // Allocates; call only when reporting.
     public string DescribeHookCost(int top = 3)
@@ -547,42 +629,70 @@ public class UpdateManager
         const double budgetMs = 6.0;
         long startTicks = System.Diagnostics.Stopwatch.GetTimestamp();
         double ticksToMs = 1000.0 / System.Diagnostics.Stopwatch.Frequency;
-        _hookMsByType.Clear();
 
         // Slot hooks are the transform/visibility flush and cost microseconds each. The render camera
         // reads the engine's fresh head pose every frame, so any slot flush left behind by the budget
         // shows up as the world trailing the view - the dash sliding away in a fall, a dragged panel
         // rubber-banding. They drain completely every pass, ahead of and outside the budget; the budget
         // keeps governing the hooks that are actually expensive (mesh builds, canvas chunks). -xlinka
+        //
+        // The queue is taken in one bite per round rather than one entry per lock, and the cost of a round
+        // is booked per hook type in one dictionary write instead of two per flush; a few hundred flushes a
+        // frame made the bookkeeping a measurable share of what it was measuring. A flush that re-queues a
+        // slot mid-round lands in the queue for the next round, and the loop keeps taking rounds until the
+        // queue comes up empty, so nothing is left behind. -xlinka
         while (true)
         {
-            IImplementable slotFlush;
             lock (_hookUpdatesLock)
             {
                 if (_pendingSlotHookUpdates.Count == 0)
                     break;
-                slotFlush = _pendingSlotHookUpdates.Dequeue();
-                _queuedHookUpdates.Remove(slotFlush);
+                while (_pendingSlotHookUpdates.Count > 0)
+                {
+                    var queued = _pendingSlotHookUpdates.Dequeue();
+                    _queuedHookUpdates.Remove(queued);
+                    _slotFlushBatch.Add(queued);
+                }
             }
 
-            if (slotFlush == null || slotFlush.IsDestroyed ||
-                (slotFlush is Worker removedWorker && removedWorker.IsRemoved) || slotFlush.Hook == null)
+            Type runType = null!;
+            double runMs = 0.0;
+            int runCalls = 0;
+            for (int i = 0; i < _slotFlushBatch.Count; i++)
             {
-                continue;
-            }
+                var slotFlush = _slotFlushBatch[i];
+                if (slotFlush == null || slotFlush.IsDestroyed ||
+                    (slotFlush is Worker removedWorker && removedWorker.IsRemoved) || slotFlush.Hook == null)
+                {
+                    continue;
+                }
 
-            long slotStart = System.Diagnostics.Stopwatch.GetTimestamp();
-            try
-            {
-                slotFlush.Hook.ApplyChanges();
+                long slotStart = System.Diagnostics.Stopwatch.GetTimestamp();
+                try
+                {
+                    slotFlush.Hook.ApplyChanges();
+                }
+                catch (Exception ex)
+                {
+                    Logging.Logger.Error($"UpdateManager: Error in hook update for {slotFlush}: {ex}");
+                }
+                double slotMs = (System.Diagnostics.Stopwatch.GetTimestamp() - slotStart) * ticksToMs;
+
+                var slotHookType = slotFlush.Hook.GetType();
+                if (slotHookType != runType)
+                {
+                    if (runType != null)
+                        AccumulateHookCost(runType, runMs, runCalls);
+                    runType = slotHookType;
+                    runMs = 0.0;
+                    runCalls = 0;
+                }
+                runMs += slotMs;
+                runCalls++;
             }
-            catch (Exception ex)
-            {
-                Logging.Logger.Error($"UpdateManager: Error in hook update for {slotFlush}: {ex}");
-            }
-            var slotHookType = slotFlush.Hook.GetType();
-            _hookMsByType[slotHookType] = (_hookMsByType.TryGetValue(slotHookType, out var slotPrior) ? slotPrior : 0.0)
-                + (System.Diagnostics.Stopwatch.GetTimestamp() - slotStart) * ticksToMs;
+            if (runType != null)
+                AccumulateHookCost(runType, runMs, runCalls);
+            _slotFlushBatch.Clear();
         }
 
         while (true)
@@ -623,7 +733,7 @@ public class UpdateManager
             // question "which hook ate the frame" is answerable without a profiler attached.
             var hookType = implementable.Hook.GetType();
             double hookMs = (System.Diagnostics.Stopwatch.GetTimestamp() - hookStart) * ticksToMs;
-            _hookMsByType[hookType] = (_hookMsByType.TryGetValue(hookType, out var prior) ? prior : 0.0) + hookMs;
+            AccumulateHookCost(hookType, hookMs, 1);
 
             processed++;
             if (processed >= maxUpdates)
@@ -710,6 +820,7 @@ public class UpdateManager
             _pendingSlotHookUpdates.Clear();
             _queuedHookUpdates.Clear();
         }
+        _slotFlushBatch.Clear();
         lock (_movedSlotsLock)
         {
             _pendingMovedSlots.Clear();

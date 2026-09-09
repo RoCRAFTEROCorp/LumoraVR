@@ -157,6 +157,18 @@ public class RectTransform : Component
     {
         if (Slot != null)
             Slot.ActiveChanged -= OnSlotActiveChanged;
+
+        // Tell the PARENT the tree under it changed. NotifyComponentsChanged only ever fired on the rect
+        // whose own components moved, so destroying a subtree marked the chunk that was going away and
+        // told the surviving parent nothing: its layout never re-ran, the rows below kept the positions
+        // they had while the removed ones were still there, and the panel stayed wrong until some other
+        // edit forced a full pass. That is the inspector's "collapse a slot and it glitches until you
+        // reopen the parent" - reopening attaches components to a LIVE rect, which finally marks it.
+        // -xlinka
+        var parent = _rectParent;
+        if (parent != null && !parent.IsDestroyed)
+            parent.NotifyComponentsChanged();
+
         base.OnDestroy();
     }
 

@@ -31,6 +31,12 @@ public class ComponentSelectorPanel : Component, IInspectorActionHandler
     private readonly Sync<string> _builtPath;
     private readonly Sync<string> _builtQuery;
 
+    // Assembly-qualified name of the open generic currently being picked for, empty when browsing
+    // normally. A generic component is ONE row; choosing it drills into its type arguments rather than
+    // pouring every closed form into the tree. -xlinka
+    public readonly Sync<string> GenericPath;
+    private readonly Sync<string> _builtGeneric;
+
     private const float RowHeight = 30f;
     private const int MaxSearchResults = 120;
 
@@ -45,6 +51,8 @@ public class ComponentSelectorPanel : Component, IInspectorActionHandler
         _builtPath = new Sync<string>(this, "unbuilt");
         _builtQuery = new Sync<string>(this, "unbuilt");
         SwapTarget = new SyncRef<Component>(this);
+        GenericPath = new Sync<string>(this, "");
+        _builtGeneric = new Sync<string>(this, "unbuilt");
     }
 
     private bool IsSwapMode => SwapTarget.Target is { IsDestroyed: false };
@@ -158,10 +166,12 @@ public class ComponentSelectorPanel : Component, IInspectorActionHandler
         base.OnChanges();
         if (World?.IsAuthority != true)
             return;
-        if (_builtPath.Value == CategoryPath.Value && _builtQuery.Value == Query.Value)
+        if (_builtPath.Value == CategoryPath.Value && _builtQuery.Value == Query.Value
+            && _builtGeneric.Value == GenericPath.Value)
             return;
         _builtPath.Value = CategoryPath.Value;
         _builtQuery.Value = Query.Value;
+        _builtGeneric.Value = GenericPath.Value;
         RebuildList();
     }
 
@@ -187,6 +197,15 @@ public class ComponentSelectorPanel : Component, IInspectorActionHandler
             return;
         }
 
+        // Picking a type argument for a generic. Ahead of search on purpose: while the picker is open a
+        // typed query filters the ARGUMENTS, which is what someone hunting "ShadowType" among a hundred
+        // of them actually wants.
+        if (GenericPath.Value.Length > 0)
+        {
+            BuildGenericArguments(container, query);
+            return;
+        }
+
         if (query.Length > 0)
         {
             BuildSearchResults(container, query);
@@ -203,6 +222,40 @@ public class ComponentSelectorPanel : Component, IInspectorActionHandler
 
         foreach (var type in node.Types)
             AddRow(container, ComponentLibrary.DisplayName(type), "type:" + type.AssemblyQualifiedName, InspectorUI.TextColor);
+    }
+
+    // The type-argument page for one open generic.
+    //
+    // The browser used to list every closed form as its own entry, so twenty-odd generic components
+    // spent 2200 rows of the tree between them and adding one type to the table cost another forty-odd.
+    // One row per component and a second step to choose the argument is both smaller to read and free
+    // to extend. -xlinka
+    private void BuildGenericArguments(Slot container, string query)
+    {
+        var definition = Type.GetType(GenericPath.Value);
+        if (definition == null || !definition.IsGenericTypeDefinition)
+        {
+            GenericPath.Value = "";
+            return;
+        }
+
+        AddRow(container, "< Back", "generic:", InspectorUI.MutedColor);
+        AddLabelRow(container, ComponentLibrary.DisplayName(definition), InspectorUI.AccentColor);
+
+        int shown = 0;
+        foreach (var closed in GenericComponentTypes.Enumerate(definition))
+        {
+            var argument = closed.GetGenericArguments()[0];
+            var label = ComponentLibrary.DisplayName(argument);
+            if (query.Length > 0 && !label.Contains(query, StringComparison.OrdinalIgnoreCase))
+                continue;
+            shown++;
+            AddRow(container, label, "type:" + closed.AssemblyQualifiedName, InspectorUI.TextColor);
+        }
+
+        if (shown == 0)
+            AddLabelRow(container, query.Length > 0 ? "No matching types" : "No types available",
+                InspectorUI.MutedColor);
     }
 
     // Swap mode: one flat list of the types that can replace the target. A family is small enough
@@ -235,15 +288,29 @@ public class ComponentSelectorPanel : Component, IInspectorActionHandler
     {
         foreach (var type in node.Types)
         {
-            if (!ComponentTypeSwapUndoBatch.IsCompatible(sourceType, type))
+            // The tree now holds open generics, and you cannot swap a component FOR an open generic.
+            // Expand them here so swap keeps offering concrete siblings; this is the one place that
+            // still wants every closed form. -xlinka
+            if (type.IsGenericTypeDefinition)
+            {
+                foreach (var closed in GenericComponentTypes.Enumerate(type))
+                    Consider(closed, sourceType, query, output);
                 continue;
-            if (query.Length > 0 && !ComponentLibrary.DisplayName(type).Contains(query, StringComparison.OrdinalIgnoreCase))
-                continue;
-            if (!output.Contains(type))
-                output.Add(type);
+            }
+            Consider(type, sourceType, query, output);
         }
         foreach (var sub in node.Subcategories.Values)
             CollectSwapCandidates(sub, sourceType, query, output);
+    }
+
+    private static void Consider(Type type, Type sourceType, string query, List<Type> output)
+    {
+        if (!ComponentTypeSwapUndoBatch.IsCompatible(sourceType, type))
+            return;
+        if (query.Length > 0 && !ComponentLibrary.DisplayName(type).Contains(query, StringComparison.OrdinalIgnoreCase))
+            return;
+        if (!output.Contains(type))
+            output.Add(type);
     }
 
     // Flattened matches across every category: type name OR category path substring, case-insensitive.
@@ -339,16 +406,41 @@ public class ComponentSelectorPanel : Component, IInspectorActionHandler
             var path = CategoryPath.Value ?? "";
             int slash = path.LastIndexOf('/');
             CategoryPath.Value = slash > 0 ? path[..slash] : "";
+            GenericPath.Value = "";
             return;
         }
         if (action.StartsWith("cat:", StringComparison.Ordinal))
         {
             CategoryPath.Value = action[4..];
+            GenericPath.Value = "";
+            return;
+        }
+        if (action.StartsWith("generic:", StringComparison.Ordinal))
+        {
+            // Empty payload is the back row out of the picker.
+            GenericPath.Value = action[8..];
             return;
         }
         if (action.StartsWith("type:", StringComparison.Ordinal))
         {
             var type = Type.GetType(action[5..]);
+
+            // An open generic cannot be attached, so picking one opens its argument list instead of
+            // doing nothing. Swap mode never reaches here with an open generic: its candidate list is
+            // built from closed forms only.
+            if (type != null && type.IsGenericTypeDefinition && !IsSwapMode)
+            {
+                // The search box has to be cleared as well as the query, or it keeps displaying the term
+                // that found the component while the list below it is filtered by nothing. The picker
+                // filters on the same field, so whatever is typed next narrows the ARGUMENTS.
+                Query.Value = "";
+                var input = _searchInput.Target;
+                if (input != null && !input.IsDestroyed)
+                    input.Text.Value = "";
+                GenericPath.Value = type.AssemblyQualifiedName ?? "";
+                return;
+            }
+
             var swapTarget = SwapTarget.Target;
             if (swapTarget != null && !swapTarget.IsDestroyed)
             {

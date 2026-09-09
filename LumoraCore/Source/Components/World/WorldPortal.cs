@@ -137,7 +137,8 @@ public sealed class WorldPortal : WorldLink
         _face.QuadAspect.Value = FaceWidth / FaceHeight;
         // The procedural quad's V runs bottom to top while decoded pictures are stored top down, so the
         // picture goes in flipped or the sky ends up on the floor.
-        _face.FlipPicture.Value = true;
+        // No flip needed any more: the procedural quad's V is top-origin now, same as the decoded rows.
+        _face.FlipPicture.Value = false;
         _face.Seed.Value = (ReferenceID.GetHashCode() & 0xffff) * 0.01f;
         var faceRenderer = face.GetComponent<MeshRenderer>() ?? face.AttachComponent<MeshRenderer>();
         faceRenderer.Mesh.Target = quad;

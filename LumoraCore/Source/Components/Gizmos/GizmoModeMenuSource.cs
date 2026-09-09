@@ -38,6 +38,27 @@ public class GizmoModeMenuSource : ContextMenuItemSource
         // deselects next to Undo/Locomotion/Inspector turned the root ring into a wall of slices.
         page = page.GetOrAddSubPage(ToolSubmenuLabel, ToolSubmenuFill);
 
+        // The spawn catalog. Sits on the dev tool's menu because that is where it lives on the source
+        // platform, and because the dev tool is the one you already have out when you are building.
+        page.AddItem(new ContextMenuItem
+        {
+            Label = "Create New",
+            FillColor = ActiveFill,
+            OnPressed = _ => OpenCreateNew(),
+        });
+        page.AddItem(new ContextMenuItem
+        {
+            Label = "Reflection Probes",
+            FillColor = ItemFill,
+            OnPressed = _ => OpenProbeWizard(),
+        });
+        page.AddItem(new ContextMenuItem
+        {
+            Label = "Lighting",
+            FillColor = ItemFill,
+            OnPressed = _ => OpenLightingWizard(),
+        });
+
         if (gizmo != null)
         {
             int mode = gizmo.ActiveMode.Value;
@@ -110,5 +131,55 @@ public class GizmoModeMenuSource : ContextMenuItemSource
                 return owned;
         }
         return GizmoHelper.AnyGizmo(World);
+    }
+
+    // One panel per user at a time: pressing again focuses the one already up rather than stacking a
+    // second, which is the same rule the scene inspector had to grow.
+    private void OpenCreateNew()
+    {
+        var world = World;
+        if (world?.RootSlot == null)
+            return;
+
+        var existing = world.RootSlot.GetComponentInChildren<CreateNewPanel>();
+        if (existing != null && !existing.IsDestroyed)
+        {
+            existing.Slot.Destroy();
+            return;
+        }
+
+        CreateNewPanel.Spawn(world);
+    }
+
+    private void OpenProbeWizard()
+    {
+        var world = World;
+        if (world?.RootSlot == null)
+            return;
+
+        var existing = world.RootSlot.GetComponentInChildren<ReflectionProbeWizard>();
+        if (existing != null && !existing.IsDestroyed)
+        {
+            existing.Slot.Destroy();
+            return;
+        }
+
+        ReflectionProbeWizard.Spawn(world);
+    }
+
+    private void OpenLightingWizard()
+    {
+        var world = World;
+        if (world?.RootSlot == null)
+            return;
+
+        var existing = world.RootSlot.GetComponentInChildren<LightingWizard>();
+        if (existing != null && !existing.IsDestroyed)
+        {
+            existing.Slot.Destroy();
+            return;
+        }
+
+        LightingWizard.Spawn(world);
     }
 }

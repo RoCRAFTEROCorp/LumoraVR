@@ -15,6 +15,9 @@ public enum GenericTypeGroup
     Values,
 
     WorldElements,
+
+    // Enums only, for a component that makes no sense for a number or a string.
+    Enums,
 }
 
 // Declares the type arguments a generic component can be attached with.
@@ -67,7 +70,86 @@ public static class GenericComponentTypes
         typeof(floatQ),
         typeof(color),
         typeof(colorHDR),
+        typeof(int4),
+        typeof(BoundingBox),
     };
+
+    // Every enum a component actually declares a Sync field of.
+    //
+    // Discovered rather than listed, because a hand-written list is wrong the day someone adds an enum
+    // and nobody remembers this file. Scanning the Sync fields is also the right FILTER: an enum that no
+    // component stores is an enum nothing can drive, and the browser gains nothing by offering it.
+    //
+    // Both coders take any enum without registration (SyncCoder and DataTreeCoder each branch on
+    // IsEnum), so unlike a new value type this needs no coder work at all. -xlinka
+    private static Type[]? _enumTypes;
+    private static int _enumScanAssemblyCount;
+
+    public static Type[] EnumTypes
+    {
+        get
+        {
+            // .NET loads assemblies on demand, so GetAssemblies() returns only what has been touched so
+            // far. Caching the first answer forever would permanently miss every enum in an assembly
+            // that loaded later. Re-scan when the count moves; it never moves on a warm run, so this
+            // costs one integer compare per call in practice. -xlinka
+            var assemblies = AppDomain.CurrentDomain.GetAssemblies();
+            if (_enumTypes == null || assemblies.Length != _enumScanAssemblyCount)
+            {
+                _enumScanAssemblyCount = assemblies.Length;
+                _enumTypes = DiscoverSyncedEnums(assemblies);
+            }
+            return _enumTypes;
+        }
+    }
+
+    private static Type[] DiscoverSyncedEnums(Assembly[] assemblies)
+    {
+        var found = new HashSet<Type>();
+
+        foreach (var assembly in assemblies)
+        {
+            Type[] types;
+            try
+            {
+                types = assembly.GetTypes();
+            }
+            catch (ReflectionTypeLoadException ex)
+            {
+                // A partially loadable assembly still has usable types; take those and move on rather
+                // than losing every enum in the tree to one bad reference.
+                types = Array.FindAll(ex.Types, t => t != null)!;
+            }
+            catch (Exception)
+            {
+                continue;
+            }
+
+            foreach (var type in types)
+            {
+                if (type == null || !typeof(Component).IsAssignableFrom(type))
+                    continue;
+
+                foreach (var field in type.GetFields(BindingFlags.Public | BindingFlags.Instance | BindingFlags.DeclaredOnly))
+                {
+                    var fieldType = field.FieldType;
+                    if (!fieldType.IsGenericType)
+                        continue;
+                    if (fieldType.GetGenericTypeDefinition() != typeof(Sync<>))
+                        continue;
+
+                    var argument = fieldType.GetGenericArguments()[0];
+                    if (argument.IsEnum)
+                        found.Add(argument);
+                }
+            }
+        }
+
+        var result = new Type[found.Count];
+        found.CopyTo(result);
+        Array.Sort(result, (a, b) => string.CompareOrdinal(a.Name, b.Name));
+        return result;
+    }
 
     public static readonly Type[] WorldElementTypes =
     {
@@ -102,6 +184,18 @@ public static class GenericComponentTypes
         {
             case GenericTypeGroup.Values:
                 foreach (var type in ValueTypes)
+                    yield return type;
+                // Enums ride with the value types: an enum IS a value as far as storing, driving,
+                // copying and comparing go, and until now not one enum field in the engine could be
+                // driven by anything. Components that need arithmetic reject them through their own
+                // IsValidGenericType, which TryClose already honours, so the ones that cannot use an
+                // enum never offer it. -xlinka
+                foreach (var type in EnumTypes)
+                    yield return type;
+                break;
+
+            case GenericTypeGroup.Enums:
+                foreach (var type in EnumTypes)
                     yield return type;
                 break;
             case GenericTypeGroup.WorldElements:

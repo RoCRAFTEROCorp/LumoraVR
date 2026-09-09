@@ -34,12 +34,47 @@ namespace Lumora.Core.Logging
         public static event Action<LogLevel, string, string> OnLogWritten = null!;
 
         // Flip to true when actively diagnosing - Debug calls are firehose and choke
-        // the console/file otherwise. - xlinka
-        public static bool EnableDebug { get; set; } = false;
+        // the console/file otherwise. Several call sites also read this to skip building expensive
+        // diagnostic strings at all, so it stays a plain bool. - xlinka
+        public static bool EnableDebug
+        {
+            get => MinimumLevel == LogLevel.DEBUG;
+            set => MinimumLevel = value ? LogLevel.DEBUG : LogLevel.LOG;
+        }
+
+        // The floor. Anything below it is dropped before it costs a timestamp, a formatted string, a
+        // queue entry or a GD.Print. Default LOG, so DEBUG stays off; set LUMORA_LOG_LEVEL to
+        // DEBUG/LOG/WARN/ERROR to move it without a rebuild - WARN is the one to use when you want a
+        // session log you can actually read. -xlinka
+        public static LogLevel MinimumLevel { get; set; } = ReadLevelFromEnvironment();
+
+        // The enum is ordered by age, not by severity (DEBUG was added last), so rank it explicitly
+        // rather than comparing the underlying values.
+        private static int Severity(LogLevel level) => level switch
+        {
+            LogLevel.DEBUG => 0,
+            LogLevel.LOG => 1,
+            LogLevel.WARN => 2,
+            LogLevel.ERROR => 3,
+            _ => 1,
+        };
+
+        private static LogLevel ReadLevelFromEnvironment()
+        {
+            var raw = Environment.GetEnvironmentVariable("LUMORA_LOG_LEVEL");
+            return raw?.Trim().ToUpperInvariant() switch
+            {
+                "DEBUG" => LogLevel.DEBUG,
+                "LOG" or "INFO" => LogLevel.LOG,
+                "WARN" or "WARNING" => LogLevel.WARN,
+                "ERROR" => LogLevel.ERROR,
+                _ => LogLevel.LOG,
+            };
+        }
 
         private static void WriteLog(LogLevel level, string message)
         {
-            if (!EnableDebug && level == LogLevel.DEBUG) return;
+            if (Severity(level) < Severity(MinimumLevel)) return;
             string timestamp = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
             string logEntry = $"[{timestamp}] [{level}] {message}";
             _logQueue.Enqueue(logEntry);

@@ -85,12 +85,19 @@ public static class ComponentLibrary
                     node = child;
                 }
 
-                // An open generic can't be attached, so the browser lists its declared closed forms
-                // instead. One that declares none stays out entirely, which is the same as before.
+                // An open generic is listed ONCE and the type argument is chosen in a second step.
+                //
+                // It used to expand into one browser row per closed form, which put 2200 rows into the
+                // tree across the generic components and meant every type added to the table cost
+                // another row on each of them. A generic that declares no usable argument still stays
+                // out entirely, which is what the enumeration is checked for here. -xlinka
                 if (type.IsGenericTypeDefinition)
                 {
-                    foreach (var closed in GenericComponentTypes.Enumerate(type))
-                        node.Types.Add(closed);
+                    foreach (var _ in GenericComponentTypes.Enumerate(type))
+                    {
+                        node.Types.Add(type);
+                        break;
+                    }
                     continue;
                 }
 

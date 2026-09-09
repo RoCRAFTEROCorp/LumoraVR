@@ -1335,6 +1335,12 @@ public class World : IPermissionWorldFacts
 		_localUserSet = true;
 		LocalUser = user;
 
+		// Only this machine knows what it is running on, so it stamps its own platform here rather than
+		// letting the host guess. Same reasoning as the group card below: the host authors what it can
+		// see, the peer authors what only it can know. -xlinka
+		if (user.UserPlatform.Value != Engine.CurrentPlatform)
+			user.UserPlatform.Value = Engine.CurrentPlatform;
+
 		// The host authors a joiner's identity fields, but not the group card: only the peer holding the
 		// account can read its own profile, so the joining client writes its own the moment it knows which
 		// user is its. -xlinka
@@ -1522,6 +1528,9 @@ public class World : IPermissionWorldFacts
 		hostUser.UserName.Value = resolvedName;
 		hostUser.UserID.Value = userRefId.ToString();
 		hostUser.MachineID.Value = System.Environment.MachineName;
+		// Declared since the User class was written and never once assigned, so every user in every
+		// session reported the enum's default regardless of what they were on.
+		hostUser.UserPlatform.Value = Engine.CurrentPlatform;
 		hostUser.AllocationIDStart.Value = rangeStart;
 		hostUser.AllocationIDEnd.Value = rangeEnd;
 		hostUser.AllocationID.Value = userRefId.GetUserByte();
@@ -2217,6 +2226,10 @@ public class World : IPermissionWorldFacts
 				+ (hookDetail.Length > 0 ? $" [{hookDetail}]" : "");
 		}
 		if (_slowFrameCount == 1)
+			// Back at Log level. Demoting this left a SIXTY SECOND stall reporting "0 slow frames": the
+			// window summary below only fires on a SECOND slow frame, so one catastrophic frame logged
+			// nothing at all. This line fires once per quiet spell, which is rare and is exactly the
+			// evidence you want when something locks up. -xlinka
 			LumoraLogger.Log($"World.Update slow frame {total:F0}ms: {_slowWorstDetail}");
 		else if (Time.TotalTime - _slowWindowStart >= SlowReportWindowSeconds)
 			FlushSlowFrameReport();
@@ -2257,8 +2270,12 @@ public class World : IPermissionWorldFacts
 					localUser.FPS.Value = fps;
 			}
 
-			// Per-stage timing so a lock-up frame logs WHICH stage ate it (instead of guessing). GetTimestamp is
-			// allocation-free; only logs on a genuinely slow frame so it's not spam. -xlinka
+			// Per-stage timing so a frame can say WHICH stage ate it instead of leaving it to guesswork.
+			// GetTimestamp is allocation-free. These used to be discarded unless the frame broke 25 ms, and
+			// then only into a log line - so the ordinary "why is this world at 40 fps" case, where no single
+			// frame is slow enough to trip the threshold, had no numbers at all. They are now published every
+			// frame on LastFrameProfile whatever the cost, and the log threshold only governs the LOG. -xlinka
+			_updateManager?.BeginFrameProfiling();
 			long _ts = System.Diagnostics.Stopwatch.GetTimestamp();
 			double _mspt = 1000.0 / System.Diagnostics.Stopwatch.Frequency;
 			double Lap() { long n = System.Diagnostics.Stopwatch.GetTimestamp(); double ms = (n - _ts) * _mspt; _ts = n; return ms; }
@@ -2314,6 +2331,21 @@ public class World : IPermissionWorldFacts
 			double msEnd = Lap();
 
 			double msTotal = msSync + msPre + msComp + msChange + msHooks + msEnd;
+
+			// LateMs is the previous frame's late pass, because LateUpdate has not run yet this frame and a
+			// background world skips it entirely - waiting for it would mean never publishing at all. One
+			// frame stale on one field beats a hole in the data. -xlinka
+			LastFrameProfile = new FrameProfile(
+				Time.UpdateIndex, msTotal, msSync, msPre, msComp, msChange, msHooks, msEnd, _lastLateMs);
+
+			Metrics.UpdatesProcessed++;
+			Metrics.PeakUpdateTimeMs = System.Math.Max(Metrics.PeakUpdateTimeMs, msTotal);
+			// Exponential average: no ring buffer to carry, and it tracks a world that gets heavier as it
+			// loads instead of being dragged down forever by the first quiet second.
+			Metrics.AverageUpdateTimeMs = Metrics.AverageUpdateTimeMs <= 0.0
+				? msTotal
+				: Metrics.AverageUpdateTimeMs * 0.95 + msTotal * 0.05;
+
 			if (msTotal > SlowFrameMs)
 				NoteSlowFrame(msTotal, msSync, msPre, msComp, msChange, msHooks, msEnd);
 			else if (_slowFrameCount > 0 && Time.TotalTime - _slowWindowStart >= SlowReportWindowSeconds)
@@ -2353,6 +2385,8 @@ public class World : IPermissionWorldFacts
 		{
 			var scaledDelta = delta * TimeScale;
 
+			long lateStart = System.Diagnostics.Stopwatch.GetTimestamp();
+
 			_updateManager?.RunLateUpdates((float)scaledDelta);
 
 			// Same order as the main pass: anything a late component moved fires its WorldTransformChanged
@@ -2361,12 +2395,49 @@ public class World : IPermissionWorldFacts
 			_updateManager?.ProcessMovedSlots();
 
 			_updateManager?.ProcessHookUpdates((float)scaledDelta);
+
+			// The late pass runs a SECOND full hook flush and was completely untimed, so any cost here was
+			// invisible to every frame number we had. -xlinka
+			_lastLateMs = (System.Diagnostics.Stopwatch.GetTimestamp() - lateStart)
+				* 1000.0 / System.Diagnostics.Stopwatch.Frequency;
 		}
 		finally
 		{
 			_hookManager?.ImplementerUnlock();
 		}
 	}
+
+	private double _lastLateMs;
+
+	// One frame's cost, split by stage. Published every frame.
+	public readonly struct FrameProfile
+	{
+		public readonly ulong UpdateIndex;
+		public readonly double TotalMs;
+		public readonly double SyncMs;
+		public readonly double PreMs;
+		public readonly double CompMs;
+		public readonly double ChangeMs;
+		public readonly double HooksMs;
+		public readonly double EndMs;
+		public readonly double LateMs;
+
+		public FrameProfile(ulong updateIndex, double total, double sync, double pre, double comp,
+			double change, double hooks, double end, double late)
+		{
+			UpdateIndex = updateIndex;
+			TotalMs = total;
+			SyncMs = sync;
+			PreMs = pre;
+			CompMs = comp;
+			ChangeMs = change;
+			HooksMs = hooks;
+			EndMs = end;
+			LateMs = late;
+		}
+	}
+
+	public FrameProfile LastFrameProfile { get; private set; }
 
 	private void ProcessInput(float delta)
 	{

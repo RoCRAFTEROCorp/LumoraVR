@@ -738,8 +738,7 @@ public sealed class FileBrowserScreen : DashboardScreen, IDashboardKeyInput
                 {
                     _lastPressPath = null;
                     Select(captured);
-                    if (World != null)
-                        SpawnImport(captured.Path);
+                    SpawnImport(captured.Path);
                     return;
                 }
                 Select(captured);
@@ -811,22 +810,30 @@ public sealed class FileBrowserScreen : DashboardScreen, IDashboardKeyInput
     private void OpenFolderHere()
     {
         if (string.IsNullOrEmpty(_currentPath)) return;
-        if (World == null) return;
         SpawnImport(_currentPath);
     }
 
+    // The world an import belongs in: the one the user is standing in, NOT this screen's own. A dash
+    // screen lives in the userspace overlay world, so `World` here is that overlay - importing into it
+    // put the model somewhere the session cannot see and nothing worked on it. Same property the
+    // inventory spawn and the clipboard importer already use. -xlinka
+    private static World? FocusedWorld => Lumora.Core.Engine.Current?.WorldManager?.FocusedWorld;
+
     private void SpawnImport(string path)
     {
-        var (position, rotation) = ResolveSpawnPose();
-        Lumora.Core.Components.Import.UniversalImporter.Import(path, World, position, rotation);
+        var world = FocusedWorld;
+        if (world == null)
+            return;
+
+        var (position, rotation) = ResolveSpawnPose(world);
+        Lumora.Core.Components.Import.UniversalImporter.Import(path, world, position, rotation);
     }
 
-    private (float3 position, floatQ rotation) ResolveSpawnPose()
+    private static (float3 position, floatQ rotation) ResolveSpawnPose(World world)
     {
-        // Prefer the local user's head - that's where they're looking, so dialogs/spawned
-        // items land in front of them. Fall back to the dashboard panel's transform if
-        // no head is registered yet (loading screens, etc). - xlinka
-        var head = World?.LocalUser?.Root?.HeadSlot;
+        // The head in the world being imported INTO. Taking it off this screen's own world would be
+        // a position in the overlay's coordinate space, which means nothing over there.
+        var head = world.LocalUser?.Root?.HeadSlot;
         if (head != null)
         {
             // View direction is the head's -Z (float3.Backward). Using +Z put the dialog BEHIND the
@@ -834,10 +841,10 @@ public sealed class FileBrowserScreen : DashboardScreen, IDashboardKeyInput
             var fwd = head.GlobalRotation * float3.Backward;
             return (head.GlobalPosition + fwd * 0.75f, head.GlobalRotation);
         }
-        var basePos = Slot?.GlobalPosition ?? float3.Zero;
-        var baseRot = Slot?.GlobalRotation ?? floatQ.Identity;
-        var forward = baseRot * float3.Forward;
-        return (basePos + forward * 1.5f, baseRot);
+        // No local user yet: drop it at the world's own origin rather than at some overlay-space
+        // coordinate that happens to parse as a position.
+        var root = world.RootSlot;
+        return (root?.GlobalPosition ?? float3.Zero, root?.GlobalRotation ?? floatQ.Identity);
     }
 
     private void BuildNewFolderModal(Slot root, IAssetProvider<FontSet>? font, RoundedRectTextureProvider? rounded)

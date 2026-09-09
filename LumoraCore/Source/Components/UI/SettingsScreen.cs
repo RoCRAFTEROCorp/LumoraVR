@@ -234,11 +234,11 @@ public sealed class SettingsScreen : DashboardScreen
         Header(path, "You", "Settings.General.Section.You".AsLocale("You"));
         // Drives the avatar auto-rescale: SettingsApplier feeds it to InputInterface.UserHeight and
         // AvatarIK re-scales so the eyes land at this height.
-        Slider(path, "height", "Settings.General.Height".AsLocale("Height"), 0.5f, 2.5f, 0.01f,
+        Slider(path, "height", "Settings.General.Height".AsLocale("Height"), SettingsCatalog.UserHeight,
             () => EngineSettings.UserHeight, v => EngineSettings.UserHeight = v, v => $"{v:0.00} m");
 
         Header(path, "Audio", "Settings.General.Section.Audio".AsLocale("Audio"));
-        Slider(path, "volume", "Settings.General.MasterVolume".AsLocale("Master Volume"), 0f, 1f, 0.01f,
+        Slider(path, "volume", "Settings.General.MasterVolume".AsLocale("Master Volume"), SettingsCatalog.MasterVolume,
             () => EngineSettings.MasterVolume, v => EngineSettings.MasterVolume = v, v => $"{v * 100f:0}%");
     }
 
@@ -248,18 +248,81 @@ public sealed class SettingsScreen : DashboardScreen
         Header(path, "Display", "Settings.Graphics.Section.Display".AsLocale("Display"));
         Toggle(path, "vsync", "Settings.Graphics.VSync".AsLocale("VSync"), () => EngineSettings.VSync, v => EngineSettings.VSync = v);
         Toggle(path, "fullscreen", "Settings.Graphics.Fullscreen".AsLocale("Fullscreen"), () => EngineSettings.Fullscreen, v => EngineSettings.Fullscreen = v);
-        Slider(path, "fps", "Settings.Graphics.FpsLimit".AsLocale("FPS Limit"), 0f, 240f, 10f,
+        Slider(path, "fps", "Settings.Graphics.FpsLimit".AsLocale("FPS Limit"), SettingsCatalog.MaxFps,
             () => EngineSettings.MaxFps, v => EngineSettings.MaxFps = (int)v,
             v => v <= 0f ? "Off" : $"{(int)v}");
         // Caps the loop while the window is unfocused or minimized (vsync stops throttling there).
-        Slider(path, "bgfps", "Settings.Graphics.BackgroundFps".AsLocale("Background FPS"), 0f, 120f, 10f,
+        Slider(path, "bgfps", "Settings.Graphics.BackgroundFps".AsLocale("Background FPS"), SettingsCatalog.BackgroundFps,
             () => EngineSettings.BackgroundFps, v => EngineSettings.BackgroundFps = (int)v,
             v => v <= 0f ? "Off" : $"{(int)v}");
-        // 5% steps so the viewport is not re-allocated per pixel of drag.
-        Slider(path, "renderscale", "Settings.Graphics.RenderScale".AsLocale("Render Scale"), 0.5f, 1.5f, 0.05f,
+        // Windowed this resizes the window; fullscreen it drops the 3D buffer to that height and leaves
+        // the interface at native. A picker, not a slider: nobody drags for a resolution.
+        _entries.Add(path, new ListingChoice("resolution", "Settings.Graphics.Resolution".AsLocale("Resolution"))
+        {
+            Options = ResolutionOptionLabels(),
+            Read = () => ResolutionIndex(EngineSettings.ResolutionHeight),
+            Write = index =>
+            {
+                var options = EngineSettings.ResolutionHeightOptions;
+                if (index >= 0 && index < options.Length)
+                    EngineSettings.ResolutionHeight = options[index];
+            },
+        });
+
+        // 5% steps so the viewport is not re-allocated per pixel of drag. With dynamic resolution on
+        // this is the CEILING rather than the fixed value.
+        Slider(path, "renderscale", "Settings.Graphics.RenderScale".AsLocale("Render Scale"), SettingsCatalog.RenderScale,
             () => EngineSettings.RenderScale, v => EngineSettings.RenderScale = v, v => $"{v * 100f:0}%");
+        Toggle(path, "dynres", "Settings.Graphics.DynamicResolution".AsLocale("Dynamic Resolution"),
+            () => EngineSettings.DynamicResolution, v => EngineSettings.DynamicResolution = v);
+        // Desktop only, and only does anything below 100% scale. Not offered in a headset: see
+        // EngineSettings.Upscaler for why.
+        _entries.Add(path, new ListingChoice("upscaler", "Settings.Graphics.Upscaler".AsLocale("Upscaler"))
+        {
+            Options = new[] { "Bilinear", "FSR 1", "FSR 2" },
+            Read = () => EngineSettings.Upscaler,
+            Write = index => EngineSettings.Upscaler = index,
+        });
+
+        Header(path, "Image", "Settings.Graphics.Section.Image".AsLocale("Image"));
+        // The renderer shipped on the platform's untouched defaults: a LINEAR tonemapper with a white
+        // point of 1.0, which clips every value above 1 - exactly the range colorHDR exists to carry.
+        // AgX holds saturated brights where ACES skews them toward white, and saturated brights are
+        // what emissives are made of.
+        _entries.Add(path, new ListingChoice("tonemap", "Settings.Graphics.Tonemap".AsLocale("Tonemap"))
+        {
+            Options = EngineSettings.TonemapOptions,
+            Read = () => EngineSettings.Tonemap,
+            Write = index => EngineSettings.Tonemap = index,
+        });
+        // The luminance that maps to full white. At 1 everything brighter clips, which is the default
+        // that made every emissive flat.
+        Slider(path, "exposure", "Settings.Graphics.WhitePoint".AsLocale("White Point"), SettingsCatalog.Exposure,
+            () => EngineSettings.Exposure, v => EngineSettings.Exposure = v, v => $"{v:0.#}");
+        Slider(path, "bloom", "Settings.Graphics.Bloom".AsLocale("Bloom"), SettingsCatalog.Bloom,
+            () => EngineSettings.Bloom, v => EngineSettings.Bloom = v,
+            v => v <= 0.001f ? "Off" : $"{v:0.##}");
+        // Costs fill rate rather than frame logic. Off is a real option on a weak GPU, but in a
+        // headset the first step off zero is the difference between crawling edges and a clean image.
+        Slider(path, "aa", "Settings.Graphics.AntiAliasing".AsLocale("Anti-Aliasing"), 0f, EngineSettings.AntiAliasingOptions.Length - 1, 1f,
+            () => AntiAliasingIndex(EngineSettings.AntiAliasing),
+            v =>
+            {
+                int index = System.Math.Clamp((int)MathF.Round(v), 0, EngineSettings.AntiAliasingOptions.Length - 1);
+                EngineSettings.AntiAliasing = EngineSettings.AntiAliasingOptions[index];
+            },
+            v => EngineSettings.DescribeAntiAliasing(
+                EngineSettings.AntiAliasingOptions[System.Math.Clamp((int)MathF.Round(v), 0, EngineSettings.AntiAliasingOptions.Length - 1)]));
 
         Header(path, "Quality", "Settings.Graphics.Section.Quality".AsLocale("Quality"));
+        // Never set by anything until now, so every world ran on the renderer default. One of the
+        // largest single levers on shadow cost.
+        _entries.Add(path, new ListingChoice("shadowquality", "Settings.Graphics.ShadowQuality".AsLocale("Shadow Quality"))
+        {
+            Options = EngineSettings.ShadowQualityOptions,
+            Read = () => EngineSettings.ShadowQuality,
+            Write = index => EngineSettings.ShadowQuality = index,
+        });
         // Driven as an index over the generated buckets, not pixels: a drag can only land on a size
         // that actually has a variant behind it. Providers re-resolve live onto the new cap.
         Slider(path, "texturesize", "Settings.Graphics.MaxTextureSize".AsLocale("Max Texture Size"), 0f, EngineSettings.TextureSizeOptions.Length - 1, 1f,
@@ -276,16 +339,16 @@ public sealed class SettingsScreen : DashboardScreen
         Toggle(path, "reflections", "Settings.Graphics.Reflections".AsLocale("Reflections"),
             () => EngineSettings.ReflectionsEnabled, v => EngineSettings.ReflectionsEnabled = v);
         // Multiplier on every LOD switch distance. Above 1 holds detailed levels further out.
-        Slider(path, "lodbias", "Settings.Graphics.LodBias".AsLocale("LOD Bias"), 0.25f, 4f, 0.05f,
+        Slider(path, "lodbias", "Settings.Graphics.LodBias".AsLocale("LOD Bias"), SettingsCatalog.LodBias,
             () => EngineSettings.LodBias, v => EngineSettings.LodBias = v, v => $"{v:0.00}x");
         // Screen-space error an imported mesh is allowed to show before the renderer drops it to a
         // cheaper level of itself. This never removes an object, only triangles.
-        Slider(path, "meshlod", "Settings.Graphics.MeshDetail".AsLocale("Mesh Detail"), 0f, 8f, 0.5f,
+        Slider(path, "meshlod", "Settings.Graphics.MeshDetail".AsLocale("Mesh Detail"), SettingsCatalog.MeshLodThreshold,
             () => EngineSettings.MeshLodThreshold, v => EngineSettings.MeshLodThreshold = v,
             EngineSettings.DescribeMeshLodThreshold);
         // Multiplier on every directional light's cascade range - the cheapest real cut on the shadow
         // pass, and it works on worlds whose lights someone else authored.
-        Slider(path, "shadowdistance", "Settings.Graphics.ShadowDistance".AsLocale("Shadow Distance"), 0.25f, 4f, 0.05f,
+        Slider(path, "shadowdistance", "Settings.Graphics.ShadowDistance".AsLocale("Shadow Distance"), SettingsCatalog.ShadowDistanceScale,
             () => EngineSettings.ShadowDistanceScale, v => EngineSettings.ShadowDistanceScale = v, v => $"{v:0.00}x");
     }
 
@@ -293,15 +356,15 @@ public sealed class SettingsScreen : DashboardScreen
     {
         const string path = "movement";
         Header(path, "Look", "Settings.Movement.Section.Look".AsLocale("Look"));
-        Slider(path, "mousesens", "Settings.Movement.MouseSensitivity".AsLocale("Mouse Sensitivity"), 0.1f, 5f, 0.01f,
+        Slider(path, "mousesens", "Settings.Movement.MouseSensitivity".AsLocale("Mouse Sensitivity"), SettingsCatalog.MouseSensitivity,
             () => EngineSettings.MouseSensitivity, v => EngineSettings.MouseSensitivity = v, v => $"{v:0.00}x");
-        Slider(path, "mousesmooth", "Settings.Movement.MouseSmoothing".AsLocale("Mouse Smoothing"), 0f, 0.9f, 0.01f,
+        Slider(path, "mousesmooth", "Settings.Movement.MouseSmoothing".AsLocale("Mouse Smoothing"), SettingsCatalog.MouseSmoothing,
             () => EngineSettings.MouseSmoothing, v => EngineSettings.MouseSmoothing = v,
             v => v <= 0.001f ? "Off" : $"{v:0.00}");
 
         Header(path, "Locomotion", "Settings.Movement.Section.Locomotion".AsLocale("Locomotion"));
         _entries.Add(path, new ListingCustom("locomotion", KindLocomotion, "Settings.Movement.Mode".AsLocale("Mode")));
-        Slider(path, "noclip", "Settings.Movement.NoclipSpeed".AsLocale("Noclip Speed"), 1f, 30f, 0.5f,
+        Slider(path, "noclip", "Settings.Movement.NoclipSpeed".AsLocale("Noclip Speed"), SettingsCatalog.NoclipSpeed,
             () => EngineSettings.NoclipSpeed, v => EngineSettings.NoclipSpeed = v, v => $"{v:0.#} m/s");
 
         Header(path, "Turning", "Settings.Movement.Section.Turning".AsLocale("Turning"));
@@ -309,10 +372,10 @@ public sealed class SettingsScreen : DashboardScreen
             () => EngineSettings.TurnMode, v => EngineSettings.TurnMode = v));
         // Only one of these two does anything at a time; the idle one greys out instead of vanishing so
         // the list does not reflow while you are reading it.
-        var snap = Slider(path, "snapangle", "Settings.Movement.SnapAngle".AsLocale("Snap Angle"), 10f, 90f, 5f,
+        var snap = Slider(path, "snapangle", "Settings.Movement.SnapAngle".AsLocale("Snap Angle"), SettingsCatalog.SnapTurnAngle,
             () => EngineSettings.SnapTurnAngle, v => EngineSettings.SnapTurnAngle = v, v => $"{v:0}°");
         snap.Tag = EngineSettings.TurnStyle.Snap;
-        var smooth = Slider(path, "smoothspeed", "Settings.Movement.SmoothTurnSpeed".AsLocale("Smooth Turn Speed"), 30f, 360f, 5f,
+        var smooth = Slider(path, "smoothspeed", "Settings.Movement.SmoothTurnSpeed".AsLocale("Smooth Turn Speed"), SettingsCatalog.SmoothTurnSpeed,
             () => EngineSettings.SmoothTurnSpeed, v => EngineSettings.SmoothTurnSpeed = v, v => $"{v:0}°/s");
         smooth.Tag = EngineSettings.TurnStyle.Smooth;
     }
@@ -332,10 +395,10 @@ public sealed class SettingsScreen : DashboardScreen
         // fields, so a change repaints the cursor on the next frame.
         _entries.Add(path, ListingChoice.FromEnum<EngineSettings.ReticleShape>("reticlestyle", "Settings.Interface.ReticleStyle".AsLocale("Style"),
             () => EngineSettings.ReticleStyle, v => EngineSettings.ReticleStyle = v));
-        var size = Slider(path, "reticlesize", "Settings.Interface.ReticleSize".AsLocale("Size"), 2f, 48f, 1f,
+        var size = Slider(path, "reticlesize", "Settings.Interface.ReticleSize".AsLocale("Size"), SettingsCatalog.ReticleSize,
             () => EngineSettings.ReticleSize, v => EngineSettings.ReticleSize = v, v => $"{v:0} px");
         size.Tag = "reticle";
-        var thickness = Slider(path, "reticlethickness", "Settings.Interface.ReticleThickness".AsLocale("Thickness"), 1f, 8f, 0.5f,
+        var thickness = Slider(path, "reticlethickness", "Settings.Interface.ReticleThickness".AsLocale("Thickness"), SettingsCatalog.ReticleThickness,
             () => EngineSettings.ReticleThickness, v => EngineSettings.ReticleThickness = v, v => $"{v:0.#} px");
         thickness.Tag = "reticle";
 
@@ -417,6 +480,12 @@ public sealed class SettingsScreen : DashboardScreen
         LocaleText hint = default)
         => _entries.Add(path, new ListingToggle(key, label) { Read = read, Write = write, DetailText = hint });
 
+    // Range-taking overload. Every slider whose setting has bounds goes through this one, so the row can
+    // no longer offer a narrower span than the engine accepts. Three of them already did. -xlinka
+    private ListingSlider Slider(string path, string key, LocaleText label, in SettingRange range,
+        Func<float> read, Action<float> write, Func<float, string> format)
+        => Slider(path, key, label, range.Min, range.Max, range.Step, read, write, format);
+
     private ListingSlider Slider(string path, string key, LocaleText label, float min, float max, float step,
         Func<float> read, Action<float> write, Func<float, string> format)
         => _entries.Add(path, new ListingSlider(key, label)
@@ -454,12 +523,43 @@ public sealed class SettingsScreen : DashboardScreen
         };
     }
 
+    private static string[] ResolutionOptionLabels()
+    {
+        var options = EngineSettings.ResolutionHeightOptions;
+        var labels = new string[options.Length];
+        for (int i = 0; i < options.Length; i++)
+            labels[i] = EngineSettings.DescribeResolutionHeight(options[i]);
+        return labels;
+    }
+
+    private static int ResolutionIndex(int height)
+    {
+        var options = EngineSettings.ResolutionHeightOptions;
+        for (int i = 0; i < options.Length; i++)
+        {
+            if (options[i] == height)
+                return i;
+        }
+        return 0;
+    }
+
     private static int TextureSizeIndex(int size)
     {
         var options = EngineSettings.TextureSizeOptions;
         for (int i = 0; i < options.Length; i++)
         {
             if (options[i] == size)
+                return i;
+        }
+        return 0;
+    }
+
+    private static int AntiAliasingIndex(int samples)
+    {
+        var options = EngineSettings.AntiAliasingOptions;
+        for (int i = 0; i < options.Length; i++)
+        {
+            if (options[i] == samples)
                 return i;
         }
         return 0;

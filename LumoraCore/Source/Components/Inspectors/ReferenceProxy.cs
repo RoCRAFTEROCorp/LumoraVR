@@ -189,10 +189,13 @@ public class ReferenceProxy : Component, IHeldActivatable
 
         var mesh = slot.AttachComponent<QuadMesh>();
         mesh.Size.Value = float2.One;
-        mesh.DualSided.Value = true;
+        // Two-sided from the material, not from a second coplanar quad. DualSided builds a duplicate
+        // rotated 180 degrees at the same depth, which fights with the original over which is in front.
+        mesh.DualSided.Value = false;
 
         var material = slot.AttachComponent<UnlitMaterial>();
         material.BlendMode.Value = BlendMode.Transparent;
+        material.Culling.Value = Culling.None;
         material.Texture.Target = texture;
 
         var renderer = slot.AttachComponent<MeshRenderer>();
