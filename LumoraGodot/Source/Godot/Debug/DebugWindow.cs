@@ -176,6 +176,7 @@ public partial class DebugWindow : Control
         ConfigureMemoryProfilerTree();
         ConfigureProfilerTrees();
         ConfigureNetworkTree();
+        ConfigureFrameTab();
         WireEvents();
         StartUdpListener();
 
@@ -204,6 +205,8 @@ public partial class DebugWindow : Control
             _logsDirty = false;
             RebuildLogDisplay();
         }
+
+        RefreshFrameUi();
 
         if (_memoryUiDirty)
         {
@@ -329,6 +332,8 @@ public partial class DebugWindow : Control
         _profComponentTree = GetNodeOrNull<Tree>("%ProfComponentTree");
         _profSlotTree = GetNodeOrNull<Tree>("%ProfSlotTree");
         _profStatusLabel = GetNodeOrNull<Label>("%ProfStatusLabel");
+
+        CacheFrameTabReferences();
     }
 
     private void ConfigureMemoryProfilerTree()
@@ -614,6 +619,17 @@ public partial class DebugWindow : Control
             case "PROF":
                 HandleProfilePacket(segments);
                 break;
+            case "FRAM":
+                HandleFramePacket(segments);
+                break;
+            case "DROP":
+                // The sender could not fit a packet in a datagram. Say so loudly: the alternative is a
+                // tab that silently stops updating while its stale numbers still look believable.
+                AddLocalLog(LogLevel.WARN, segments.Length >= 3
+                    ? $"Telemetry packet '{segments[1]}' dropped: {segments[2]} bytes exceeds the datagram limit. That tab is missing data."
+                    : "Telemetry packet dropped: over the datagram limit.");
+                _logsDirty = true;
+                break;
         }
     }
 
@@ -848,6 +864,8 @@ public partial class DebugWindow : Control
 
         RebuildProfileTree(_profComponentTree, components);
         RebuildProfileTree(_profSlotTree, slots);
+
+        AccumulateComponentProfile(components);
 
         SetLabel(_profStatusLabel,
             $"Live | Packets: {_profilePacketCount:N0} | Components: {components.Count} | Slots: {slots.Count} | latest frame");

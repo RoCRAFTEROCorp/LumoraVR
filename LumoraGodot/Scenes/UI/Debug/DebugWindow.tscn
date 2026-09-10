@@ -1618,3 +1618,289 @@ layout_mode = 2
 theme_override_colors/font_color = Color(0.45, 0.45, 0.52, 1)
 theme_override_font_sizes/font_size = 10
 text = "Waiting for network packets..."
+
+; ==================== FRAME TAB ====================
+[node name="Frame" type="ScrollContainer" parent="Background/RootMargin/RootVBox/Tabs"]
+unique_name_in_owner = true
+layout_mode = 2
+horizontal_scroll_mode = 0
+
+[node name="FrameVBox" type="VBoxContainer" parent="Background/RootMargin/RootVBox/Tabs/Frame"]
+layout_mode = 2
+size_flags_horizontal = 3
+theme_override_constants/separation = 8
+
+[node name="FrameHeader" type="Label" parent="Background/RootMargin/RootVBox/Tabs/Frame/FrameVBox"]
+layout_mode = 2
+theme_override_colors/font_color = Color(1, 0.7, 0.3, 1)
+theme_override_font_sizes/font_size = 14
+text = "WHERE THE FRAME WENT"
+
+[node name="FrameBlurb" type="Label" parent="Background/RootMargin/RootVBox/Tabs/Frame/FrameVBox"]
+layout_mode = 2
+autowrap_mode = 3
+theme_override_colors/font_color = Color(0.45, 0.45, 0.52, 1)
+theme_override_font_sizes/font_size = 10
+text = "Measured, not derived. World phases come from the update loop itself; render times come from the renderer with measurement enabled. Record, reproduce the stutter, then export the CSV."
+
+[node name="FrameCaptureBar" type="HBoxContainer" parent="Background/RootMargin/RootVBox/Tabs/Frame/FrameVBox"]
+layout_mode = 2
+theme_override_constants/separation = 8
+
+[node name="FrameRecordToggle" type="CheckButton" parent="Background/RootMargin/RootVBox/Tabs/Frame/FrameVBox/FrameCaptureBar"]
+unique_name_in_owner = true
+layout_mode = 2
+button_pressed = true
+text = "Record"
+
+[node name="FrameExportBtn" type="Button" parent="Background/RootMargin/RootVBox/Tabs/Frame/FrameVBox/FrameCaptureBar"]
+unique_name_in_owner = true
+layout_mode = 2
+text = "Export CSV"
+
+[node name="FrameOpenFolderBtn" type="Button" parent="Background/RootMargin/RootVBox/Tabs/Frame/FrameVBox/FrameCaptureBar"]
+unique_name_in_owner = true
+layout_mode = 2
+text = "Open Folder"
+
+[node name="FrameClearBtn" type="Button" parent="Background/RootMargin/RootVBox/Tabs/Frame/FrameVBox/FrameCaptureBar"]
+unique_name_in_owner = true
+layout_mode = 2
+text = "Clear"
+
+[node name="FrameCaptureStatus" type="Label" parent="Background/RootMargin/RootVBox/Tabs/Frame/FrameVBox"]
+unique_name_in_owner = true
+layout_mode = 2
+autowrap_mode = 3
+theme_override_colors/font_color = Color(0.55, 0.55, 0.62, 1)
+theme_override_font_sizes/font_size = 11
+text = "Waiting for frame packets..."
+
+[node name="FramePhasePanel" type="PanelContainer" parent="Background/RootMargin/RootVBox/Tabs/Frame/FrameVBox"]
+layout_mode = 2
+theme_override_styles/panel = SubResource("section_bg")
+
+[node name="FramePhaseVBox" type="VBoxContainer" parent="Background/RootMargin/RootVBox/Tabs/Frame/FrameVBox/FramePhasePanel"]
+layout_mode = 2
+theme_override_constants/separation = 4
+
+[node name="FramePhaseTitle" type="Label" parent="Background/RootMargin/RootVBox/Tabs/Frame/FrameVBox/FramePhasePanel/FramePhaseVBox"]
+layout_mode = 2
+theme_override_colors/font_color = Color(0.75, 0.78, 1, 1)
+theme_override_font_sizes/font_size = 13
+text = "World Update Phases (last frame)"
+
+[node name="FramePhaseTree" type="Tree" parent="Background/RootMargin/RootVBox/Tabs/Frame/FrameVBox/FramePhasePanel/FramePhaseVBox"]
+unique_name_in_owner = true
+custom_minimum_size = Vector2(0, 210)
+layout_mode = 2
+theme_override_font_sizes/font_size = 11
+columns = 3
+hide_root = true
+
+[node name="FrameRenderPanel" type="PanelContainer" parent="Background/RootMargin/RootVBox/Tabs/Frame/FrameVBox"]
+layout_mode = 2
+theme_override_styles/panel = SubResource("section_bg")
+
+[node name="FrameRenderVBox" type="VBoxContainer" parent="Background/RootMargin/RootVBox/Tabs/Frame/FrameVBox/FrameRenderPanel"]
+layout_mode = 2
+theme_override_constants/separation = 4
+
+[node name="FrameRenderTitle" type="Label" parent="Background/RootMargin/RootVBox/Tabs/Frame/FrameVBox/FrameRenderPanel/FrameRenderVBox"]
+layout_mode = 2
+theme_override_colors/font_color = Color(0.75, 0.78, 1, 1)
+theme_override_font_sizes/font_size = 13
+text = "Renderer"
+
+[node name="FrameRenderGrid" type="GridContainer" parent="Background/RootMargin/RootVBox/Tabs/Frame/FrameVBox/FrameRenderPanel/FrameRenderVBox"]
+layout_mode = 2
+columns = 4
+theme_override_constants/h_separation = 14
+theme_override_constants/v_separation = 3
+
+[node name="LblRenderCpu" type="Label" parent="Background/RootMargin/RootVBox/Tabs/Frame/FrameVBox/FrameRenderPanel/FrameRenderVBox/FrameRenderGrid"]
+layout_mode = 2
+theme_override_colors/font_color = Color(0.55, 0.55, 0.62, 1)
+theme_override_font_sizes/font_size = 11
+text = "Render CPU"
+
+[node name="FrameRenderCpuValue" type="Label" parent="Background/RootMargin/RootVBox/Tabs/Frame/FrameVBox/FrameRenderPanel/FrameRenderVBox/FrameRenderGrid"]
+unique_name_in_owner = true
+layout_mode = 2
+theme_override_font_sizes/font_size = 11
+text = "-"
+
+[node name="LblRenderGpu" type="Label" parent="Background/RootMargin/RootVBox/Tabs/Frame/FrameVBox/FrameRenderPanel/FrameRenderVBox/FrameRenderGrid"]
+layout_mode = 2
+theme_override_colors/font_color = Color(0.55, 0.55, 0.62, 1)
+theme_override_font_sizes/font_size = 11
+text = "Render GPU"
+
+[node name="FrameRenderGpuValue" type="Label" parent="Background/RootMargin/RootVBox/Tabs/Frame/FrameVBox/FrameRenderPanel/FrameRenderVBox/FrameRenderGrid"]
+unique_name_in_owner = true
+layout_mode = 2
+theme_override_font_sizes/font_size = 11
+text = "-"
+
+[node name="LblFrameSetup" type="Label" parent="Background/RootMargin/RootVBox/Tabs/Frame/FrameVBox/FrameRenderPanel/FrameRenderVBox/FrameRenderGrid"]
+layout_mode = 2
+theme_override_colors/font_color = Color(0.55, 0.55, 0.62, 1)
+theme_override_font_sizes/font_size = 11
+text = "Frame setup CPU"
+
+[node name="FrameSetupValue" type="Label" parent="Background/RootMargin/RootVBox/Tabs/Frame/FrameVBox/FrameRenderPanel/FrameRenderVBox/FrameRenderGrid"]
+unique_name_in_owner = true
+layout_mode = 2
+theme_override_font_sizes/font_size = 11
+text = "-"
+
+[node name="LblCpuFrame" type="Label" parent="Background/RootMargin/RootVBox/Tabs/Frame/FrameVBox/FrameRenderPanel/FrameRenderVBox/FrameRenderGrid"]
+layout_mode = 2
+theme_override_colors/font_color = Color(0.55, 0.55, 0.62, 1)
+theme_override_font_sizes/font_size = 11
+text = "Process delta"
+
+[node name="FrameCpuValue" type="Label" parent="Background/RootMargin/RootVBox/Tabs/Frame/FrameVBox/FrameRenderPanel/FrameRenderVBox/FrameRenderGrid"]
+unique_name_in_owner = true
+layout_mode = 2
+theme_override_font_sizes/font_size = 11
+text = "-"
+
+[node name="LblDrawsVisible" type="Label" parent="Background/RootMargin/RootVBox/Tabs/Frame/FrameVBox/FrameRenderPanel/FrameRenderVBox/FrameRenderGrid"]
+layout_mode = 2
+theme_override_colors/font_color = Color(0.55, 0.55, 0.62, 1)
+theme_override_font_sizes/font_size = 11
+text = "Draws: visible"
+
+[node name="FrameDrawsVisibleValue" type="Label" parent="Background/RootMargin/RootVBox/Tabs/Frame/FrameVBox/FrameRenderPanel/FrameRenderVBox/FrameRenderGrid"]
+unique_name_in_owner = true
+layout_mode = 2
+theme_override_font_sizes/font_size = 11
+text = "-"
+
+[node name="LblDrawsShadow" type="Label" parent="Background/RootMargin/RootVBox/Tabs/Frame/FrameVBox/FrameRenderPanel/FrameRenderVBox/FrameRenderGrid"]
+layout_mode = 2
+theme_override_colors/font_color = Color(0.55, 0.55, 0.62, 1)
+theme_override_font_sizes/font_size = 11
+text = "Draws: SHADOW"
+
+[node name="FrameDrawsShadowValue" type="Label" parent="Background/RootMargin/RootVBox/Tabs/Frame/FrameVBox/FrameRenderPanel/FrameRenderVBox/FrameRenderGrid"]
+unique_name_in_owner = true
+layout_mode = 2
+theme_override_font_sizes/font_size = 11
+text = "-"
+
+[node name="LblDrawsCanvas" type="Label" parent="Background/RootMargin/RootVBox/Tabs/Frame/FrameVBox/FrameRenderPanel/FrameRenderVBox/FrameRenderGrid"]
+layout_mode = 2
+theme_override_colors/font_color = Color(0.55, 0.55, 0.62, 1)
+theme_override_font_sizes/font_size = 11
+text = "Draws: canvas"
+
+[node name="FrameDrawsCanvasValue" type="Label" parent="Background/RootMargin/RootVBox/Tabs/Frame/FrameVBox/FrameRenderPanel/FrameRenderVBox/FrameRenderGrid"]
+unique_name_in_owner = true
+layout_mode = 2
+theme_override_font_sizes/font_size = 11
+text = "-"
+
+[node name="LblObjectsVisible" type="Label" parent="Background/RootMargin/RootVBox/Tabs/Frame/FrameVBox/FrameRenderPanel/FrameRenderVBox/FrameRenderGrid"]
+layout_mode = 2
+theme_override_colors/font_color = Color(0.55, 0.55, 0.62, 1)
+theme_override_font_sizes/font_size = 11
+text = "Objects: visible"
+
+[node name="FrameObjectsVisibleValue" type="Label" parent="Background/RootMargin/RootVBox/Tabs/Frame/FrameVBox/FrameRenderPanel/FrameRenderVBox/FrameRenderGrid"]
+unique_name_in_owner = true
+layout_mode = 2
+theme_override_font_sizes/font_size = 11
+text = "-"
+
+[node name="LblObjectsShadow" type="Label" parent="Background/RootMargin/RootVBox/Tabs/Frame/FrameVBox/FrameRenderPanel/FrameRenderVBox/FrameRenderGrid"]
+layout_mode = 2
+theme_override_colors/font_color = Color(0.55, 0.55, 0.62, 1)
+theme_override_font_sizes/font_size = 11
+text = "Objects: shadow"
+
+[node name="FrameObjectsShadowValue" type="Label" parent="Background/RootMargin/RootVBox/Tabs/Frame/FrameVBox/FrameRenderPanel/FrameRenderVBox/FrameRenderGrid"]
+unique_name_in_owner = true
+layout_mode = 2
+theme_override_font_sizes/font_size = 11
+text = "-"
+
+[node name="LblGpuMem" type="Label" parent="Background/RootMargin/RootVBox/Tabs/Frame/FrameVBox/FrameRenderPanel/FrameRenderVBox/FrameRenderGrid"]
+layout_mode = 2
+theme_override_colors/font_color = Color(0.55, 0.55, 0.62, 1)
+theme_override_font_sizes/font_size = 11
+text = "GPU mem (tex/buf/total)"
+
+[node name="FrameGpuMemValue" type="Label" parent="Background/RootMargin/RootVBox/Tabs/Frame/FrameVBox/FrameRenderPanel/FrameRenderVBox/FrameRenderGrid"]
+unique_name_in_owner = true
+layout_mode = 2
+theme_override_font_sizes/font_size = 11
+text = "-"
+
+[node name="FrameShadowHint" type="Label" parent="Background/RootMargin/RootVBox/Tabs/Frame/FrameVBox"]
+unique_name_in_owner = true
+layout_mode = 2
+autowrap_mode = 3
+theme_override_colors/font_color = Color(0.55, 0.55, 0.62, 1)
+theme_override_font_sizes/font_size = 10
+text = ""
+
+[node name="FrameHookPanel" type="PanelContainer" parent="Background/RootMargin/RootVBox/Tabs/Frame/FrameVBox"]
+layout_mode = 2
+theme_override_styles/panel = SubResource("section_bg")
+
+[node name="FrameHookVBox" type="VBoxContainer" parent="Background/RootMargin/RootVBox/Tabs/Frame/FrameVBox/FrameHookPanel"]
+layout_mode = 2
+theme_override_constants/separation = 4
+
+[node name="FrameHookTitle" type="Label" parent="Background/RootMargin/RootVBox/Tabs/Frame/FrameVBox/FrameHookPanel/FrameHookVBox"]
+layout_mode = 2
+theme_override_colors/font_color = Color(0.75, 0.78, 1, 1)
+theme_override_font_sizes/font_size = 13
+text = "Hook Cost By Type (last frame, both passes)"
+
+[node name="FrameHookTree" type="Tree" parent="Background/RootMargin/RootVBox/Tabs/Frame/FrameVBox/FrameHookPanel/FrameHookVBox"]
+unique_name_in_owner = true
+custom_minimum_size = Vector2(0, 260)
+layout_mode = 2
+theme_override_font_sizes/font_size = 11
+columns = 3
+hide_root = true
+
+[node name="FrameStutterHint" type="Label" parent="Background/RootMargin/RootVBox/Tabs/Frame/FrameVBox"]
+unique_name_in_owner = true
+layout_mode = 2
+autowrap_mode = 3
+theme_override_colors/font_color = Color(0.55, 0.55, 0.62, 1)
+theme_override_font_sizes/font_size = 10
+text = ""
+
+[node name="FrameViewportPanel" type="PanelContainer" parent="Background/RootMargin/RootVBox/Tabs/Frame/FrameVBox"]
+layout_mode = 2
+theme_override_styles/panel = SubResource("section_bg")
+
+[node name="FrameViewportVBox" type="VBoxContainer" parent="Background/RootMargin/RootVBox/Tabs/Frame/FrameVBox/FrameViewportPanel"]
+layout_mode = 2
+theme_override_constants/separation = 4
+
+[node name="FrameViewportTitle" type="Label" parent="Background/RootMargin/RootVBox/Tabs/Frame/FrameVBox/FrameViewportPanel/FrameViewportVBox"]
+layout_mode = 2
+theme_override_colors/font_color = Color(0.75, 0.78, 1, 1)
+theme_override_font_sizes/font_size = 13
+text = "Cost Per Viewport"
+
+[node name="FrameViewportHint" type="Label" parent="Background/RootMargin/RootVBox/Tabs/Frame/FrameVBox/FrameViewportPanel/FrameViewportVBox"]
+layout_mode = 2
+autowrap_mode = 3
+theme_override_colors/font_color = Color(0.45, 0.45, 0.52, 1)
+theme_override_font_sizes/font_size = 10
+text = "The dash, every mirror and every camera render the world again into their own viewport. If one of these rivals main, that is where the frame went."
+
+[node name="FrameViewportTree" type="Tree" parent="Background/RootMargin/RootVBox/Tabs/Frame/FrameVBox/FrameViewportPanel/FrameViewportVBox"]
+unique_name_in_owner = true
+custom_minimum_size = Vector2(0, 180)
+layout_mode = 2
+theme_override_font_sizes/font_size = 11
+columns = 3
+hide_root = true

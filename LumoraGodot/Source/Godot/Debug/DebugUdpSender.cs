@@ -58,8 +58,13 @@ public class DebugUdpSender : IDisposable
         string worldName, int slots, int components, int users,
         long gcMemBytes, long videoMemBytes, int godotObjects, int godotNodes)
     {
+        // worldName is the one user-authored string in this packet and was the only one going in raw.
+        // '|' is the field separator, so a world called "Bob | Test" shifted every field after it: slot
+        // count read the world name's tail, component count read the slot count, and so on down the
+        // line. The receiver only checks the field COUNT, so nothing rejected it - the tab just showed
+        // confident nonsense. -xlinka
         Send($"PERF|{fps:F1}|{frameTime:F2}|{renderTime:F2}|{physicsTime:F2}" +
-             $"|{worldName}|{slots}|{components}|{users}" +
+             $"|{SanitizeField(worldName)}|{slots}|{components}|{users}" +
              $"|{gcMemBytes}|{videoMemBytes}|{godotObjects}|{godotNodes}");
     }
 
@@ -166,13 +171,124 @@ public class DebugUdpSender : IDisposable
             .Replace(';', ',');
     }
 
+    // One frame's full cost breakdown: the six world phases plus the late pass, alongside what the
+    // renderer charged for the same frame. This is the packet that answers "what is eating my frame",
+    // which nothing before it could - the world phases were computed every frame and thrown away, and
+    // the old PERF frame time was not a measurement at all, just 1000/fps off a rounded replicated
+    // value. Everything here is measured. -xlinka
+    //
+    // Draw calls arrive split by PASS (visible / shadow / canvas) because "12000 draw calls" and "9000
+    // of them are the shadow pass" are completely different problems with completely different fixes.
+    // Viewports arrive separately for the same reason: the dash, every mirror and every camera render
+    // the world again, and a single global number cannot say which one is doing it.
+    public void SendFrame(in FramePacket f)
+    {
+        var sb = new StringBuilder(1024);
+        sb.Append("FRAM");
+        void N(double v) => sb.Append('|').Append(v.ToString("F3", CultureInfo.InvariantCulture));
+        void L(long v) => sb.Append('|').Append(v.ToString(CultureInfo.InvariantCulture));
+
+        N(f.CpuFrameMs);
+        N(f.WorldTotalMs); N(f.SyncMs); N(f.PreMs); N(f.CompMs); N(f.ChangeMs); N(f.HooksMs); N(f.EndMs); N(f.LateMs);
+        N(f.RenderCpuMs); N(f.RenderGpuMs); N(f.FrameSetupCpuMs);
+        N(f.EngineInputMs); N(f.EngineCoroutinesMs); N(f.EngineFixedMs); N(f.EngineAssetsMs);
+        N(f.HostNetworkMs); N(f.HostEngineMs); N(f.HostTailMs);
+        L(f.DrawsVisible); L(f.DrawsShadow); L(f.DrawsCanvas);
+        L(f.ObjectsVisible); L(f.ObjectsShadow);
+        L(f.GpuTextureBytes); L(f.GpuBufferBytes); L(f.GpuTotalBytes);
+        L(f.OrphanNodes); L(f.StaticMemBytes);
+        L(f.PhysicsActiveObjects); L(f.PhysicsCollisionPairs); L(f.PhysicsIslands);
+        // Pipeline compilations are the shader-stutter tell: a nonzero count mid-session means the
+        // driver stopped to compile something, which reads as a hitch nothing else in the profile
+        // explains. Zero on a warm frame is the healthy answer.
+        L(f.PipeCanvas); L(f.PipeMesh); L(f.PipeSurface); L(f.PipeDraw); L(f.PipeSpecialization);
+        L(f.DriverAllocationCount); L(f.DriverTotalMemBytes);
+
+        sb.Append('|');
+        bool first = true;
+        foreach (var entry in f.HookCosts)
+        {
+            if (!first) sb.Append(',');
+            first = false;
+            sb.Append(SanitizeField(entry.Name)).Append(':')
+              .Append(entry.Ms.ToString("F4", CultureInfo.InvariantCulture)).Append(':')
+              .Append(entry.Count.ToString(CultureInfo.InvariantCulture));
+        }
+
+        sb.Append('|');
+        first = true;
+        foreach (var viewport in f.Viewports)
+        {
+            if (!first) sb.Append(';');
+            first = false;
+            sb.Append(NetField(viewport.Name)).Append('~')
+              .Append(viewport.Draws.ToString(CultureInfo.InvariantCulture)).Append('~')
+              .Append(viewport.GpuMs.ToString("F3", CultureInfo.InvariantCulture)).Append('~')
+              .Append(viewport.CpuMs.ToString("F3", CultureInfo.InvariantCulture));
+        }
+
+        sb.Append('|').Append(SanitizeField(f.PerfReport ?? string.Empty));
+
+        Send(sb.ToString());
+    }
+
+    public readonly struct FrameViewport
+    {
+        public FrameViewport(string name, long draws, double gpuMs, double cpuMs)
+        {
+            Name = name; Draws = draws; GpuMs = gpuMs; CpuMs = cpuMs;
+        }
+        public string Name { get; }
+        public long Draws { get; }
+        public double GpuMs { get; }
+        public double CpuMs { get; }
+    }
+
+    // Grouped into a struct because the argument list had passed the point where a caller could get the
+    // order right by reading it.
+    public struct FramePacket
+    {
+        public double CpuFrameMs;
+        public double WorldTotalMs, SyncMs, PreMs, CompMs, ChangeMs, HooksMs, EndMs, LateMs;
+        public double RenderCpuMs, RenderGpuMs, FrameSetupCpuMs;
+        public double EngineInputMs, EngineCoroutinesMs, EngineFixedMs, EngineAssetsMs;
+        public double HostNetworkMs, HostEngineMs, HostTailMs;
+        public long DrawsVisible, DrawsShadow, DrawsCanvas, ObjectsVisible, ObjectsShadow;
+        public long GpuTextureBytes, GpuBufferBytes, GpuTotalBytes;
+        public long OrphanNodes, StaticMemBytes;
+        public long PhysicsActiveObjects, PhysicsCollisionPairs, PhysicsIslands;
+        public long PipeCanvas, PipeMesh, PipeSurface, PipeDraw, PipeSpecialization;
+        public long DriverAllocationCount, DriverTotalMemBytes;
+        public string? PerfReport;
+        public IEnumerable<(string Name, double Ms, int Count)> HookCosts;
+        public IEnumerable<FrameViewport> Viewports;
+    }
+
+    // UDP datagram ceiling with headroom. Anything past this cannot be delivered at all.
+    private const int MaxDatagramBytes = 65000;
+
     private void Send(string message)
     {
         try
         {
             var bytes = Encoding.UTF8.GetBytes(message);
-            if (bytes.Length <= 65000)
+            if (bytes.Length <= MaxDatagramBytes)
+            {
                 _client.Send(bytes, bytes.Length, _endpoint);
+                return;
+            }
+
+            // An oversize packet used to vanish here with no trace at all, so a tab would quietly stop
+            // updating and the only symptom was stale numbers that still looked plausible. The list
+            // packets (MEM, PROF, NET) are the ones that can grow, and they grow exactly when a session
+            // gets big - which is when someone is most likely to be profiling it.
+            //
+            // A marker rather than a log call, because Send is what Logger.OnLogWritten calls: logging
+            // from in here would recurse straight back into itself. -xlinka
+            int split = message.IndexOf('|');
+            string prefix = split > 0 ? message.Substring(0, split) : "?";
+            var marker = Encoding.UTF8.GetBytes($"DROP|{prefix}|{bytes.Length}");
+            _client.Send(marker, marker.Length, _endpoint);
         }
         catch { /* fire and forget */ }
     }
