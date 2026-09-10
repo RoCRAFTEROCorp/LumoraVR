@@ -60,7 +60,16 @@ public class AvatarIK : Component, IAvatarEquipReceiver, IInputUpdateReceiver
     public readonly Sync<float> BendGoalWeight = null!;
     public readonly Sync<float> TwistRelax = null!;
     public readonly Sync<float> WristBendInfluence = null!; // 0..1 tracked wrist roll steering the elbow pole
+    public readonly Sync<float> WristBendDeadZone = null!;  // deg of wrist roll ignored before it steers the elbow
     public readonly Sync<float> ChestFollowHands = null!;   // 0..1 chest yaw toward tracked hands
+    // Elbow swivel from the hand's position in the shoulder frame (degrees; see FullBodyIKSolver.SwivelBase).
+    // Offset is the per-avatar trim: a rig whose elbows read too tucked or too flared gets a few degrees here.
+    [Group("Elbow Swivel")]
+    public readonly Sync<float> SwivelOffset = null!;       // deg added to every computed elbow swivel, default 0
+    public readonly Sync<float> SwivelBase = null!;         // deg at shoulder height, arm half-extended
+    public readonly Sync<float> SwivelHeightGain = null!;   // deg per arm-reach of hand height above the shoulder
+    public readonly Sync<float> SwivelReachGain = null!;    // deg per arm-reach the hand is pulled in toward the chest
+    public readonly Sync<float> SwivelOutwardGain = null!;  // deg per arm-reach of cross-body travel
     [Group("Idle Motion")]
     public readonly Sync<float> IdleBreathing = null!;      // 0..2 chest breathing amount
     public readonly Sync<float> IdleSway = null!;           // 0..2 standing weight-shift sway amount
@@ -320,12 +329,21 @@ public class AvatarIK : Component, IAvatarEquipReceiver, IInputUpdateReceiver
         ShoulderPitchDown.Value = 14f;
         ArmLift.Value = 26f;
         ArmStretch.Value = 1.08f;
-        BendGoalWeight.Value = 0.5f;
+        // 1: a bend goal is an elbow/knee tracker and decides the swivel. 0.5 only ever gave a tracker half a vote.
+        BendGoalWeight.Value = 1f;
         TwistRelax.Value = 0.5f;
         WristBendInfluence.Value = 0.5f;
+        WristBendDeadZone.Value = 40f;
         ChestFollowHands.Value = 0.2f;
+        SwivelOffset.Value = 0f;
+        SwivelBase.Value = 35f;
+        SwivelHeightGain.Value = 75f;
+        SwivelReachGain.Value = 60f;
+        SwivelOutwardGain.Value = 50f;
         IdleBreathing.Value = 1f;
-        IdleSway.Value = 1f;
+        // Off. The standing weight-shift read as a constant wiggle on a worn avatar rather than as life,
+        // and the hand drift that went with it is gone entirely. Still here to turn back up per avatar.
+        IdleSway.Value = 0f;
         WalkArmSwing.Value = 0.7f;
         HandIKWeight.Value = 1f;
         FootIKWeight.Value = 1f;
@@ -565,7 +583,13 @@ public class AvatarIK : Component, IAvatarEquipReceiver, IInputUpdateReceiver
         _solver.BendGoalWeight = BendGoalWeight.Value;
         _solver.TwistRelax = TwistRelax.Value;
         _solver.WristBendInfluence = System.Math.Clamp(WristBendInfluence.Value, 0f, 1f);
+        _solver.WristBendDeadZone = System.Math.Clamp(WristBendDeadZone.Value, 0f, 120f) * deg2rad;
         _solver.ChestFollowHands = System.Math.Clamp(ChestFollowHands.Value, 0f, 1f);
+        _solver.SwivelOffset = System.Math.Clamp(SwivelOffset.Value, -90f, 90f) * deg2rad;
+        _solver.SwivelBase = SwivelBase.Value * deg2rad;
+        _solver.SwivelHeightGain = SwivelHeightGain.Value * deg2rad;
+        _solver.SwivelReachGain = SwivelReachGain.Value * deg2rad;
+        _solver.SwivelOutwardGain = SwivelOutwardGain.Value * deg2rad;
         _solver.TimeSeconds = (float)(World?.Time.TotalTime ?? 0.0);
         _solver.IdleWeight = _idleWeight;
         _solver.BreathingWeight = System.Math.Clamp(IdleBreathing.Value, 0f, 2f);
@@ -585,9 +609,7 @@ public class AvatarIK : Component, IAvatarEquipReceiver, IInputUpdateReceiver
         var userSlot = UserRoot.Target?.Slot;
         float3 locomotionBodyForward = ComputeBodyForward(userSlot, _headProxy.Target);
         var head = ResolveHeadTarget(userSlot, input);
-        float3 visualBodyForward = head.Valid
-            ? FlattenDir(head.Rotation * float3.Backward)
-            : locomotionBodyForward;
+        float3 visualBodyForward = UpdateBodyForwardReference(in head, locomotionBodyForward);
 
         // Pelvis target only counts when a waist/hip tracker is actually equipped; otherwise the
         // solver estimates the hips from the head (no calibration offset on the pelvis).
@@ -595,24 +617,90 @@ public class AvatarIK : Component, IAvatarEquipReceiver, IInputUpdateReceiver
             ? ProxyTarget(_pelvisProxy.Target, default)
             : default;
 
-        // Only pull a limb to its IK target when that body node is actually driven. On desktop, hand proxies sit at
-        // setup poses, so full weight would fold the avatar toward stale controller markers. - xlinka
+        // Only pull a limb to its IK target when that body node is actually driven. On desktop an idle hand
+        // proxy sits at a setup pose nothing is moving, so full weight would fold the avatar toward a stale
+        // controller marker. - xlinka
         float handW = System.Math.Clamp(HandIKWeight.Value, 0f, 1f);
-        var leftHandT = ProxyTarget(_leftHandProxy.Target, _leftHandOffset);
-        var rightHandT = ProxyTarget(_rightHandProxy.Target, _rightHandOffset);
+        // The proxy is only a valid source while OUR pose node owns the socket.
+        //
+        // An avatar that ships its own hand objects equips them into the hand sockets and displaces
+        // this solver's AvatarPoseDriver, so the proxy never moves again and sits at the avatar root.
+        // ProxyTarget still called that "valid" because the slot existed. In VR that meant the tracked
+        // controllers moved the SOCKET every frame while the IK aimed the arms at a dead proxy on the
+        // floor - hands did not follow the person at all. The socket's filtered pose is the same
+        // controller pose with the grip offset applied, which is exactly what the pose driver would have
+        // written into the proxy had it owned the socket. Read that instead whenever we do not. This
+        // generalises the hold-only patch from earlier: it applies to tracked hands, held tools, and
+        // everything else the same way. -xlinka
+        var leftHandT = HandTargetFor(BodyNode.LeftHand, _leftHandProxy.Target, _leftHandNode.Target, _leftHandOffset);
+        var rightHandT = HandTargetFor(BodyNode.RightHand, _rightHandProxy.Target, _rightHandNode.Target, _rightHandOffset);
         bool leftHandTracked = IsNodeTracked(input, BodyNode.LeftHand);
         bool rightHandTracked = IsNodeTracked(input, BodyNode.RightHand);
-        leftHandT.PositionWeight = leftHandT.RotationWeight = leftHandTracked ? handW : 0f;
-        rightHandT.PositionWeight = rightHandT.RotationWeight = rightHandTracked ? handW : 0f;
-        // Equipped elbow trackers steer the arm bend.
+        // A desktop hand holding a tool IS driven even though no hardware tracks it: HandTool moves the
+        // controller body node to a hold pose in front of the head, so the proxy hanging off it carries a
+        // real target and the arm has somewhere to go. Weighting by the hand tool's own 0..1 blend rather
+        // than a bool means the arm rises and falls WITH the hand instead of snapping to full IK the
+        // instant a tool is equipped. Zero in VR, where the tracker gate above already answers. -xlinka
+        RefreshHandTools();
+        float leftHoldW = HoldWeightOf(_leftHandTool);
+        float rightHoldW = HoldWeightOf(_rightHandTool);
+        // A hold may only weight a hand whose PROXY IS ACTUALLY BEING DRIVEN.
+        //
+        // The hand target is the proxy slot, moved by an AvatarPoseDriver equipped into the hand socket.
+        // When that node is not equipped - the avatar's own hand object can take the socket instead - the
+        // proxy never moves and sits at the avatar root, on the FLOOR. That was harmless while an
+        // untracked desktop hand carried PositionWeight 0. The tool hold raised it to 1, so the solver
+        // began faithfully hauling the arm toward a target at Y=0: measured targetW=(0.805, 0.001, -0.936)
+        // against a hand bone at Y=0.758, miss=0.762. The arm was not folding wrong, it was reaching for
+        // the ground. Never weight a target nothing is writing. -xlinka
+        // When our own pose node lost the socket, take the target from the SOCKET SLOT itself.
+        //
+        // An avatar that ships its own hand objects equips them into the hand sockets, which displaces
+        // this solver's pose node - Chiki equips four objects, Root/Head/LeftHand/RightHand, and takes
+        // both hands. The proxy then never moves and reports the avatar root, on the floor. Reading the
+        // socket slot directly is not a workaround: the socket is a child of the controller body node
+        // that HandTool writes the hold pose onto, so it is the same pose one link earlier, and it is
+        // live whoever owns the socket. -xlinka
+        // The hold no longer needs its own socket fallback: HandTargetFor above already sources from
+        // the socket whenever our pose node does not own it, tracked or held alike.
+
+        leftHandT.PositionWeight = leftHandT.RotationWeight = leftHandTracked ? handW : handW * leftHoldW;
+        rightHandT.PositionWeight = rightHandT.RotationWeight = rightHandTracked ? handW : handW * rightHoldW;
+        // Hand the far end of the chain back to the tool that asked for it, so its TOOLHOLD trace can say
+        // whether the arm was actually weighted or the request died somewhere in between. -xlinka
+        _leftHandTool?.ReportIKHandWeight(leftHandT.PositionWeight);
+        _rightHandTool?.ReportIKHandWeight(rightHandT.PositionWeight);
+
+        // TARGET vs BONE, both in world space, at the same instant.
+        //
+        // Three separate bugs have been indistinguishable from a screenshot: the target being wrong, the
+        // bone failing to reach a correct target, and both being right while the avatar's scale makes it
+        // look wrong. Three edits in a row failed to move this arm because I kept assuming the target was
+        // correct and the solver was at fault without ever comparing them. Print both. -xlinka
+        // BOTH hands, every time either is holding. Which arm actually moves is the open question, and a
+        // one-sided log cannot answer it: if the right-hand tool drives a bone sitting on the avatar's
+        // left, that is a mirrored rig and only a side-by-side comparison shows it. -xlinka
+        // Equipped elbow trackers steer the arm bend. A desktop hand holding a tool gets NO synthetic goal any
+        // more: the solver derives the elbow swivel from the hand's position in the shoulder frame, which is the
+        // rule a held tool needed (elbow down and a little out for a hand at chest height). The old stopgap here
+        // built a goal below-and-outside the shoulder and handed it to a 0.5-weight position lerp, so it only ever
+        // moved the elbow halfway and was logged BEFORE it ran, which is why every ARMDIAG line said
+        // bendGoal=False whether or not it fired. -xlinka
         ApplyBendGoal(ref leftHandT, _leftElbowProxy, _leftElbowNode);
         ApplyBendGoal(ref rightHandT, _rightElbowProxy, _rightElbowNode);
+
+        // Logged AFTER the goals are attached so bendGoal= is what the solver will actually see. The swivel
+        // fields are from the PREVIOUS solve (the bone positions in the same line are too). -xlinka
+        float holdAny = MathF.Max(leftHoldW, rightHoldW);
+        LogArmDiagnostic("Left", in leftHandT, BodyNode.LeftHand, holdAny, leftHoldW, _solver.LeftArmPole);
+        LogArmDiagnostic("Right", in rightHandT, BodyNode.RightHand, holdAny, rightHoldW, _solver.RightArmPole);
+        LogHandSeparation(holdAny);
 
         // Feet count as DRIVEN when a tracker is live OR procedural locomotion is on - the gait writes a
         // valid ground-planted target into the foot proxy every frame, so that target should be used.
         // Only TRULY undriven feet drop to rest weight 0; otherwise the avatar floats (the plants get
-        // computed in UpdateProceduralFeet then thrown away by a hardware-only gate). Hands have no such
-        // driver, so they stay gated on real tracking. -xlinka
+        // computed in UpdateProceduralFeet then thrown away by a hardware-only gate). The hands' equivalent
+        // driver is the desktop tool hold handled just above. -xlinka
         float footW = System.Math.Clamp(FootIKWeight.Value, 0f, 1f);
         bool leftFootTrackedInput = IsNodeTracked(input, BodyNode.LeftFoot);
         bool rightFootTrackedInput = IsNodeTracked(input, BodyNode.RightFoot);
@@ -681,7 +769,252 @@ public class AvatarIK : Component, IAvatarEquipReceiver, IInputUpdateReceiver
                 : userSlot != null && !userSlot.IsDestroyed ? userSlot.GlobalPosition.y : (float?)null)
             : null;
 
+        LogPoseDiagnostics(head, leftHandT, rightHandT, leftFootT, rightFootT);
+
         _solver.Solve(head, pelvis, leftHandT, rightHandT, leftFootT, rightFootT);
+    }
+
+    private bool _poseDiagLogged;
+
+    // One block, once, the first time this avatar is actually solved.
+    //
+    // A body that comes out crumpled is a body whose targets are closer to it than its own limbs are
+    // long: the chain has nowhere to go but fold. That is invisible from a screenshot and obvious from
+    // two numbers, so print them - the reach of each chain against the distance its target actually
+    // sits at. Anything where target is far below reach is what is doing the folding. -xlinka
+    private void LogPoseDiagnostics(in FullBodyIKSolver.Target head, in FullBodyIKSolver.Target leftHand,
+        in FullBodyIKSolver.Target rightHand, in FullBodyIKSolver.Target leftFoot, in FullBodyIKSolver.Target rightFoot)
+    {
+        if (_poseDiagLogged)
+            return;
+        _poseDiagLogged = true;
+
+        var rig = Rig.Target;
+        if (rig == null || rig.IsDestroyed || Slot == null)
+            return;
+
+        float scale = Slot.GlobalScale.x;
+        float userHeight = Engine.Current?.InputInterface?.UserHeight ?? 0f;
+
+        LumoraLogger.Log(
+            $"AvatarIK[pose-diag] '{Slot.SlotName.Value}': avatarHeight={AvatarHeight.Value:F3} "
+            + $"userHeight={userHeight:F3} rootScale={scale:F3} forceTpose={ForceTpose.Value}");
+
+        // What the solver believes the rest pose is. A digitigrade leg is a DEEP zigzag: its chain is far
+        // longer than the hips are high, and the foot bone sits well above the sole. If the clearances
+        // come back at zero, or the stand height is close to the leg's full chain length, the pose it
+        // captured as rest was not the bind pose and every limb derives from a straightened leg.
+        var hips = rig.TryGetBone(BodyNode.Hips);
+        float soleY = TryFootBoneY(rig, out float sy) ? sy : 0f;
+        float hipsY = hips != null && !hips.IsDestroyed ? Slot.GlobalPointToLocal(hips.GlobalPosition).y : 0f;
+        float footBoneY = FirstBoneLocalY(rig, BodyNode.LeftFoot);
+        float toeBoneY = FirstBoneLocalY(rig, BodyNode.LeftToes);
+        LumoraLogger.Log(
+            $"AvatarIK[pose-diag]   rest   standHeight={_solver.RestStandHeight:F3} headHeight={_solver.RestHeadHeight:F3} "
+            + $"clearance L={_solver.LeftFootGroundClearance:F3} R={_solver.RightFootGroundClearance:F3}");
+        LumoraLogger.Log(
+            $"AvatarIK[pose-diag]   local  hipsY={hipsY:F3} footY={footBoneY:F3} toeY={toeBoneY:F3} soleY={soleY:F3} "
+            + $"(hips above sole = {hipsY - soleY:F3})");
+
+        // Which of the three possible hand faults it is. An arm dragged somewhere silly, a wrist rolled
+        // the wrong way, or fingers posed by a model that assumed a human hand frame - they look similar
+        // in a screenshot and are three different fixes.
+        LogHand("handL", BodyNode.LeftHand, _leftHandNode.Target, _leftHandProxy.Target, _leftHandOffset);
+        LogHand("handR", BodyNode.RightHand, _rightHandNode.Target, _rightHandProxy.Target, _rightHandOffset);
+
+        // Which way this body thinks it faces, from every source that has an opinion.
+        //
+        // Four of them, and they must agree: the axis their own rig file authored, the one we derive
+        // from bone geometry, the avatar root's own forward, and what the solver is actually driving the
+        // gait with. A body that walks backwards wrong is a body where one of these is opposite the
+        // others, and the guess is the fragile one - it reads the LABELLED left-to-right arm line, so an
+        // arm frozen mid-gesture skews it.
+        var rigAxis = rig.ForwardAxis.Value;
+        var guess = rig.GuessForwardAxis();
+        var rootFwd = Slot.GlobalRotation * float3.Backward;
+
+        // The angle AlignAvatarFacing measures. Near zero means the root already faces the body; near a
+        // hundred and eighty means the frame is backwards and the gait drives every step the wrong way.
+        float guessVsRoot = float.NaN;
+        if (guess.HasValue)
+        {
+            var a = guess.Value; a.y = 0f;
+            var b = rootFwd; b.y = 0f;
+            if (a.LengthSquared > 1e-6f && b.LengthSquared > 1e-6f)
+                guessVsRoot = MathF.Acos(System.Math.Clamp(float3.Dot(a.Normalized, b.Normalized), -1f, 1f)) * (180f / MathF.PI);
+        }
+
+        LumoraLogger.Log(
+            $"AvatarIK[pose-diag]   fwd    rigAxis={(rigAxis.HasValue ? rigAxis.Value.ToString() : "<unset>")} "
+            + $"guessLocal={(guess.HasValue ? Slot.GlobalDirectionToLocal(guess.Value).ToString() : "<null>")} "
+            + $"guessVsRoot={guessVsRoot:F1}deg signFlip={_solver.ForwardSignFlip}");
+        LumoraLogger.Log(
+            $"AvatarIK[pose-diag]   fwd    solverRest={Slot.GlobalDirectionToLocal(_solver.RestBodyForward)} "
+            + $"solverNow={Slot.GlobalDirectionToLocal(_solver.CurrentBodyForward)}");
+
+        LogEveryBone(rig);
+
+        LogChain("spine", BodyNode.Hips, head, new[] { BodyNode.Hips, BodyNode.Spine, BodyNode.Chest, BodyNode.Neck, BodyNode.Head });
+        LogChain("armL", BodyNode.LeftUpperArm, leftHand, new[] { BodyNode.LeftUpperArm, BodyNode.LeftLowerArm, BodyNode.LeftHand });
+        LogChain("armR", BodyNode.RightUpperArm, rightHand, new[] { BodyNode.RightUpperArm, BodyNode.RightLowerArm, BodyNode.RightHand });
+        LogChain("legL", BodyNode.LeftUpperLeg, leftFoot, new[] { BodyNode.LeftUpperLeg, BodyNode.LeftLowerLeg, BodyNode.LeftFoot });
+        LogChain("legR", BodyNode.RightUpperLeg, rightFoot, new[] { BodyNode.RightUpperLeg, BodyNode.RightLowerLeg, BodyNode.RightFoot });
+
+        void LogHand(string label, BodyNode handNode, AvatarPoseDriver? node, Slot? proxy, in ReferenceOffset offset)
+        {
+            var bone = rig.TryGetBone(handNode);
+            bool driven = node?.IsEquippedAndActive ?? false;
+            string proxyText = proxy != null && !proxy.IsDestroyed
+                ? $"{Slot.GlobalPointToLocal(proxy.GlobalPosition)}"
+                : "<none>";
+
+            // How far the grip frame we DERIVED sits from the hand bone's own frame. A few degrees is
+            // an authored wrist; ninety is a grip built off a thumb that is not where the model expects.
+            float twist = float.NaN;
+            if (bone != null && !bone.IsDestroyed && offset.Valid)
+            {
+                var relative = offset.LocalRotation;
+                twist = 2f * MathF.Acos(System.Math.Clamp(MathF.Abs(relative.w), 0f, 1f)) * (180f / MathF.PI);
+            }
+
+            LumoraLogger.Log(
+                $"AvatarIK[pose-diag]   {label,-6} driven={driven} gripTwist={twist:F1}deg proxyLocal={proxyText}");
+
+            var fingerDriver = bone?.GetComponent<HandPoseDriver>();
+            if (fingerDriver != null)
+                LumoraLogger.Log($"AvatarIK[pose-diag]   {label,-6} fingerDriver present, idlePose={fingerDriver.IdlePose.Target != null}");
+        }
+
+        void LogChain(string label, BodyNode rootNode, in FullBodyIKSolver.Target target, BodyNode[] chain)
+        {
+            var rootBone = rig.TryGetBone(rootNode);
+            if (rootBone == null || rootBone.IsDestroyed)
+            {
+                LumoraLogger.Log($"AvatarIK[pose-diag]   {label,-6} no root bone");
+                return;
+            }
+
+            float reach = 0f;
+            Slot? previous = null;
+            foreach (var node in chain)
+            {
+                var bone = rig.TryGetBone(node);
+                if (bone == null || bone.IsDestroyed)
+                    continue;
+                if (previous != null)
+                    reach += (bone.GlobalPosition - previous.GlobalPosition).Length;
+                previous = bone;
+            }
+
+            float distance = (target.Position - rootBone.GlobalPosition).Length;
+            LumoraLogger.Log(
+                $"AvatarIK[pose-diag]   {label,-6} reach={reach:F3} targetAt={distance:F3} "
+                + $"({(reach > 0.0001f ? distance / reach : 0f):P0} of reach) weight={target.PositionWeight:F2}");
+        }
+    }
+
+    // BODY FORWARD REFERENCE
+    //
+    // The avatar's torso does not point where the head points, and pinning it there is the single
+    // biggest reason our IK read as stiff next to other platforms: turn the view and the whole body
+    // snapped round with it, so there was never any neck twist to see, and the shoulders swung on every
+    // flick of the mouse. A real body TRAILS the head, up to about a shoulder's worth of twist, and only
+    // gives up and turns once the head has gone far enough round that the neck runs out.
+    //
+    // Four parts, in order:
+    //   1. A reference direction from the head. Straight up or straight down, the head's forward has no
+    //      yaw left to flatten, so blend toward the head's UP axis by how vertical the head has got -
+    //      otherwise looking at your feet spins the body on whatever numerical noise survives.
+    //   2. Trail limit: the body may sit up to MaxNeckTwist away from that reference and no further.
+    //   3. Hysteresis, which is what makes it read as a body rather than a spring. Below the START
+    //      threshold nothing happens at all - small look-arounds leave the torso completely still. Once
+    //      it commits it keeps turning until it is within the STOP threshold. Standing, the head can go
+    //      a long way (60 degrees) before the body bothers; walking, it gives up almost at once (15).
+    //   4. Under movement the reference is pulled toward the direction of travel by speed, so walking
+    //      sideways or backwards turns the body to face the way you are going.
+    // -xlinka
+    private float3 _bodyForwardRef = float3.Backward;
+    private bool _bodyForwardTurning;
+    private bool _bodyForwardValid;
+
+    private const float MaxNeckTwist = 80f * (MathF.PI / 180f);
+    private const float TurnStartStanding = 60f * (MathF.PI / 180f);
+    private const float TurnStartMoving = 15f * (MathF.PI / 180f);
+    private const float TurnStopStanding = 2f * (MathF.PI / 180f);
+    private const float TurnStopMoving = 0.5f * (MathF.PI / 180f);
+    private const float BodyForwardRate = 6f;
+    private const float MovingSpeed = 0.5f;
+    private const float FullTurnSpeed = 1f;
+
+    private float3 UpdateBodyForwardReference(in FullBodyIKSolver.Target head, float3 fallback)
+    {
+        if (!head.Valid)
+            return _bodyForwardValid ? _bodyForwardRef : fallback;
+
+        // 1. Reference from the head, vertical-look safe.
+        float3 fwd = head.Rotation * float3.Backward;
+        float3 up = head.Rotation * float3.Up;
+        float vertical = MathF.Abs(float3.Dot(up, float3.Up));
+        float3 reference = FlattenDir(float3.Lerp(float3.Dot(fwd, float3.Up) > 0f ? -up : up, fwd, vertical));
+        if (reference.LengthSquared < 1e-6f)
+            reference = _bodyForwardValid ? _bodyForwardRef : FlattenDir(fallback);
+        if (reference.LengthSquared < 1e-6f)
+            return fallback;
+        reference = reference.Normalized;
+
+        if (!_bodyForwardValid)
+        {
+            _bodyForwardRef = reference;
+            _bodyForwardValid = true;
+            return _bodyForwardRef;
+        }
+
+        // 4. Bias toward travel while actually travelling.
+        // The gait's own smoothed body velocity, one frame old at worst. Reusing it keeps the torso, the
+        // step prediction and the arm swing all agreeing about how fast the avatar is actually moving.
+        float speed = _smoothedGaitVel.Length;
+        float3 travel = FlattenDir(_smoothedGaitVel);
+        if (speed > 1e-3f && travel.LengthSquared > 1e-6f)
+        {
+            // Only bias toward travel that agrees with where the body already faces.
+            //
+            // Walking backwards is not a reason to spin the torso: a person stepping back keeps facing
+            // forward. Blending the reference onto a reversed travel vector turned the avatar a full
+            // hundred and eighty degrees the moment it picked up speed, which reads exactly like the body
+            // flipping round. Weighting by the alignment leaves a forward walk fully biased, gives a
+            // strafe a partial turn - which is what a real body does - and leaves a backward step alone.
+            // -xlinka
+            float3 travelDir = travel.Normalized;
+            float align = float3.Dot(travelDir, reference);
+            if (align > 0f)
+            {
+                float blend = System.Math.Clamp(speed / FullTurnSpeed, 0f, 1f) * align;
+                float3 mixed = FlattenDir(float3.Lerp(reference, travelDir, blend));
+                if (mixed.LengthSquared > 1e-6f)
+                    reference = mixed.Normalized;
+            }
+        }
+
+        // 3. Hysteresis.
+        bool moving = speed >= MovingSpeed;
+        float offBy = float3.Angle(reference, _bodyForwardRef);
+        if (offBy > (moving ? TurnStartMoving : TurnStartStanding))
+            _bodyForwardTurning = true;
+        else if (offBy < (moving ? TurnStopMoving : TurnStopStanding))
+            _bodyForwardTurning = false;
+
+        if (_bodyForwardTurning)
+        {
+            float dt = (float)(World?.Time.Delta ?? (1.0 / 60.0));
+            float t = System.Math.Clamp(BodyForwardRate * dt, 0f, 1f);
+            float3 stepped = FlattenDir(float3.Lerp(_bodyForwardRef, reference, t));
+            if (stepped.LengthSquared > 1e-6f)
+                _bodyForwardRef = stepped.Normalized;
+        }
+
+        // 2. Trail limit, applied last so it is never violated no matter what the steps above did.
+        _bodyForwardRef = float3.LimitSwing(_bodyForwardRef, reference, MaxNeckTwist).Normalized;
+        return _bodyForwardRef;
     }
 
     private static float3 ComputeBodyForward(Slot? userSlot, Slot? headSlot)
@@ -696,10 +1029,16 @@ public class AvatarIK : Component, IAvatarEquipReceiver, IInputUpdateReceiver
 
     private FullBodyIKSolver.Target ResolveHeadTarget(Slot? userSlot, InputInterface? input)
     {
-        var proxy = ViewProxyTarget(_headProxy.Target, _viewOffset);
         var directHeadSlot = UserRoot.Target?.HeadSlot;
         var direct = ViewProxyTarget(directHeadSlot, _viewOffset);
         bool hardwareHead = input?.HeadDevice?.IsTracked == true;
+
+        // Same ownership rule as the hands. The desktop branch below already preferred the direct head
+        // slot when the proxy read too low; VR trusted the proxy unconditionally, so a headset-tracked
+        // person wearing an avatar with its own head object had the IK aim at a dead proxy while the
+        // head slot moved with the headset. -xlinka
+        bool headProxyOwned = _headNode.Target?.IsEquippedAndActive ?? false;
+        var proxy = headProxyOwned ? ViewProxyTarget(_headProxy.Target, _viewOffset) : default;
 
         FullBodyIKSolver.Target chosen = proxy.Valid ? proxy : direct;
 
@@ -762,15 +1101,180 @@ public class AvatarIK : Component, IAvatarEquipReceiver, IInputUpdateReceiver
     }
 
     // True only when a body node has a LIVE tracked source (VR controller/tracker). Desktop hands/feet have no
-    // tracker, so this is false and their IK weight drops to 0 (rest pose) instead of folding the avatar. -xlinka
+    // tracker, so this is false. An undriven limb then takes IK weight 0 (rest pose) instead of folding the
+    // avatar toward a marker nothing is moving; the callers decide what else counts as driven (procedural
+    // feet, a desktop tool hold). -xlinka
     private static bool IsNodeTracked(Lumora.Core.Input.InputInterface? input, BodyNode node)
     {
         var device = input?.GetBodyNode(node);
         return device != null && device.IsTracking;
     }
 
+    // The two hand tools on this avatar's user, so the solve can ask how far each hand is into a desktop
+    // tool hold. Cached, and re-scanned at most once a second while unresolved - an avatar that has no
+    // user (a prop standing in the world) would otherwise walk its whole tree every frame for nothing.
+    // -xlinka
+    private Interaction.HandTool? _leftHandTool;
+    private Interaction.HandTool? _rightHandTool;
+    private double _nextHandToolScan;
+
+    private static float HoldWeightOf(Interaction.HandTool? tool)
+        => tool != null && !tool.IsDestroyed ? System.Math.Clamp(tool.HoldWeight, 0f, 1f) : 0f;
+
+    private void RefreshHandTools()
+    {
+        bool leftOk = _leftHandTool != null && !_leftHandTool.IsDestroyed;
+        bool rightOk = _rightHandTool != null && !_rightHandTool.IsDestroyed;
+        if (leftOk && rightOk)
+            return;
+
+        double now = World?.Time.TotalTime ?? 0.0;
+        if (now < _nextHandToolScan)
+            return;
+        _nextHandToolScan = now + 1.0;
+
+        var rootSlot = UserRoot.Target?.Slot;
+        if (rootSlot == null || rootSlot.IsDestroyed)
+            return;
+
+        if (!leftOk)
+            _leftHandTool = rootSlot.GetComponentInChildren<Interaction.HandTool>(
+                t => t.Side.Value == Lumora.Core.Input.Chirality.Left);
+        if (!rightOk)
+            _rightHandTool = rootSlot.GetComponentInChildren<Interaction.HandTool>(
+                t => t.Side.Value == Lumora.Core.Input.Chirality.Right);
+    }
+
     // If the bend-goal's pose node is tracked (e.g. an elbow/knee tracker), feed its proxy position
     // to the solver so the limb bends toward it.
+    private static bool TryTargetFromSocket(ref FullBodyIKSolver.Target target, Slot? socket)
+    {
+        if (socket == null || socket.IsDestroyed)
+            return false;
+
+        target.Position = socket.GlobalPosition;
+        target.Rotation = socket.GlobalRotation;
+        return true;
+    }
+
+    // The LEFT-TO-RIGHT axis measured directly, with no assumed body axis.
+    //
+    // A derived "right" vector is exactly what made the previous reading useless: projecting a
+    // separation that lies along Z onto an axis pointing along X gave two nearly equal numbers and the
+    // false conclusion that both hands sat on the same side. The vector between the two shoulder bones
+    // IS the body's left-right axis, so measure against that and nothing else. Shoulders rather than
+    // hands because a raised hand moves and a shoulder does not. -xlinka
+    private double _sepLogAt;
+
+    private void LogHandSeparation(float gateWeight)
+    {
+        if (gateWeight <= 1e-3f)
+            return;
+        double now = World != null ? World.Time.TotalTime : 0.0;
+        if (now - _sepLogAt < 2.0)
+            return;
+
+        var rig = Rig.Target;
+        if (rig == null || rig.IsDestroyed)
+            return;
+
+        var lUpper = rig.TryGetBone(BodyNode.LeftUpperArm);
+        var rUpper = rig.TryGetBone(BodyNode.RightUpperArm);
+        var lHand = rig.TryGetBone(BodyNode.LeftHand);
+        var rHand = rig.TryGetBone(BodyNode.RightHand);
+        if (lUpper == null || rUpper == null || lHand == null || rHand == null)
+        {
+            LumoraLogger.Log("HANDSEP: one or more arm bones unmapped "
+                           + $"(lUpper={lUpper != null} rUpper={rUpper != null} lHand={lHand != null} rHand={rHand != null})");
+            _sepLogAt = now;
+            return;
+        }
+
+        // Shoulder axis: from the RIGHT shoulder to the LEFT one. On a correct rig the left hand lies on
+        // the positive side of it and the right hand on the negative side.
+        float3 axis = lUpper.GlobalPosition - rUpper.GlobalPosition;
+        axis.y = 0f;
+        float shoulderSpan = axis.Length;
+        if (shoulderSpan < 1e-4f)
+        {
+            LumoraLogger.Log($"HANDSEP: shoulders coincide, span={shoulderSpan:F4} - the arms ARE mapped to one side");
+            _sepLogAt = now;
+            return;
+        }
+        axis = axis.Normalized;
+
+        float3 mid = (lUpper.GlobalPosition + rUpper.GlobalPosition) * 0.5f;
+        float lSide = float3.Dot(lHand.GlobalPosition - mid, axis);
+        float rSide = float3.Dot(rHand.GlobalPosition - mid, axis);
+
+        LumoraLogger.Log($"HANDSEP: shoulderSpan={shoulderSpan:F3} leftHandSide={lSide:F3} rightHandSide={rSide:F3} "
+                       + $"verdict={(lSide > 0f && rSide < 0f ? "CORRECT" : "MIRRORED-OR-SAME-SIDE")}");
+        _sepLogAt = now;
+    }
+
+    private string _armDiagLast = string.Empty;
+    private double _armDiagAt;
+
+    private void LogArmDiagnostic(string side, in FullBodyIKSolver.Target target, BodyNode handNode,
+        float gateWeight, float holdWeight, FullBodyIKSolver.PoleDebug pole)
+    {
+        if (gateWeight <= 1e-3f)
+            return;
+
+        var rig = Rig.Target;
+        if (rig == null || rig.IsDestroyed)
+            return;
+        var bone = rig.TryGetBone(handNode);
+        if (bone == null || bone.IsDestroyed)
+            return;
+
+        var bonePos = bone.GlobalPosition;
+        float miss = float3.Distance(bonePos, target.Position);
+        float scale = Slot != null && !Slot.IsDestroyed ? Slot.GlobalScale.x : 1f;
+
+        // Which SIDE of the body this bone is physically on, in the avatar's own frame. Positive is the
+        // avatar's right. A bone the right-hand tool drives that reports a negative side is mirrored.
+        // Measured from the HIPS, not the avatar root. The root is wherever equip parented the avatar and
+        // is under no obligation to sit on the body's centre line, so projecting from it can report both
+        // hands on the same side of a perfectly symmetric rig. The hips are the body's centre by
+        // definition. Measuring from the wrong origin has already produced two wrong conclusions
+        // tonight. -xlinka
+        float bodySide = 0f;
+        var hips = rig.TryGetBone(BodyNode.Hips) ?? rig.TryGetBone(BodyNode.Spine);
+        var bodyRoot = Slot;
+        if (hips != null && !hips.IsDestroyed && bodyRoot != null && !bodyRoot.IsDestroyed)
+        {
+            var r = bodyRoot.GlobalRotation * float3.Right;
+            r.y = 0f;
+            if (r.LengthSquared > 1e-6f)
+                bodySide = float3.Dot(bonePos - hips.GlobalPosition, r.Normalized);
+        }
+
+        // swivelDeg is the final elbow angle about the shoulder->hand axis (0 = base direction: down for a reach
+        // in front, back for a hang; positive = outward). handSwivelDeg is the hand-position term alone, so a gap
+        // between the two is the rest bend, a goal or the wrist roll pulling. poleSource names the biggest voter.
+        const float rad2deg = 180f / MathF.PI;
+        string poleSource = pole.Source switch
+        {
+            FullBodyIKSolver.PoleSource.Rest => "rest",
+            FullBodyIKSolver.PoleSource.Hand => "hand",
+            FullBodyIKSolver.PoleSource.Goal => "goal",
+            _ => "none",
+        };
+        string line = $"ARMDIAG {side}: hold={holdWeight:F2} bodySide={bodySide:F3} targetW=({target.Position.x:F3},{target.Position.y:F3},{target.Position.z:F3}) "
+                    + $"boneW=({bonePos.x:F3},{bonePos.y:F3},{bonePos.z:F3}) miss={miss:F3} "
+                    + $"posW={target.PositionWeight:F2} bendGoal={target.HasBendGoal} avatarScale={scale:F3} "
+                    + $"swivelDeg={pole.SwivelRad * rad2deg:F1} handSwivelDeg={pole.HandSwivelRad * rad2deg:F1} "
+                    + $"poleSource={poleSource} restW={pole.RestWeight:F2}";
+
+        double now = World != null ? World.Time.TotalTime : 0.0;
+        if (line == _armDiagLast || now - _armDiagAt < 2.0)
+            return;
+        _armDiagLast = line;
+        _armDiagAt = now;
+        LumoraLogger.Log(line);
+    }
+
     private static void ApplyBendGoal(ref FullBodyIKSolver.Target target, SyncRef<Slot> proxy, SyncRef<AvatarPoseDriver> node)
     {
         if ((node.Target?.IsEquippedAndActive ?? false) && proxy.Target != null && !proxy.Target.IsDestroyed)
@@ -783,6 +1287,46 @@ public class AvatarIK : Component, IAvatarEquipReceiver, IInputUpdateReceiver
     // Calibration offsets are folded into the TARGET, never written back to
     // the proxy: the proxies are driven by pose nodes every frame, and a
     // second writer would both fight the drives and generate sync churn.
+    private FullBodyIKSolver.Target HandTargetFor(BodyNode node, Slot? proxy, AvatarPoseDriver? poseNode, in ReferenceOffset offset)
+    {
+        if (poseNode?.IsEquippedAndActive ?? false)
+            return ProxyTarget(proxy, offset);
+
+        var socket = FindSocket(node);
+        if (socket != null)
+        {
+            socket.GetFilteredPose(out float3 pos, out floatQ rot, out _);
+            return TargetFromPose(pos, rot, offset);
+        }
+
+        // No socket either: fall back to the raw body-node slot, then to the proxy as a last resort.
+        var slot = node == BodyNode.LeftHand ? UserRoot.Target?.LeftHandSlot : UserRoot.Target?.RightHandSlot;
+        if (slot != null && !slot.IsDestroyed)
+            return TargetFromPose(slot.GlobalPosition, slot.GlobalRotation, offset);
+        return ProxyTarget(proxy, offset);
+    }
+
+    private AvatarSocket? _leftSocket, _rightSocket;
+    private double _socketScanAt;
+
+    private AvatarSocket? FindSocket(BodyNode node)
+    {
+        ref var cached = ref (node == BodyNode.LeftHand ? ref _leftSocket : ref _rightSocket);
+        if (cached != null && !cached.IsDestroyed)
+            return cached;
+
+        double now = World?.Time.TotalTime ?? 0.0;
+        if (now < _socketScanAt)
+            return null;
+        _socketScanAt = now + 1.0;
+
+        var root = UserRoot.Target?.Slot;
+        if (root == null || root.IsDestroyed)
+            return null;
+        cached = root.GetComponentInChildren<AvatarSocket>(s => s.Node.Value == node);
+        return cached;
+    }
+
     private static FullBodyIKSolver.Target ProxyTarget(Slot? proxy, in ReferenceOffset offset)
     {
         if (proxy == null || proxy.IsDestroyed)
@@ -873,8 +1417,11 @@ public class AvatarIK : Component, IAvatarEquipReceiver, IInputUpdateReceiver
     // an avatar is self-describing: its components ARE the metadata
     public bool SetupFromAvatar(UserRoot userRoot)
     {
-        var skeleton = Skeleton.Target ?? Slot.GetComponent<SkeletonBuilder>() ?? Slot.GetComponentInChildren<SkeletonBuilder>();
         var rig = Rig.Target ?? Slot.GetComponent<HumanoidRig>() ?? Slot.GetComponentInChildren<HumanoidRig>();
+        var skeleton = Skeleton.Target
+            ?? SkeletonHolding(rig)
+            ?? Slot.GetComponent<SkeletonBuilder>()
+            ?? Slot.GetComponentInChildren<SkeletonBuilder>();
         if (skeleton == null || rig == null)
         {
             LumoraLogger.Warn("AvatarIK: Avatar tree has no skeleton or rig");
@@ -884,6 +1431,26 @@ public class AvatarIK : Component, IAvatarEquipReceiver, IInputUpdateReceiver
         Setup(skeleton, rig, userRoot);
         SetupTracking(userRoot);
         return true;
+    }
+
+    // An avatar can carry SEVERAL skeletons: a body, a tail, a swap mesh, anything skinned to its own
+    // bone set. GetComponentInChildren answers with whichever it reaches first, and driving a biped off
+    // a 35-bone tail rig fails silently and completely. Pick the one that actually holds the rig's hips.
+    private SkeletonBuilder? SkeletonHolding(HumanoidRig? rig)
+    {
+        var hips = rig?.TryGetBone(BodyNode.Hips);
+        if (hips == null)
+            return null;
+
+        foreach (var candidate in Slot.GetComponentsInChildren<SkeletonBuilder>())
+        {
+            for (int i = 0; i < candidate.BoneCount && i < candidate.BoneSlots.Count; i++)
+            {
+                if (ReferenceEquals(candidate.BoneSlots[i], hips))
+                    return candidate;
+            }
+        }
+        return null;
     }
 
     public void SetupTracking(UserRoot userRoot)
@@ -1173,6 +1740,130 @@ public class AvatarIK : Component, IAvatarEquipReceiver, IInputUpdateReceiver
         }
     }
 
+    // Every mapped bone, once: where it is, which way it points, and how it is rolled.
+    //
+    // Positions are AVATAR-LOCAL so they can be read against the bind table directly. axis is the
+    // direction to the next bone down the chain, normalised, which is the thing that actually decides
+    // how a limb or a finger folds. rot is the bone's LOCAL rotation as euler degrees - a finger whose
+    // roll differs from its neighbours by ninety degrees is a finger the pose model will splay instead
+    // of curl. -xlinka
+    private void LogEveryBone(HumanoidRig rig)
+    {
+        LumoraLogger.Log($"AvatarIK[bones] '{Slot.SlotName.Value}' scale={Slot.GlobalScale.x:F3} - positions AVATAR-LOCAL, rot = local euler degrees");
+
+        foreach (var node in AllBodyNodes)
+        {
+            var bone = rig.TryGetBone(node);
+            if (bone == null || bone.IsDestroyed)
+                continue;
+
+            var localPos = Slot.GlobalPointToLocal(bone.GlobalPosition);
+            var euler = bone.LocalRotation.Value.ToEuler() * (180f / MathF.PI);
+
+            var child = NextInChain(rig, node);
+            string axis = "(  end  )";
+            if (child != null && !child.IsDestroyed)
+            {
+                var d = Slot.GlobalPointToLocal(child.GlobalPosition) - localPos;
+                if (d.LengthSquared > 1e-10f)
+                {
+                    d = d.Normalized;
+                    axis = $"({d.x,6:F2},{d.y,6:F2},{d.z,6:F2})";
+                }
+            }
+
+            LumoraLogger.Log(
+                $"AvatarIK[bones]  {node,-30} {bone.SlotName.Value,-22} "
+                + $"pos=({localPos.x,7:F3},{localPos.y,7:F3},{localPos.z,7:F3}) "
+                + $"axis={axis} rot=({euler.x,7:F1},{euler.y,7:F1},{euler.z,7:F1})");
+        }
+    }
+
+    // The next bone DOWN this bone's own chain, so "axis" means the same thing for a spine, a limb and
+    // a finger segment.
+    private static Slot? NextInChain(HumanoidRig rig, BodyNode node)
+    {
+        BodyNode next = node switch
+        {
+            BodyNode.Hips => BodyNode.Spine,
+            BodyNode.Spine => BodyNode.Chest,
+            BodyNode.Chest => BodyNode.Neck,
+            BodyNode.Neck => BodyNode.Head,
+            BodyNode.LeftShoulder => BodyNode.LeftUpperArm,
+            BodyNode.LeftUpperArm => BodyNode.LeftLowerArm,
+            BodyNode.LeftLowerArm => BodyNode.LeftHand,
+            BodyNode.RightShoulder => BodyNode.RightUpperArm,
+            BodyNode.RightUpperArm => BodyNode.RightLowerArm,
+            BodyNode.RightLowerArm => BodyNode.RightHand,
+            BodyNode.LeftUpperLeg => BodyNode.LeftLowerLeg,
+            BodyNode.LeftLowerLeg => BodyNode.LeftFoot,
+            BodyNode.LeftFoot => BodyNode.LeftToes,
+            BodyNode.RightUpperLeg => BodyNode.RightLowerLeg,
+            BodyNode.RightLowerLeg => BodyNode.RightFoot,
+            BodyNode.RightFoot => BodyNode.RightToes,
+            _ => BodyNode.NONE,
+        };
+
+        // Finger segments run metacarpal -> proximal -> intermediate -> distal -> tip, which the enum
+        // lays out contiguously, so the next segment is simply the next value.
+        if (next == BodyNode.NONE && node.IsFinger())
+        {
+            var candidate = node + 1;
+            if (candidate.IsFinger() && candidate.GetFingerSegmentType() > node.GetFingerSegmentType())
+                next = candidate;
+        }
+
+        return next == BodyNode.NONE ? null : rig.TryGetBone(next);
+    }
+
+    private static readonly BodyNode[] AllBodyNodes = BuildBodyNodeOrder();
+
+    private static BodyNode[] BuildBodyNodeOrder()
+    {
+        var all = (BodyNode[])System.Enum.GetValues(typeof(BodyNode));
+        var ordered = new List<BodyNode>(all.Length);
+        foreach (var node in all)
+        {
+            // Skip the markers and aliases the enum carries alongside the real joints.
+            if (node <= BodyNode.NONE || node >= BodyNode.END)
+                continue;
+            if (!ordered.Contains(node))
+                ordered.Add(node);
+        }
+        return ordered.ToArray();
+    }
+
+    private float FirstBoneLocalY(HumanoidRig rig, BodyNode node)
+    {
+        var bone = rig.TryGetBone(node);
+        return bone != null && !bone.IsDestroyed ? Slot.GlobalPointToLocal(bone.GlobalPosition).y : float.NaN;
+    }
+
+    // The lowest foot/toe bone in avatar-local space. Slightly above the actual sole, which is a far
+    // smaller error than measuring from the hips.
+    private bool TryFootBoneY(HumanoidRig rig, out float y)
+    {
+        y = 0f;
+        bool found = false;
+        foreach (var node in FloorBones)
+        {
+            var bone = rig.TryGetBone(node);
+            if (bone == null || bone.IsDestroyed)
+                continue;
+
+            float boneY = Slot.GlobalPointToLocal(bone.GlobalPosition).y;
+            if (!found || boneY < y)
+                y = boneY;
+            found = true;
+        }
+        return found;
+    }
+
+    private static readonly BodyNode[] FloorBones =
+    {
+        BodyNode.LeftToes, BodyNode.RightToes, BodyNode.LeftFoot, BodyNode.RightFoot,
+    };
+
     private bool TryMeasureFromReferences(HumanoidRig rig, Slot? view, Slot? leftFoot, Slot? rightFoot, out float measured)
     {
         measured = 0f;
@@ -1194,6 +1885,23 @@ public class AvatarIK : Component, IAvatarEquipReceiver, IInputUpdateReceiver
         {
             if (!hasBase || baseY > footY + 0.25f)
                 baseY = footY;
+            hasBase = true;
+        }
+        else if (TryFootBoneY(rig, out float boneFootY) && (!hasBase || baseY > boneFootY + 0.25f))
+        {
+            // The root bone is not the floor.
+            //
+            // On most rigs - and on EVERY package import, where the skeleton is rooted at the topmost
+            // bone - the root bone IS the hips, which stand a whole leg above the ground. Taken as the
+            // base it makes this function return the TORSO height and call it the avatar's height, and
+            // nothing downstream can tell: the rescale simply multiplies the avatar by however much it
+            // thinks is missing. On the test avatar that measured 0.414 against a 1.75 m user and scaled
+            // the body 4x, after which the spine had to fold to reach a head target a third of its own
+            // length away, and the whole avatar wore crumpled.
+            //
+            // Foot REFERENCES are the better answer because they sit at the sole, but they only exist
+            // when someone opted into feet calibration. The foot BONES are always there. -xlinka
+            baseY = boneFootY;
             hasBase = true;
         }
 

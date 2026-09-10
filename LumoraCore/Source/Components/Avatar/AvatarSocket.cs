@@ -10,76 +10,42 @@ using LumoraLogger = Lumora.Core.Logging.Logger;
 
 namespace Lumora.Core.Components.Avatar;
 
-/// <summary>
-/// A slot that can have avatar objects equipped to it for a specific body node.
-/// Used by TrackedDevicePositioner to create body node tracking points.
-/// </summary>
+// A slot that can have avatar objects equipped to it for a specific body node.
+// Used by TrackedDevicePositioner to create body node tracking points.
 [ComponentCategory("Users/Avatar")]
 public class AvatarSocket : UserRootComponent
 {
-    /// <summary>
-    /// The currently equipped avatar object. Synced so every peer can see
-    /// equip state (pose nodes derive their drive links from it, and
-    /// FillEmptySockets must not re-fill slots the authority already filled).
-    /// </summary>
+    // The currently equipped avatar object. Synced so every peer can see
+    // equip state (pose nodes derive their drive links from it, and
+    // FillEmptySockets must not re-fill slots the authority already filled).
     public readonly SyncRef<IAvatarEquippable> Equipped = null!;
 
-    /// <summary>
-    /// The body node this slot corresponds to.
-    /// </summary>
     public readonly Sync<BodyNode> Node = new();
 
-    /// <summary>
-    /// Whether this slot is currently tracking.
-    /// </summary>
     public readonly Sync<bool> IsTracking = new();
 
-    /// <summary>
-    /// Whether this slot's device is active.
-    /// </summary>
     public readonly Sync<bool> IsActive = new();
 
-    /// <summary>
-    /// Whether to drive the active state of equipped objects.
-    /// </summary>
     public readonly Sync<bool> DriveActive = new();
 
-    /// <summary>
-    /// Whether to drive the scale of equipped objects.
-    /// </summary>
     public readonly Sync<bool> DriveScale = new();
 
-    /// <summary>
-    /// List of pose filters to apply to tracking data.
-    /// Using a simple list since IPoseFilter doesn't implement IWorldElement.
-    /// </summary>
+    // Using a simple list since IPoseFilter doesn't implement IWorldElement.
     private readonly List<IPoseFilter> _filters = new();
 
-    /// <summary>
-    /// Get the pose filters list (read-only enumerable).
-    /// </summary>
     public IEnumerable<IPoseFilter> Filters => _filters;
 
-    /// <summary>
-    /// Add a pose filter.
-    /// </summary>
     public void AddFilter(IPoseFilter filter)
     {
         if (filter != null && !_filters.Contains(filter))
             _filters.Add(filter);
     }
 
-    /// <summary>
-    /// Remove a pose filter.
-    /// </summary>
     public void RemoveFilter(IPoseFilter filter)
     {
         _filters.Remove(filter);
     }
 
-    /// <summary>
-    /// Whether an object is currently equipped.
-    /// </summary>
     public bool HasEquipped => Equipped?.Target != null;
 
     // Internal state
@@ -166,9 +132,6 @@ public class AvatarSocket : UserRootComponent
         _userRoot = Slot?.ActiveUserRoot!;
     }
 
-    /// <summary>
-    /// Check if this slot is under the local user.
-    /// </summary>
     public new bool IsUnderLocalUser
     {
         get
@@ -179,9 +142,7 @@ public class AvatarSocket : UserRootComponent
         }
     }
 
-    /// <summary>
-    /// Pre-equip an avatar object - dequips any existing object first.
-    /// </summary>
+    // Pre-equip an avatar object - dequips any existing object first.
     public bool PreEquip(IAvatarEquippable avatarObject, HashSet<IAvatarEquippable> dequippedObjects)
     {
         if (avatarObject.Node == Node.Value)
@@ -206,9 +167,6 @@ public class AvatarSocket : UserRootComponent
         return false;
     }
 
-    /// <summary>
-    /// Equip an avatar object to this slot.
-    /// </summary>
     public void Equip(IAvatarEquippable avatarObject)
     {
         Equipped.Target = avatarObject;
@@ -230,9 +188,6 @@ public class AvatarSocket : UserRootComponent
         LumoraLogger.Log($"AvatarSocket: Equipped {avatarObject.Node} to slot on '{Slot.SlotName.Value}'");
     }
 
-    /// <summary>
-    /// Dequip the currently equipped object.
-    /// </summary>
     public void Dequip(HashSet<IAvatarEquippable> dequippedObjects)
     {
         if (Equipped?.Target == null)
@@ -257,9 +212,6 @@ public class AvatarSocket : UserRootComponent
         Equipped.Target = null!;
     }
 
-    /// <summary>
-    /// Call an action on all IAvatarEquipReceiver in a slot hierarchy.
-    /// </summary>
     public void ForeachObjectComponent(Action<IAvatarEquipReceiver> action)
     {
         if (Equipped?.Target is Component comp)
@@ -268,9 +220,6 @@ public class AvatarSocket : UserRootComponent
         }
     }
 
-    /// <summary>
-    /// Call an action on all IAvatarEquipReceiver in a component's slot hierarchy.
-    /// </summary>
     public static void ForeachObjectComponent(Component component, Action<IAvatarEquipReceiver> action)
     {
         if (component?.Slot == null)
@@ -306,10 +255,7 @@ public class AvatarSocket : UserRootComponent
         }
     }
 
-    /// <summary>
-    /// Get the filtered pose data for this slot.
-    /// Applies all pose filters to the raw tracking data.
-    /// </summary>
+    // Applies all pose filters to the raw tracking data.
     public Slot GetFilteredPose(out float3 position, out floatQ rotation, out bool isTracking)
     {
         if (_userRoot == null)

@@ -81,7 +81,7 @@ public class AvatarEquipManager : UserRootComponent
         BadgeText.OnChanged += _ => UpdateBadges();
         BadgeColor.OnChanged += _ => UpdateBadges();
         BadgeOutline.OnChanged += _ => UpdateBadges();
-        Logger.Log($"AvatarEquipManager: Awake on slot '{Slot.SlotName.Value}'");
+        Logger.Debug($"AvatarEquipManager: Awake on slot '{Slot.SlotName.Value}'");
     }
 
     public void UpdateBadges()
@@ -562,35 +562,141 @@ public class AvatarEquipManager : UserRootComponent
             // Root frame must face the body: equip resets this slot to identity, so a stale frame wears the
             // avatar yawed off the user's forward. World-invariant + reference slots are live transforms, so
             // healing an old avatar here is safe. No-op when already aligned.
-            AvatarCalibration.AlignAvatarFacing(avatarSlot, rig);
-
-            var avatarIk = avatarSlot.GetComponent<AvatarIK>() ?? avatarSlot.AttachComponent<AvatarIK>();
-            if (!avatarIk.SetupFromAvatar(UserRoot.Target))
+            // Four legs get the quadruped solver, and get it INSTEAD - never alongside. Both write the
+            // same bone rotations in the same phase at the same update order, and the dispatch sort is
+            // not stable, so having both means the pose flickers frame to frame.
+            (avatarSlot.GetComponent<QuadrupedRig>() ?? avatarSlot.GetComponentInChildren<QuadrupedRig>())
+                ?.LogGirdleSpan("before-TryAttachFor");
+            var quadrupedIk = QuadrupedIK.TryAttachFor(avatarSlot, skeleton, rig);
+            quadrupedIk?.Rig.Target?.LogGirdleSpan("after-TryAttachFor");
+            AvatarIK? avatarIk = null;
+            if (quadrupedIk != null)
             {
-                Logger.Warn("AvatarEquipManager: Avatar IK setup failed");
-                return false;
+                if (!quadrupedIk.SetupFromAvatar(UserRoot.Target))
+                {
+                    Logger.Warn("AvatarEquipManager: quadruped IK setup failed");
+                    return false;
+                }
+            }
+            else
+            {
+                AvatarCalibration.AlignAvatarFacing(avatarSlot, rig);
+
+                avatarIk = avatarSlot.GetComponent<AvatarIK>() ?? avatarSlot.AttachComponent<AvatarIK>();
+                if (!avatarIk.SetupFromAvatar(UserRoot.Target))
+                {
+                    Logger.Warn("AvatarEquipManager: Avatar IK setup failed");
+                    return false;
+                }
             }
 
             // Rigs with finger bones get a per-hand poser. It drives fingers only
             // from a live source (VR tracking); without one the hand rests.
-            if (rig.HasLeftFingerBones)
-                EnsureHandPoser(rig, Chirality.Left);
-            if (rig.HasRightFingerBones)
-                EnsureHandPoser(rig, Chirality.Right);
+            //
+            // NOT on four legs. The HumanoidRig stays attached on a quadruped - it is the thing that got
+            // us here, and the quadruped path is entered THROUGH it - so every humanoid consumer still
+            // finds it and carries on as if the avatar were a person. On a fox the "hands" are front
+            // paws: a hand poser curls them to whatever the controller's fingers are doing while the
+            // quadruped solver is trying to plant them on the ground. -xlinka
+            if (quadrupedIk == null)
+            {
+                if (rig.HasLeftFingerBones)
+                    EnsureHandPoser(rig, Chirality.Left);
+                if (rig.HasRightFingerBones)
+                    EnsureHandPoser(rig, Chirality.Right);
+            }
 
             // Coarse body colliders so a created/equipped avatar has grab/point hitboxes on every equip
             // path, not just model-import. Idempotent - skips bones that already have one.
-            avatarIk.GenerateBodyColliders();
+            if (avatarIk != null)
+                avatarIk.GenerateBodyColliders();
+            else
+                quadrupedIk?.GenerateBodyColliders();
 
             // Face drivers (blink/eye-look/eye-expression/mouth/viseme). The in-world AvatarStudio wires
             // these, but an import-built or directly-equipped avatar otherwise has a dead face. Attach the
             // same set here so every equip path gets it; idempotent, so a creator-built avatar isn't doubled.
             AttachFaceDrivers(avatarSlot, rig);
+
+            FitBodyColliderToAvatar(quadrupedIk);
+            AnchorNameplateToAvatar(quadrupedIk, rig);
         }
 
+        var spanRig = avatarSlot.GetComponent<QuadrupedRig>() ?? avatarSlot.GetComponentInChildren<QuadrupedRig>();
+        spanRig?.LogGirdleSpan("before-Equip");
         DequipCurrentAvatar();
-        return Equip(avatarSlot, isManualEquip: true);
+        bool equipped = Equip(avatarSlot, isManualEquip: true);
+        spanRig?.LogGirdleSpan("after-Equip");
+        return equipped;
     }
+
+    // Resize the wearer's character capsule to the avatar actually being worn.
+    //
+    // The capsule is built once for a standing person: 1.8 m tall, 0.3 m radius, centred at 0.9. Wear a
+    // fox and you are still a person-shaped pillar, so you cannot get under anything, you collide with
+    // walls a foot before you reach them, and the body the world pushes around has nothing to do with
+    // the body on screen. CapsuleCollider is Y-axis only, so an animal cannot get a capsule along its
+    // spine; what it CAN get is one that is the right height and the right width, which is the part
+    // that decides where you fit. Restored to the standing defaults whenever a humanoid is worn, so
+    // taking the fox off gives the person their own body back. -xlinka
+    private void FitBodyColliderToAvatar(QuadrupedIK? quadrupedIk)
+    {
+        var userRoot = UserRoot.Target ?? Slot?.ActiveUserRoot;
+        if (userRoot?.Slot == null || userRoot.Slot.IsDestroyed)
+            return;
+
+        CapsuleCollider? capsule = null;
+        foreach (var candidate in userRoot.Slot.GetComponents<CapsuleCollider>())
+        {
+            if (candidate.Type.Value == Lumora.Core.Physics.ColliderType.CharacterController)
+            {
+                capsule = candidate;
+                break;
+            }
+        }
+        if (capsule == null)
+            return;
+
+        float height = HumanCapsuleHeight;
+        float radius = HumanCapsuleRadius;
+
+        if (quadrupedIk != null && quadrupedIk.TryGetBodyMetrics(out float standHeight, out _, out float width))
+        {
+            height = MathF.Max(standHeight, 0.2f);
+            // Half the shoulder track, floored so a narrow animal still has a body, and capped at half
+            // the height so the capsule cannot become a sphere wider than the thing is tall.
+            radius = System.Math.Clamp(width * 0.5f, 0.1f, height * 0.5f);
+        }
+
+        capsule.Height.Value = height;
+        capsule.Radius.Value = radius;
+        capsule.Offset.Value = new float3(0f, height * 0.5f, 0f);
+
+        Logger.Log($"AvatarEquipManager: body capsule fitted to {(quadrupedIk != null ? "quadruped" : "humanoid")} "
+                 + $"height={height:F2} radius={radius:F2}");
+    }
+
+    // Put the nameplate on the AVATAR's head, not the wearer's tracked head node.
+    //
+    // The two are the same place on a person, which is why nothing ever distinguished them. On an animal
+    // the wearer's head node stays at human standing height while the dog's head is out front and low,
+    // so the plate hung over empty air. Resolved on every equip and cleared when nothing is worn.
+    private void AnchorNameplateToAvatar(QuadrupedIK? quadrupedIk, HumanoidRig? rig)
+    {
+        var plateRoot = Slot?.FindChild(NameplateManager.RootSlotName, recursive: false);
+        var positioner = plateRoot?.GetComponentInChildren<PositionAtUser>();
+        if (positioner == null || positioner.IsDestroyed)
+            return;
+
+        var head = quadrupedIk != null
+            ? quadrupedIk.HeadBone
+            : rig?.TryGetBone(BodyNode.Head);
+
+        positioner.Anchor.Target = head != null && !head.IsDestroyed ? head : null!;
+    }
+
+    private const float HumanCapsuleHeight = 1.8f;
+    private const float HumanCapsuleRadius = 0.3f;
 
     // Attach the avatar's face-driver set, mirroring the in-world creator. Eye drivers gate on eye bones;
     // mouth/viseme drivers always attach (they rest when nothing is tracking). Each is added only if absent.

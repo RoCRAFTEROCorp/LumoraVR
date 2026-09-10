@@ -7,19 +7,17 @@ using Lumora.Core.Math;
 
 namespace Lumora.Core.Components.Avatar;
 
-/// <summary>
-/// Computes avatar calibration reference poses (view, hand grips, feet, pelvis) directly from a
-/// <see cref="HumanoidRig"/>, so the avatar can be set up automatically with no manual placement.
-///
-/// The key over a naive "copy the bone's rotation" approach is that bone rotations are arbitrary per
-/// model - a raw hand-bone rotation makes a useless grip. Instead each reference frame is rebuilt
-/// from the body geometry: facing from the spine + shoulder line, grips from the forearm + arm-bend
-/// plane, feet/pelvis flattened to the ground. Results feed <see cref="AvatarReferencePoint"/>s that
-/// <see cref="AvatarIK"/> reads.
-/// </summary>
+// Computes avatar calibration reference poses (view, hand grips, feet, pelvis) directly from a
+// HumanoidRig, so the avatar can be set up automatically with no manual placement.
+//
+// The key over a naive "copy the bone's rotation" approach is that bone rotations are arbitrary per
+// model - a raw hand-bone rotation makes a useless grip. Instead each reference frame is rebuilt
+// from the body geometry: facing from the spine + shoulder line, grips from the forearm + arm-bend
+// plane, feet/pelvis flattened to the ground. Results feed AvatarReferencePoints that
+// AvatarIK reads.
 public static class AvatarCalibration
 {
-    /// <summary>A computed reference pose, expressed in the avatar root's local space.</summary>
+    // A computed reference pose, expressed in the avatar root's local space.
     public struct RefPose
     {
         public bool Valid;
@@ -30,11 +28,19 @@ public static class AvatarCalibration
     // Eyes sit a little in front of the head bone.
     private const float ViewForwardOffset = 0.06f;
 
-    /// <summary>
-    /// Derive the body's world axes from the rig: <paramref name="up"/> along the spine,
-    /// <paramref name="forward"/> the facing direction (disambiguated by the head), <paramref name="right"/>
-    /// the shoulder line. Falls back to world axes / the head's facing when bones are missing.
-    /// </summary>
+    // Default tool-anchor offsets, in HAND GRIP local space, taken from the source platform's creator
+    // defaults (it spawns its tool point 15cm out along the controller and its grab point 7.5cm out and
+    // 2cm under). Our forward is local -Z, theirs is +Z, so the sign is flipped and nothing else.
+    //
+    // Shared with AvatarStudio on purpose: the studio spawns its draggable anchors at these offsets and
+    // the auto path below bakes them at the same place, so an avatar built by dragging the markers
+    // without touching the anchors is identical to one built with no markers at all. -xlinka
+    public static readonly float3 ToolAnchorGripOffset = new(0f, 0f, -0.15f);
+    public static readonly float3 GrabAnchorGripOffset = new(0f, -0.02f, -0.075f);
+
+    // Derive the body's world axes from the rig: up along the spine,
+    // forward the facing direction (disambiguated by the head), right
+    // the shoulder line. Falls back to world axes / the head's facing when bones are missing.
     public static bool TryComputeBodyAxes(HumanoidRig rig, out float3 up, out float3 right, out float3 forward)
     {
         up = float3.Up;
@@ -90,14 +96,12 @@ public static class AvatarCalibration
         return true;
     }
 
-    /// <summary>
-    /// Point the avatar root's forward (-Z) at the body's geometric front WITHOUT moving anything visibly:
-    /// the root frame is yawed onto the mesh front by the exact delta and every direct child is restored to
-    /// its world pose. Equip resets the root to identity, so the root frame IS the worn facing - this is what
-    /// makes an avatar walk snout-first regardless of how the model was authored or dropped in the world.
-    /// Exact-angle (no binary 180 guess), yaw-only (root stays upright), idempotent. Run it before references
-    /// are baked; re-running after only rewrites the same frame. Returns true when the frame moved. -xlinka
-    /// </summary>
+    // Point the avatar root's forward (-Z) at the body's geometric front WITHOUT moving anything visibly:
+    // the root frame is yawed onto the mesh front by the exact delta and every direct child is restored to
+    // its world pose. Equip resets the root to identity, so the root frame IS the worn facing - this is what
+    // makes an avatar walk snout-first regardless of how the model was authored or dropped in the world.
+    // Exact-angle (no binary 180 guess), yaw-only (root stays upright), idempotent. Run it before references
+    // are baked; re-running after only rewrites the same frame. Returns true when the frame moved. -xlinka
     public static bool AlignAvatarFacing(Slot avatarRoot, HumanoidRig rig)
     {
         if (avatarRoot == null || avatarRoot.IsDestroyed || rig == null || rig.IsDestroyed)
@@ -145,7 +149,7 @@ public static class AvatarCalibration
         return true;
     }
 
-    /// <summary>View/head reference: in front of the head bone, looking along the (horizontal) facing.</summary>
+    // View/head reference: in front of the head bone, looking along the (horizontal) facing.
     public static RefPose ComputeView(Slot avatarRoot, HumanoidRig rig)
     {
         var head = rig?.TryGetBone(BodyNode.Head);
@@ -158,10 +162,8 @@ public static class AvatarCalibration
         return ToLocal(avatarRoot, worldPos, BuildRotation(flat, float3.Up));
     }
 
-    /// <summary>
-    /// Hand grip reference: at the hand bone, oriented along the forearm with "up" along the arm-bend
-    /// plane normal - a usable controller grip frame regardless of the bone's authored rotation.
-    /// </summary>
+    // Hand grip reference: at the hand bone, oriented along the forearm with "up" along the arm-bend
+    // plane normal - a usable controller grip frame regardless of the bone's authored rotation.
     public static RefPose ComputeHandGrip(Slot avatarRoot, HumanoidRig rig, bool rightSide)
     {
         var hand = rig?.TryGetBone(rightSide ? BodyNode.RightHand : BodyNode.LeftHand);
@@ -183,12 +185,16 @@ public static class AvatarCalibration
             pointDir = hand.GlobalRotation * float3.Backward;
         }
 
-        // Palm normal (the grip's "up" roll). The arm-bend plane normal Cross(upper->lower, lower->hand) has the
-        // OPPOSITE sign for a left vs right elbow, so reusing one cross order for both hands rolls one grip 180 deg
-        // (one hand's align arrow points the wrong way vs the other). Derive it from the THUMB instead: the thumb
-        // sits on mirror-opposite sides of the two hands, and that mirroring exactly cancels the forearm mirror, so
-        // Cross(forearm, thumb) yields a consistent back-of-hand normal on BOTH sides. Falls back to the arm-bend
-        // plane, sign-corrected by label, when the rig has no thumb bone. -xlinka
+        // Palm normal (the grip's "up" roll), and it needs the same left/right sign correction the arm-bend
+        // fallback below already has.
+        //
+        // The old reasoning here was that deriving from the THUMB cancels the mirror, because the thumb
+        // sits on mirror-opposite sides of the two hands. It does not, and a cross product is why: it is a
+        // pseudovector, so mirroring BOTH of its inputs flips the result rather than mirroring it.
+        // Measured on a perfectly symmetric rig, forearm and thumb mirror exactly and the normals come out
+        // as exact opposites - (0, +0.996, +0.09) on the left against (0, -0.996, -0.09) on the right. The
+        // right grip was rolled 180 degrees from the left on every rig that has a thumb bone, which is
+        // every real one, and it reads as one paw held palm-up. -xlinka
         float3 palmNormal = float3.Up;
         var thumb = FirstBone(rig, rightSide
             ? new[] { BodyNode.RightThumb_Proximal, BodyNode.RightThumb_Metacarpal, BodyNode.RightThumb_Distal }
@@ -196,6 +202,8 @@ public static class AvatarCalibration
         if (thumb != null && !thumb.IsDestroyed)
         {
             var n = float3.Cross(pointDir, thumb.GlobalPosition - handPos);
+            if (rightSide)
+                n = -n;
             if (n.LengthSquared > 1e-6f)
                 palmNormal = n.Normalized;
         }
@@ -213,7 +221,7 @@ public static class AvatarCalibration
         return ToLocal(avatarRoot, handPos, BuildRotation(pointDir, palmNormal));
     }
 
-    /// <summary>Foot reference: at the foot bone, flattened to face the body's forward on the ground.</summary>
+    // Foot reference: at the foot bone, flattened to face the body's forward on the ground.
     public static RefPose ComputeFoot(Slot avatarRoot, HumanoidRig rig, bool rightSide)
     {
         var foot = rig?.TryGetBone(rightSide ? BodyNode.RightFoot : BodyNode.LeftFoot);
@@ -224,7 +232,7 @@ public static class AvatarCalibration
         return ToLocal(avatarRoot, foot.GlobalPosition, BuildRotation(Flatten(forward), float3.Up));
     }
 
-    /// <summary>Pelvis reference: at the hips bone, flattened to the body's forward.</summary>
+    // Pelvis reference: at the hips bone, flattened to the body's forward.
     public static RefPose ComputePelvis(Slot avatarRoot, HumanoidRig rig)
     {
         var hips = rig?.TryGetBone(BodyNode.Hips);
@@ -235,10 +243,8 @@ public static class AvatarCalibration
         return ToLocal(avatarRoot, hips.GlobalPosition, BuildRotation(Flatten(forward), float3.Up));
     }
 
-    /// <summary>
-    /// Build (or rebuild) the "AvatarReferences" subtree with auto-aligned <see cref="AvatarReferencePoint"/>s.
-    /// Returns the reference root, or null if the rig is unusable.
-    /// </summary>
+    // Build (or rebuild) the "AvatarReferences" subtree with auto-aligned AvatarReferencePoints.
+    // Returns the reference root, or null if the rig is unusable.
     public static Slot AutoPlaceReferences(Slot avatarRoot, HumanoidRig rig, bool feet, bool pelvis)
     {
         if (avatarRoot == null || rig == null)
@@ -253,8 +259,19 @@ public static class AvatarCalibration
         root.LocalRotation.Value = floatQ.Identity;
 
         Place(root, AvatarReferenceKind.View, "View", ComputeView(avatarRoot, rig));
-        Place(root, AvatarReferenceKind.LeftHandGrip, "LeftHandGrip", ComputeHandGrip(avatarRoot, rig, rightSide: false));
-        Place(root, AvatarReferenceKind.RightHandGrip, "RightHandGrip", ComputeHandGrip(avatarRoot, rig, rightSide: true));
+        var leftGrip = ComputeHandGrip(avatarRoot, rig, rightSide: false);
+        var rightGrip = ComputeHandGrip(avatarRoot, rig, rightSide: true);
+        Place(root, AvatarReferenceKind.LeftHandGrip, "LeftHandGrip", leftGrip);
+        Place(root, AvatarReferenceKind.RightHandGrip, "RightHandGrip", rightGrip);
+
+        // Tool anchors ride off the grip frames rather than being computed from bones of their own: they
+        // are defined as an offset from where the hand holds things, so a grip that came out right gives
+        // anchors that come out right, and one that came out wrong is wrong in one place instead of three.
+        Place(root, AvatarReferenceKind.LeftHandToolAnchor, "LeftHandToolAnchor", OffsetInPose(leftGrip, ToolAnchorGripOffset));
+        Place(root, AvatarReferenceKind.RightHandToolAnchor, "RightHandToolAnchor", OffsetInPose(rightGrip, ToolAnchorGripOffset));
+        Place(root, AvatarReferenceKind.LeftHandGrabAnchor, "LeftHandGrabAnchor", OffsetInPose(leftGrip, GrabAnchorGripOffset));
+        Place(root, AvatarReferenceKind.RightHandGrabAnchor, "RightHandGrabAnchor", OffsetInPose(rightGrip, GrabAnchorGripOffset));
+
         if (feet)
         {
             Place(root, AvatarReferenceKind.LeftFoot, "LeftFoot", ComputeFoot(avatarRoot, rig, rightSide: false));
@@ -275,6 +292,20 @@ public static class AvatarCalibration
         slot.LocalPosition.Value = pose.LocalPosition;
         slot.LocalRotation.Value = pose.LocalRotation;
         slot.AttachComponent<AvatarReferencePoint>().Kind.Value = kind;
+    }
+
+    // Slide a pose along its OWN axes, keeping its rotation. Both are already avatar-local, so the
+    // result drops straight into the same reference subtree.
+    private static RefPose OffsetInPose(in RefPose pose, in float3 localOffset)
+    {
+        if (!pose.Valid)
+            return default;
+        return new RefPose
+        {
+            Valid = true,
+            LocalPosition = pose.LocalPosition + pose.LocalRotation * localOffset,
+            LocalRotation = pose.LocalRotation,
+        };
     }
 
     private static RefPose ToLocal(Slot avatarRoot, in float3 worldPos, in floatQ worldRot)

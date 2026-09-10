@@ -9,10 +9,6 @@ using LumoraLogger = Lumora.Core.Logging.Logger;
 
 namespace Lumora.Core.Components.Avatar;
 
-/// <summary>
-/// Component that stores bone slot references for a biped humanoid rig.
-/// Used by the IK and other avatar systems to drive skeleton bones.
-/// </summary>
 [ComponentCategory("Rendering")]
 public class HumanoidRig : Component
 {
@@ -32,31 +28,22 @@ public class HumanoidRig : Component
         }
     }
 
-    /// <summary>
-    /// Geometric forward axis of the rig in world space, flattened to the horizontal plane. Guessed ONCE from
-    /// the rig geometry (shoulder/hand line crossed with hips->head) rather than read from a single bone's
-    /// authored rotation, so it is correct even for imports whose hips/spine bones are authored facing the
-    /// opposite way to the body. Null until <see cref="GuessForwardFlipped"/> runs. - xlinka
-    /// </summary>
+    // Geometric forward axis of the rig in world space, flattened to the horizontal plane. Guessed ONCE from
+    // the rig geometry (shoulder/hand line crossed with hips->head) rather than read from a single bone's
+    // authored rotation, so it is correct even for imports whose hips/spine bones are authored facing the
+    // opposite way to the body. Null until GuessForwardFlipped runs. - xlinka
     public readonly Sync<float3?> ForwardAxis = new();
 
-    /// <summary>
-    /// True when the rig's authored hips-forward points opposite the model's geometric front. This is diagnostic
-    /// state for import/setup tools; runtime body facing uses <see cref="ForwardAxis"/> instead. - xlinka
-    /// </summary>
+    // True when the rig's authored hips-forward points opposite the model's geometric front. This is diagnostic
+    // state for import/setup tools; runtime body facing uses ForwardAxis instead. - xlinka
     public readonly Sync<bool> ForwardFlipped = new();
 
-    /// <summary>
-    /// Maps each rig BodyNode to its bone Slot. A real synced collection: each entry is a sub-worker
-    /// with its own RefID, so the map replicates and survives slot duplication (the old local dictionary
-    /// came back empty on remote peers / after a duplicate). Declared as a readonly field so the worker's
-    /// member discovery finds and Initialize()s it. -xlinka
-    /// </summary>
+    // Maps each rig BodyNode to its bone Slot. A real synced collection: each entry is a sub-worker
+    // with its own RefID, so the map replicates and survives slot duplication (the old local dictionary
+    // came back empty on remote peers / after a duplicate). Declared as a readonly field so the worker's
+    // member discovery finds and Initialize()s it. -xlinka
     public readonly SyncObjectDictionary<BodyNode, SyncRef<Slot>> Bones = new();
 
-    /// <summary>
-    /// Minimal set of bones required for a valid biped rig.
-    /// </summary>
     public static readonly BodyNode[] RequiredBones = new BodyNode[]
     {
         BodyNode.Hips,
@@ -119,9 +106,6 @@ public class HumanoidRig : Component
 
     private readonly Dictionary<BodyNode, LimbPoseGuide> _limbPoseGuides = new();
 
-    /// <summary>
-    /// Get or set a bone slot by body node type.
-    /// </summary>
     public Slot this[BodyNode boneType]
     {
         get => TryGetBone(boneType);
@@ -141,9 +125,6 @@ public class HumanoidRig : Component
     public bool TryGetLimbPoseGuide(BodyNode rootNode, out LimbPoseGuide guide)
         => _limbPoseGuides.TryGetValue(rootNode, out guide);
 
-    /// <summary>
-    /// Whether this rig has all minimal biped bones.
-    /// </summary>
     public bool IsHumanoid
     {
         get
@@ -157,22 +138,13 @@ public class HumanoidRig : Component
         }
     }
 
-    /// <summary>
-    /// Whether this rig has left hand finger bones.
-    /// </summary>
     public bool HasLeftFingerBones => HasMinimalHand(Chirality.Left);
 
-    /// <summary>
-    /// Whether this rig has right hand finger bones.
-    /// </summary>
     public bool HasRightFingerBones => HasMinimalHand(Chirality.Right);
 
     // Bones is a discovered worker member (readonly field) - no OnAwake construction needed.
     // ForwardAxis default is null (C# default for float3?, skip OnInit)
 
-    /// <summary>
-    /// Try to get a bone slot for a body node type.
-    /// </summary>
     public Slot TryGetBone(BodyNode boneType)
     {
         if (Bones.TryGetValue(boneType, out var reference) && reference.Target != null)
@@ -180,9 +152,6 @@ public class HumanoidRig : Component
         return null!;
     }
 
-    /// <summary>
-    /// Get the body node type for a given bone slot.
-    /// </summary>
     public BodyNode GetBoneType(Slot bone)
     {
         foreach (var entry in Bones)
@@ -193,9 +162,6 @@ public class HumanoidRig : Component
         return BodyNode.NONE;
     }
 
-    /// <summary>
-    /// Check if a body node is a required bone.
-    /// </summary>
     public static bool IsRequiredBone(BodyNode node)
     {
         foreach (var required in RequiredBones)
@@ -206,9 +172,6 @@ public class HumanoidRig : Component
         return false;
     }
 
-    /// <summary>
-    /// Check if this rig has minimal hand bones for a chirality.
-    /// </summary>
     public bool HasMinimalHand(Chirality chirality)
     {
         // Need at least 2 thumb segments
@@ -226,9 +189,6 @@ public class HumanoidRig : Component
         return fingerCount >= 2;
     }
 
-    /// <summary>
-    /// Count segments for a finger.
-    /// </summary>
     public int FingerSegmentCount(FingerType finger, Chirality chirality, bool excludeMetacarpal)
     {
         int count = 0;
@@ -247,9 +207,6 @@ public class HumanoidRig : Component
         return count;
     }
 
-    /// <summary>
-    /// Get list of missing bones for a valid biped rig.
-    /// </summary>
     public void GetMissingBipedBones(List<BodyNode> list)
     {
         foreach (var node in RequiredBones)
@@ -259,14 +216,24 @@ public class HumanoidRig : Component
         }
     }
 
-    /// <summary>
-    /// Populate bones from a SkeletonBuilder by matching bone names, using the slot hierarchy to resolve
-    /// names the string heuristic alone can't (an "arm" with no upper/lower, a duplicated spine/chest).
-    /// Two passes: (1) name-classify every bone, recording whether the match was ambiguous; (2) walk each
-    /// bone root-to-tip, disambiguate an ambiguous match against its already-resolved parent's chain, drop
-    /// a bone whose chain demands neighbors that aren't present, and assign. Fingers are name-classified
-    /// here and refined geometrically by <see cref="DetectHandRigs"/> afterward. -xlinka
-    /// </summary>
+    // Bones the rig author has explicitly told us to leave alone.
+    //
+    // A "<NOIK>" prefix is a naming convention, not decoration - it marks a bone that exists for skinning
+    // or for a secondary system and must never be claimed as a rig joint. Real rigs ship a "<NOIK> Hips"
+    // alongside the actual Hips, and classifying it by name gives two candidates for one node: whichever
+    // wins, the other's mesh deforms wrong. Skip them before classification even looks. -xlinka
+    public static bool IsExcludedFromIK(string? boneName)
+    {
+        return boneName != null
+            && boneName.IndexOf("<NOIK>", System.StringComparison.OrdinalIgnoreCase) >= 0;
+    }
+
+    // Populate bones from a SkeletonBuilder by matching bone names, using the slot hierarchy to resolve
+    // names the string heuristic alone can't (an "arm" with no upper/lower, a duplicated spine/chest).
+    // Two passes: (1) name-classify every bone, recording whether the match was ambiguous; (2) walk each
+    // bone root-to-tip, disambiguate an ambiguous match against its already-resolved parent's chain, drop
+    // a bone whose chain demands neighbors that aren't present, and assign. Fingers are name-classified
+    // here and refined geometrically by DetectHandRigs afterward. -xlinka
     public void PopulateFromSkeleton(SkeletonBuilder skeleton)
     {
         if (skeleton == null || !skeleton.IsBuilt.Value)
@@ -285,6 +252,8 @@ public class HumanoidRig : Component
         {
             var boneSlot = skeleton.BoneSlots[i];
             if (boneSlot == null)
+                continue;
+            if (IsExcludedFromIK(skeleton.BoneNames[i]))
                 continue;
             var node = ClassifyBoneName(skeleton.BoneNames[i], out bool amb);
             slots.Add(boneSlot);
@@ -320,6 +289,10 @@ public class HumanoidRig : Component
 
             SetBone(node, slot);
         }
+
+        // Names decided every side above. Check them against where the bones physically are before the
+        // finger pass builds on a hand that may be the wrong one. -xlinka
+        ValidateLimbSides(classified);
 
         DetectHandRigs();
         CaptureLimbPoseGuides(overwrite: true);
@@ -402,12 +375,10 @@ public class HumanoidRig : Component
         return null;
     }
 
-    /// <summary>
-    /// Correct an ambiguous match by walking the chain past the parent. Given a child whose name only said
-    /// "arm" (assumed upper) but whose parent is already an upper-arm, the child must be the next link
-    /// (lower-arm). If the parent isn't in the child's chain, the child resets to the chain's first real
-    /// bone. Returns NONE when the chain is exhausted (deeper than its tip).
-    /// </summary>
+    // Correct an ambiguous match by walking the chain past the parent. Given a child whose name only said
+    // "arm" (assumed upper) but whose parent is already an upper-arm, the child must be the next link
+    // (lower-arm). If the parent isn't in the child's chain, the child resets to the chain's first real
+    // bone. Returns NONE when the chain is exhausted (deeper than its tip).
     public static BodyNode FixChain(BodyNode childNode, BodyNode parentNode)
     {
         var chain = GetChain(childNode, out int childIndex);
@@ -430,15 +401,13 @@ public class HumanoidRig : Component
         return chain.Nodes[childIndex];
     }
 
-    /// <summary>
-    /// Guess the rig's forward axis GEOMETRICALLY and store it in <see cref="ForwardAxis"/> (world space,
-    /// flattened). Forward is the shoulder/hand left->right line crossed with the hips->head up line, picked
-    /// once from the rig's current pose so it can't drift with the solve. The sign comes purely from the bone
-    /// POSITIONS (left/right line x hips->head), never from a bone's authored rotation. This is what makes the
-    /// body-facing robust across rigs whose hips/spine bones are authored backward (common for imported anthro
-    /// models) - the old code read the hips bone's rotation directly and turned the whole body 180 deg when that
-    /// bone faced the wrong way. -xlinka
-    /// </summary>
+    // Guess the rig's forward axis GEOMETRICALLY and store it in ForwardAxis (world space,
+    // flattened). Forward is the shoulder/hand left->right line crossed with the hips->head up line, picked
+    // once from the rig's current pose so it can't drift with the solve. The sign comes purely from the bone
+    // POSITIONS (left/right line x hips->head), never from a bone's authored rotation. This is what makes the
+    // body-facing robust across rigs whose hips/spine bones are authored backward (common for imported anthro
+    // models) - the old code read the hips bone's rotation directly and turned the whole body 180 deg when that
+    // bone faced the wrong way. -xlinka
     public void GuessForwardFlipped()
     {
         if (!IsHumanoid)
@@ -459,15 +428,13 @@ public class HumanoidRig : Component
             ForwardFlipped.Value = float3.Dot(fwd.Value, hipsFwd.Normalized) < 0f;
     }
 
-    /// <summary>
-    /// Compute the geometric forward axis (world space, flattened, normalized) without storing it. Right is the
-    /// body left->right line (upper-arm roots, else shoulders, else hands); up is hips->head. forward = up x
-    /// right (right-handed: the solver uses right = forward x up, which inverts to forward = up x right). The
-    /// sign is fully determined by the rig's bone POSITIONS and its classified left/right bone assignment, so
-    /// it never reads a bone's authored ROTATION - that is the whole point: it stays correct on imports whose
-    /// hips/spine/head bones are authored facing backward. Returns null when the rig is too incomplete to
-    /// measure (caller falls back). -xlinka
-    /// </summary>
+    // Compute the geometric forward axis (world space, flattened, normalized) without storing it. Right is the
+    // body left->right line (upper-arm roots, else shoulders, else hands); up is hips->head. forward = up x
+    // right (right-handed: the solver uses right = forward x up, which inverts to forward = up x right). The
+    // sign is fully determined by the rig's bone POSITIONS and its classified left/right bone assignment, so
+    // it never reads a bone's authored ROTATION - that is the whole point: it stays correct on imports whose
+    // hips/spine/head bones are authored facing backward. Returns null when the rig is too incomplete to
+    // measure (caller falls back). -xlinka
     public float3? GuessForwardAxis()
     {
         var hips = TryGetBone(BodyNode.Hips);
@@ -547,9 +514,18 @@ public class HumanoidRig : Component
         TryAxis(float3.Left);
         TryAxis(float3.Right);
 
-        // Only snap when the geometric front is already close to a root-cardinal axis. Otherwise keep the measured
-        // direction so unusual-but-valid diagonal rigs do not get forced sideways.
-        return bestDot > 0.82f ? best : forward;
+        // Only snap when the geometric front is ALREADY ESSENTIALLY ON a root-cardinal axis - this exists to
+        // clean up measurement noise, not to round a real facing.
+        //
+        // The old threshold of 0.82 is 35 degrees, which is not noise, it is a third of a right angle. A
+        // real avatar measured (0.552, 0, -0.833): dot 0.833 against -Z, scraping past 0.82, so a body
+        // genuinely facing 33.6 degrees off the axis was reported as facing exactly down it. Nothing
+        // downstream could tell - AlignAvatarFacing compares against this same snapped value, sees no
+        // delta and declines to correct the root, so the solver drove the gait, the arm hang and the foot
+        // ground-forward along an axis the body was not on. Ten degrees is a threshold that can only
+        // absorb noise. -xlinka
+        const float OnAxisDot = 0.9848f;   // cos(10 degrees)
+        return bestDot > OnAxisDot ? best : forward;
 
         void TryAxis(float3 localAxis)
         {
@@ -584,14 +560,13 @@ public class HumanoidRig : Component
         return true;
     }
 
-    /// <summary>
-    /// Force the rig into a canonical T-pose: arms straight out to the sides, legs straight down. Rotates each
-    /// limb bone so the direction to its child matches the target, processing root-to-tip so a parent's rotation
-    /// carries into its children before they're adjusted. Run this before IK captures the rest pose so calibration
-    /// starts from a known pose no matter how the model was authored (A-pose, relaxed, etc.). -xlinka
-    /// </summary>
+    // Force the rig into a canonical T-pose: arms straight out to the sides, legs straight down. Rotates each
+    // limb bone so the direction to its child matches the target, processing root-to-tip so a parent's rotation
+    // carries into its children before they're adjusted. Run this before IK captures the rest pose so calibration
+    // starts from a known pose no matter how the model was authored (A-pose, relaxed, etc.). -xlinka
     public void MakeTPose()
     {
+        LumoraLogger.Log("POSEWRITE HumanoidRig.MakeTPose: forcing the rig to a T-pose");
         CaptureLimbPoseGuides(overwrite: false);
 
         var fwd = ForwardAxis.Value ?? GuessForwardAxis() ?? float3.Backward;
@@ -708,19 +683,14 @@ public class HumanoidRig : Component
         return floatQ.AxisAngleRad(c, angleRad);
     }
 
-    /// <summary>
-    /// Map a bone name to its body node by heuristic, so real rigs work regardless of naming convention.
-    /// </summary>
     public static BodyNode ClassifyBoneName(string name) => ClassifyBoneName(name, out _);
 
-    /// <summary>
-    /// Name-classify a bone, also reporting whether the match was ambiguous (a bare "arm"/"leg" with no
-    /// upper/lower qualifier, or a spine/chest that could be any segment of the column). Ambiguous matches
-    /// are re-resolved by topology in <see cref="PopulateFromSkeleton"/>. Side is detected from the name
-    /// (Left/Right, _L/_R, L_/R_) and the base name picks the node (UpperArm/Bicep, ForeArm/LowerArm/Elbow,
-    /// Hand/Wrist, Palm, Jaw, Thigh/UpLeg, Calf/Shin/Knee, Foot, Toe, ...). Returns
-    /// <see cref="BodyNode.NONE"/> for bones it can't place. -xlinka
-    /// </summary>
+    // Name-classify a bone, also reporting whether the match was ambiguous (a bare "arm"/"leg" with no
+    // upper/lower qualifier, or a spine/chest that could be any segment of the column). Ambiguous matches
+    // are re-resolved by topology in PopulateFromSkeleton. Side is detected from the name
+    // (Left/Right, _L/_R, L_/R_) and the base name picks the node (UpperArm/Bicep, ForeArm/LowerArm/Elbow,
+    // Hand/Wrist, Palm, Jaw, Thigh/UpLeg, Calf/Shin/Knee, Foot, Toe, ...). Returns
+    // BodyNode.NONE for bones it can't place. -xlinka
     public static BodyNode ClassifyBoneName(string name, out bool ambiguous)
     {
         ambiguous = false;
@@ -908,12 +878,534 @@ public class HumanoidRig : Component
         return int.TryParse(t.Substring(start, end - start + 1), out var n) ? n : 0;
     }
 
+    // ----- GEOMETRIC SIDE VALIDATION --------------------------------------------------------------------
+
+    // Below this (world metres) two paired roots sit in the same place and no side can be read off them.
+    private const float SideMinSeparation = 0.02f;
+
+    // A bone counts as clearly on a side only when its offset from the pair's midline exceeds this
+    // fraction of the pair's own separation. Anything nearer the midline is left alone, never guessed:
+    // clavicles start at the sternum and a hand at rest can hang close to the body's centre line.
+    private const float SideMarginFraction = 0.25f;
+
+    private struct LimbPair
+    {
+        public BodyNode LeftRoot;
+        public BodyNode RightRoot;
+        public Slot Left;
+        public Slot Right;
+        public float3 Mid;     // midpoint of the two roots
+        public float3 Axis;    // RIGHT root -> LEFT root, horizontal, unit
+        public float Span;     // horizontal distance between the roots
+    }
+
+    private struct SideResult
+    {
+        public bool Changed;
+        public bool HandRekeyed;
+    }
+
+    // Check every limb label against where its bone physically is, and re-key what the names got wrong.
+    //
+    // Sides in this rig come from NAMES only. That was invisible while desktop hands carried IK weight 0
+    // and nothing pulled on a hand bone. Measured on a real package import (the cat, 2026-09-12 harness
+    // log): at rest both hands read on their labelled sides, and the moment the right-hand tool took hold
+    // the labelled RightHand bone reached its target and the physical LEFT arm crossed the chest to get
+    // there. The bone dump behind it: every Left_* bone at +X, every Right_* at -X, eyes at -Z in front
+    // of the head, so the body faces -Z and +X is its physical right. The whole label set is a mirror
+    // image, arms, legs and eyes alike. Package transforms are read verbatim from a left-handed source,
+    // which reflects the model, and the names come along unchanged.
+    //
+    // Two failures, checked in this order:
+    //   1. A PAIR whose labelled roots sit on opposite physical sides (that mirror). Both chains swap
+    //      wholesale, fingers included, the way the quadruped re-key moves a limb. This needs a physical
+    //      right that owes nothing to the labels, so it comes from label-free cues only: eyes in front of
+    //      the head, toes in front of the feet, knees bent forward.
+    //   2. A chain whose root is on its side but a later bone is clearly past the midline. That bone
+    //      resolved to the wrong slot; it is re-keyed to a correct-side descendant of the last good bone
+    //      that the names classified as the same node or left unclassified. No such candidate means a
+    //      loud log and no change. This is measured along the pair's own root-to-root line and never a
+    //      rotated float3.Right: two earlier diagnostics that projected on a derived body axis called
+    //      both hands "same side" when the real spread lay along Z.
+    // On a rig whose labels are right this changes nothing and says so once. -xlinka
+    public bool ValidateLimbSides(SkeletonBuilder? skeleton)
+    {
+        Dictionary<Slot, BodyNode>? classified = null;
+        if (skeleton != null && skeleton.IsBuilt.Value)
+        {
+            classified = new Dictionary<Slot, BodyNode>();
+            for (int i = 0; i < skeleton.BoneCount; i++)
+            {
+                var boneSlot = skeleton.BoneSlots[i];
+                if (boneSlot == null || boneSlot.IsDestroyed || IsExcludedFromIK(skeleton.BoneNames[i]))
+                    continue;
+                classified[boneSlot] = ClassifyBoneName(skeleton.BoneNames[i], out _);
+            }
+        }
+
+        var result = ValidateLimbSidesCore(classified);
+        // A hand that moved to another slot needs its fingers found again; the populate path runs this
+        // itself right after, this entry is for rigs that arrived already keyed (package imports).
+        if (result.HandRekeyed)
+            DetectHandRigs();
+        return result.Changed;
+    }
+
+    private void ValidateLimbSides(Dictionary<Slot, BodyNode> classified) => ValidateLimbSidesCore(classified);
+
+    private SideResult ValidateLimbSidesCore(Dictionary<Slot, BodyNode>? classified)
+    {
+        var result = default(SideResult);
+
+        if (!TryPair(BodyNode.LeftUpperArm, BodyNode.RightUpperArm, out var arms)
+            || !TryPair(BodyNode.LeftUpperLeg, BodyNode.RightUpperLeg, out var legs))
+        {
+            LumoraLogger.Log("HumanoidRig: side check skipped - needs both upper arms and both upper legs mapped");
+            return result;
+        }
+        if (arms.Span < SideMinSeparation || legs.Span < SideMinSeparation)
+        {
+            LumoraLogger.Warn($"HumanoidRig: side check skipped - paired roots too close to read a side "
+                            + $"(arms {arms.Span:F3} m, legs {legs.Span:F3} m)");
+            return result;
+        }
+
+        bool haveRight = TryLabelFreeRight(out float3 physicalRight, out string cues);
+        if (haveRight)
+        {
+            bool armsSwapped = CheckPairMirror("arms", in arms, physicalRight, cues, BodyNode.LeftShoulder, BodyNode.LeftPinky_Tip);
+            bool legsSwapped = CheckPairMirror("legs", in legs, physicalRight, cues, BodyNode.LeftUpperLeg, BodyNode.LeftToes);
+            if (armsSwapped || legsSwapped)
+            {
+                result.Changed = true;
+                // The roots moved; re-read the pairs so the chain checks below measure the new keys.
+                TryPair(BodyNode.LeftUpperArm, BodyNode.RightUpperArm, out arms);
+                TryPair(BodyNode.LeftUpperLeg, BodyNode.RightUpperLeg, out legs);
+            }
+            // Eyes only follow a whole-body mirror. A lone eye-name mix-up is not evidence of anything.
+            if (armsSwapped && legsSwapped && CheckEyeMirror(physicalRight))
+                result.Changed = true;
+        }
+        else
+        {
+            LumoraLogger.Warn("HumanoidRig: cannot verify left/right labels against the body - no label-free "
+                            + $"forward cue ({cues}); a fully mirrored rig would pass unnoticed here");
+        }
+
+        result.Changed |= CheckChainSides(in arms, Chirality.Left, classified, ref result.HandRekeyed);
+        result.Changed |= CheckChainSides(in arms, Chirality.Right, classified, ref result.HandRekeyed);
+        result.Changed |= CheckChainSides(in legs, Chirality.Left, classified, ref result.HandRekeyed);
+        result.Changed |= CheckChainSides(in legs, Chirality.Right, classified, ref result.HandRekeyed);
+
+        if (!result.Changed)
+        {
+            LumoraLogger.Log("HumanoidRig: limb sides verified geometrically, no re-key needed "
+                           + (haveRight ? $"(physical right from {cues}; " : $"(labels vs body UNVERIFIED: {cues}; ")
+                           + $"arms span={arms.Span:F3} m, legs span={legs.Span:F3} m)");
+        }
+        return result;
+    }
+
+    private bool TryPair(BodyNode leftRoot, BodyNode rightRoot, out LimbPair pair)
+    {
+        pair = default;
+        var left = TryGetBone(leftRoot);
+        var right = TryGetBone(rightRoot);
+        if (left == null || right == null || left.IsDestroyed || right.IsDestroyed)
+            return false;
+
+        float3 lp = left.GlobalPosition;
+        float3 rp = right.GlobalPosition;
+        float3 axis = lp - rp;
+        axis.y = 0f;
+        pair.LeftRoot = leftRoot;
+        pair.RightRoot = rightRoot;
+        pair.Left = left;
+        pair.Right = right;
+        pair.Mid = (lp + rp) * 0.5f;
+        pair.Span = axis.Length;
+        pair.Axis = pair.Span > 1e-6f ? axis / pair.Span : float3.Zero;
+        return true;
+    }
+
+    // The body's physical right without consulting a single left/right label. Forward is voted by cues
+    // that are symmetric in the labels (the eye MIDPOINT, the toe direction summed over BOTH feet, the
+    // knee bend summed over both legs), then right = forward x up in this engine's right-handed frame,
+    // the same product MakeTPose aligns the right arm along. Every cue present has to agree with the
+    // vote; a split vote is reported as no answer rather than a coin flip. -xlinka
+    private bool TryLabelFreeRight(out float3 right, out string cues)
+    {
+        right = float3.Zero;
+        var votes = new List<(string name, float3 dir)>(3);
+        if (TryEyeForward(out float3 eyes)) votes.Add(("eyes", eyes));
+        if (TryToeForward(out float3 toes)) votes.Add(("toes", toes));
+        if (TryKneeForward(out float3 knees)) votes.Add(("knees", knees));
+
+        if (votes.Count == 0)
+        {
+            cues = "no eye bones, no toe bones, knees straight";
+            return false;
+        }
+
+        float3 sum = float3.Zero;
+        foreach (var vote in votes)
+            sum += vote.dir;
+        sum.y = 0f;
+        if (sum.LengthSquared < 1e-8f)
+        {
+            cues = "cues cancel out";
+            return false;
+        }
+        float3 forward = sum.Normalized;
+
+        var names = new System.Text.StringBuilder();
+        foreach (var vote in votes)
+        {
+            if (float3.Dot(vote.dir, forward) < 0.5f)
+            {
+                cues = $"cues disagree ({DescribeVotes(votes)})";
+                return false;
+            }
+            if (names.Length > 0) names.Append('+');
+            names.Append(vote.name);
+        }
+
+        float3 up = float3.Up;
+        var hips = TryGetBone(BodyNode.Hips);
+        var head = TryGetBone(BodyNode.Head);
+        if (hips != null && head != null && !hips.IsDestroyed && !head.IsDestroyed)
+        {
+            float3 spine = head.GlobalPosition - hips.GlobalPosition;
+            if (spine.LengthSquared > 1e-8f)
+                up = spine.Normalized;
+        }
+
+        right = float3.Cross(forward, up);
+        right.y = 0f;
+        cues = names.ToString();
+        if (right.LengthSquared < 1e-8f)
+        {
+            cues += " (degenerate up)";
+            return false;
+        }
+        right = right.Normalized;
+        return true;
+    }
+
+    private static string DescribeVotes(List<(string name, float3 dir)> votes)
+    {
+        var sb = new System.Text.StringBuilder();
+        foreach (var vote in votes)
+        {
+            if (sb.Length > 0) sb.Append(", ");
+            sb.Append(vote.name).Append('=').Append(vote.dir);
+        }
+        return sb.ToString();
+    }
+
+    // Eye midpoint relative to the head bone, flattened. The midpoint is the same whichever eye carries
+    // which label, and eyes sit in front of the skull on every rig that has them.
+    private bool TryEyeForward(out float3 dir)
+    {
+        dir = float3.Zero;
+        var head = TryGetBone(BodyNode.Head);
+        var left = TryGetBone(BodyNode.LeftEye);
+        var right = TryGetBone(BodyNode.RightEye);
+        if (head == null || left == null || right == null || head.IsDestroyed || left.IsDestroyed || right.IsDestroyed)
+            return false;
+
+        float3 d = (left.GlobalPosition + right.GlobalPosition) * 0.5f - head.GlobalPosition;
+        d.y = 0f;
+        // Eyes parked on the head origin say nothing; ask for a few millimetres, scaled to the body.
+        float minOffset = 0.005f;
+        var hips = TryGetBone(BodyNode.Hips);
+        if (hips != null && !hips.IsDestroyed)
+            minOffset = System.MathF.Max(minOffset, 0.01f * float3.Distance(head.GlobalPosition, hips.GlobalPosition));
+        if (d.LengthSquared < minOffset * minOffset)
+            return false;
+        dir = d.Normalized;
+        return true;
+    }
+
+    // Knee bend summed over both legs: the lower-leg joint sits in front of the hip->foot line on a
+    // standing or sitting body, plantigrade or digitigrade alike. A straight leg contributes nothing.
+    private bool TryKneeForward(out float3 dir)
+    {
+        dir = float3.Zero;
+        float3 sum = float3.Zero;
+        Accumulate(BodyNode.LeftUpperLeg, BodyNode.LeftLowerLeg, BodyNode.LeftFoot);
+        Accumulate(BodyNode.RightUpperLeg, BodyNode.RightLowerLeg, BodyNode.RightFoot);
+        sum.y = 0f;
+        if (sum.LengthSquared < 1e-8f)
+            return false;
+        dir = sum.Normalized;
+        return true;
+
+        void Accumulate(BodyNode upperNode, BodyNode lowerNode, BodyNode footNode)
+        {
+            var upper = TryGetBone(upperNode);
+            var lower = TryGetBone(lowerNode);
+            var foot = TryGetBone(footNode);
+            if (upper == null || lower == null || foot == null || upper.IsDestroyed || lower.IsDestroyed || foot.IsDestroyed)
+                return;
+            float3 line = foot.GlobalPosition - upper.GlobalPosition;
+            float lineLen2 = line.LengthSquared;
+            if (lineLen2 < 1e-8f)
+                return;
+            float3 toKnee = lower.GlobalPosition - upper.GlobalPosition;
+            float3 bend = toKnee - line * (float3.Dot(toKnee, line) / lineLen2);
+            bend.y = 0f;
+            // Under 5% of the leg length is a straight leg plus authoring noise.
+            if (bend.LengthSquared < lineLen2 * 0.0025f)
+                return;
+            sum += bend.Normalized;
+        }
+    }
+
+    // Both roots of a pair on the physical sides opposite their labels means the pair is mirrored. Swap
+    // the two chains wholesale. Anything short of both-clearly-wrong is left alone with a log line.
+    private bool CheckPairMirror(string label, in LimbPair pair, float3 physicalRight, string cues,
+        BodyNode leftFirst, BodyNode leftLast)
+    {
+        float rightSide = float3.Dot(pair.Right.GlobalPosition - pair.Mid, physicalRight);
+        float leftSide = float3.Dot(pair.Left.GlobalPosition - pair.Mid, physicalRight);
+        float margin = pair.Span * SideMarginFraction;
+
+        if (rightSide > margin && leftSide < -margin)
+            return false;
+
+        if (!(rightSide < -margin && leftSide > margin))
+        {
+            LumoraLogger.Warn($"HumanoidRig: {label} side ambiguous - {pair.RightRoot} '{pair.Right.SlotName.Value}' at "
+                            + $"{rightSide:+0.000;-0.000} m and {pair.LeftRoot} '{pair.Left.SlotName.Value}' at "
+                            + $"{leftSide:+0.000;-0.000} m along the physical right (from {cues}, margin {margin:F3} m); "
+                            + "keeping the labels");
+            return false;
+        }
+
+        int moved = SwapSides(leftFirst, leftLast);
+        LumoraLogger.Warn($"HumanoidRig: MIRRORED {label} - {pair.RightRoot} '{pair.Right.SlotName.Value}' sits "
+                        + $"{rightSide:+0.000;-0.000} m and {pair.LeftRoot} '{pair.Left.SlotName.Value}' "
+                        + $"{leftSide:+0.000;-0.000} m along the physical right (from {cues}, span {pair.Span:F3} m); "
+                        + $"swapped {moved} bone(s) left<->right, fingers included");
+        return true;
+    }
+
+    private bool CheckEyeMirror(float3 physicalRight)
+    {
+        var left = TryGetBone(BodyNode.LeftEye);
+        var right = TryGetBone(BodyNode.RightEye);
+        if (left == null || right == null || left.IsDestroyed || right.IsDestroyed)
+            return false;
+
+        float3 mid = (left.GlobalPosition + right.GlobalPosition) * 0.5f;
+        float3 span = left.GlobalPosition - right.GlobalPosition;
+        span.y = 0f;
+        float margin = span.Length * SideMarginFraction;
+        if (span.Length < 0.002f)
+            return false;
+        float rightSide = float3.Dot(right.GlobalPosition - mid, physicalRight);
+        float leftSide = float3.Dot(left.GlobalPosition - mid, physicalRight);
+        if (!(rightSide < -margin && leftSide > margin))
+            return false;
+
+        SwapSides(BodyNode.LeftEye, BodyNode.LeftEye);
+        LumoraLogger.Warn($"HumanoidRig: MIRRORED eyes - RightEye '{right.SlotName.Value}' at {rightSide:+0.000;-0.000} m, "
+                        + $"LeftEye '{left.SlotName.Value}' at {leftSide:+0.000;-0.000} m along the physical right; swapped");
+        return true;
+    }
+
+    // Move every keyed bone in [leftFirst..leftLast] to its right-side node and vice versa. Both sides are
+    // cleared first so a half-filled pair cannot collide with itself on the way across.
+    private int SwapSides(BodyNode leftFirst, BodyNode leftLast)
+    {
+        var moved = new List<(BodyNode node, Slot bone)>();
+        for (var n = leftFirst; n <= leftLast; n++)
+        {
+            var r = n.GetRightSide();
+            var leftBone = TryGetBone(n);
+            var rightBone = TryGetBone(r);
+            if (leftBone != null) moved.Add((r, leftBone));
+            if (rightBone != null) moved.Add((n, rightBone));
+            Bones.Remove(n);
+            Bones.Remove(r);
+        }
+        foreach (var (node, bone) in moved)
+            SetBone(node, bone);
+        return moved.Count;
+    }
+
+    // Walk one chain root-to-tip along the pair's own axis. The root defines its side, so it can never be
+    // wrong here; each later bone clearly past the midline is re-keyed to a correct-side candidate under
+    // the last bone that was on the right side. The optional shoulder sits ABOVE the root in the
+    // hierarchy, so a wrong-sided one has no anchor to search under: it is reported and left.
+    private bool CheckChainSides(in LimbPair pair, Chirality side, Dictionary<Slot, BodyNode>? classified,
+        ref bool handRekeyed)
+    {
+        bool isArm = pair.LeftRoot == BodyNode.LeftUpperArm;
+        BodyNode[] chain = isArm
+            ? new[] { BodyNode.LeftShoulder, BodyNode.LeftUpperArm, BodyNode.LeftLowerArm, BodyNode.LeftHand }
+            : new[] { BodyNode.LeftUpperLeg, BodyNode.LeftLowerLeg, BodyNode.LeftFoot, BodyNode.LeftToes };
+        int rootIndex = isArm ? 1 : 0;
+        float expected = side == Chirality.Left ? 1f : -1f;
+        float margin = pair.Span * SideMarginFraction;
+        if (pair.Axis.LengthSquared < 0.5f)
+            return false;
+
+        bool changed = false;
+        Slot? anchor = null;
+        for (int i = 0; i < chain.Length; i++)
+        {
+            var node = chain[i].GetSide(side);
+            var bone = TryGetBone(node);
+            if (bone == null || bone.IsDestroyed)
+                continue;
+
+            // Positive = on the chain's own side.
+            float s = float3.Dot(bone.GlobalPosition - pair.Mid, pair.Axis) * expected;
+            if (s >= -margin)
+            {
+                if (i >= rootIndex)
+                    anchor = bone;
+                continue;
+            }
+
+            if (i < rootIndex || anchor == null)
+            {
+                LumoraLogger.Warn($"HumanoidRig: {node} '{bone.SlotName.Value}' sits {(-s):F3} m on the WRONG side of the "
+                                + $"{pair.RightRoot}->{pair.LeftRoot} line (margin {margin:F3} m) and has no chain bone above it "
+                                + "to search under; left as named");
+                continue;
+            }
+
+            var candidate = FindSideCandidate(node, anchor, classified, in pair, expected, margin);
+            if (candidate == null)
+            {
+                LumoraLogger.Warn($"HumanoidRig: {node} '{bone.SlotName.Value}' sits {(-s):F3} m on the WRONG side of the "
+                                + $"{pair.RightRoot}->{pair.LeftRoot} line (margin {margin:F3} m) but no correct-side bone "
+                                + $"under '{anchor.SlotName.Value}' is named {node} or unclassified; left as named, NOT guessed");
+                continue;
+            }
+
+            float cs = float3.Dot(candidate.GlobalPosition - pair.Mid, pair.Axis) * expected;
+            LumoraLogger.Warn($"HumanoidRig: re-keyed {node}: '{bone.SlotName.Value}' ({(-s):F3} m wrong side) -> "
+                            + $"'{candidate.SlotName.Value}' ({cs:F3} m correct side), found under '{anchor.SlotName.Value}'");
+            SetBone(node, candidate);
+            anchor = candidate;
+            changed = true;
+            if (node.IsHand())
+            {
+                handRekeyed = true;
+                changed |= DropStrayFingers(side, candidate) > 0;
+            }
+        }
+
+        // Fingers ride on the hand. Any that are not under the (possibly re-keyed) hand slot belong to
+        // some other hand; drop them so the geometric pass can find the real ones.
+        if (isArm)
+        {
+            var hand = TryGetBone(BodyNode.LeftHand.GetSide(side));
+            if (hand != null && !hand.IsDestroyed && DropStrayFingers(side, hand) > 0)
+            {
+                changed = true;
+                handRekeyed = true;
+            }
+        }
+        return changed;
+    }
+
+    // A slot under `anchor` that the names classified as `node` (preferred) or left unclassified, on the
+    // chain's correct side by the full margin, not already keyed to another node. Nearest in hierarchy
+    // wins among equals: a wrist is normally the forearm's direct child. With no classification table
+    // (a pre-keyed rig and no skeleton) only same-named slots qualify, because an unclassified slot under
+    // an arm could be a prop, a collider or an equipped object rather than a bone.
+    private Slot? FindSideCandidate(BodyNode node, Slot anchor, Dictionary<Slot, BodyNode>? classified,
+        in LimbPair pair, float expected, float margin)
+    {
+        Slot? best = null;
+        int bestRank = int.MaxValue;
+        int bestDepth = int.MaxValue;
+        foreach (var slot in anchor.GetDescendants(false))
+        {
+            if (slot == null || slot.IsDestroyed || IsExcludedFromIK(slot.SlotName.Value))
+                continue;
+
+            var keyed = GetBoneType(slot);
+            if (keyed != BodyNode.NONE && keyed != node)
+                continue;
+
+            int rank;
+            if (classified != null)
+            {
+                if (!classified.TryGetValue(slot, out var cls))
+                    continue;   // not a skeleton bone at all
+                if (cls == node) rank = 0;
+                else if (cls == BodyNode.NONE) rank = 1;
+                else continue;
+            }
+            else
+            {
+                if (ClassifyBoneName(slot.SlotName.Value, out _) != node)
+                    continue;
+                rank = 0;
+            }
+
+            float s = float3.Dot(slot.GlobalPosition - pair.Mid, pair.Axis) * expected;
+            if (s < margin)
+                continue;
+
+            int depth = DepthBelow(anchor, slot);
+            if (rank < bestRank || (rank == bestRank && depth < bestDepth))
+            {
+                best = slot;
+                bestRank = rank;
+                bestDepth = depth;
+            }
+        }
+        return best;
+    }
+
+    private static int DepthBelow(Slot ancestor, Slot slot)
+    {
+        int depth = 0;
+        var p = slot.Parent;
+        while (p != null && p != ancestor && depth < 256)
+        {
+            depth++;
+            p = p.Parent;
+        }
+        return depth;
+    }
+
+    // Remove this side's palm and finger keys whose slots are not under `hand`. Returns how many went.
+    private int DropStrayFingers(Chirality side, Slot hand)
+    {
+        int dropped = 0;
+        var names = new System.Text.StringBuilder();
+        var start = BodyNode.LeftPalm.GetSide(side);
+        var end = BodyNode.LeftPinky_Tip.GetSide(side);
+        for (var n = start; n <= end; n++)
+        {
+            var bone = TryGetBone(n);
+            if (bone == null || bone.IsDestroyed || bone.IsDescendantOf(hand))
+                continue;
+            if (names.Length > 0) names.Append(", ");
+            names.Append(n).Append("='").Append(bone.SlotName.Value).Append('\'');
+            Bones.Remove(n);
+            dropped++;
+        }
+        if (dropped > 0)
+        {
+            LumoraLogger.Warn($"HumanoidRig: dropped {dropped} {side} finger key(s) not under hand '{hand.SlotName.Value}' "
+                            + $"({names}); geometric finger detection will rebuild what it can");
+        }
+        return dropped;
+    }
+
     // ----- GEOMETRIC FINGER DETECTION -------------------------------------------------------------------
 
-    /// <summary>
-    /// Refine finger bones on both hands. Name-based classification (run during populate) is the primary
-    /// path; this re-detects any hand whose fingers the names couldn't resolve, using only geometry.
-    /// </summary>
+    // Refine finger bones on both hands. Name-based classification (run during populate) is the primary
+    // path; this re-detects any hand whose fingers the names couldn't resolve, using only geometry.
     public void DetectHandRigs()
     {
         var left = TryGetBone(BodyNode.LeftHand);
@@ -924,12 +1416,10 @@ public class HumanoidRig : Component
             DetectHandRig(right, Chirality.Right);
     }
 
-    /// <summary>
-    /// Geometrically detect the five fingers under a hand when names didn't. Finds the single-child chains
-    /// descending from the hand (or its palm), picks the thumb (by name, else the shortest/most-divergent
-    /// chain), sorts the remaining four by their root's distance to the thumb to assign Index->Pinky, then
-    /// walks each chain assigning Metacarpal/Proximal/Intermediate/Distal/Tip (the thumb skips Intermediate).
-    /// </summary>
+    // Geometrically detect the five fingers under a hand when names didn't. Finds the single-child chains
+    // descending from the hand (or its palm), picks the thumb (by name, else the shortest/most-divergent
+    // chain), sorts the remaining four by their root's distance to the thumb to assign Index->Pinky, then
+    // walks each chain assigning Metacarpal/Proximal/Intermediate/Distal/Tip (the thumb skips Intermediate).
     public bool DetectHandRig(Slot hand, Chirality chirality)
     {
         // Clear any partially/incorrectly named finger bones for this side before re-detecting.
@@ -1086,9 +1576,6 @@ public class HumanoidRig : Component
         }
     }
 
-    /// <summary>
-    /// Log diagnostic info about this rig.
-    /// </summary>
     public void LogDiagnosticInfo()
     {
         LumoraLogger.Log($"HumanoidRig Diagnostic Info:");

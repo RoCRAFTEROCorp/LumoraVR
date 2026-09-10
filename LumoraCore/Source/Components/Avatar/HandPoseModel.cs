@@ -7,11 +7,9 @@ using Lumora.Core.Math;
 
 namespace Lumora.Core.Components.Avatar;
 
-/// <summary>
-/// A small parametric hand model that generates wrist-local finger-node positions
-/// from a per-finger curl (and splay) angle. Used to synthesize preset poses and
-/// to apply curl/splay offsets, all in position space.
-/// </summary>
+// A small parametric hand model that generates wrist-local finger-node positions
+// from a per-finger curl (and splay) angle. Used to synthesize preset poses and
+// to apply curl/splay offsets, all in position space.
 // Kinematic model with eyeballed numbers. Coordinate convention (purely internal:
 // HandPoseDriver consumes only direction-between-consecutive-nodes, so the absolute
 // frame just has to be self-consistent):
@@ -76,12 +74,10 @@ internal static class HandPoseModel
         _ => Pinky,
     };
 
-    /// <summary>
-    /// Generate the wrist-local positions for one finger.
-    /// <paramref name="curl01"/> 0 = straight, 1 = full fist. <paramref name="extraSplay"/>
-    /// is added to the finger's rest splay (radians). Writes positions through
-    /// <paramref name="emit"/> keyed by node.
-    /// </summary>
+    // Generate the wrist-local positions for one finger.
+    // curl01 0 = straight, 1 = full fist. extraSplay
+    // is added to the finger's rest splay (radians). Writes positions through
+    // emit keyed by node.
     public static void GenerateFinger(
         FingerType finger, Chirality side, float curl01, float extraSplay,
         Action<BodyNode, float3> emit)
@@ -102,7 +98,14 @@ internal static class HandPoseModel
         // Flexion axis: perpendicular to forward in the palm plane. With forward
         // along +Z and palm facing -Y, flexion is about X; carry the splay so the
         // axis stays square to the splayed finger.
-        float3 flexAxis = (splayRot * float3.Right) * xSign;
+        //
+        // NOT mirrored with the hand. A left hand is the right hand reflected across the YZ plane,
+        // and a reflection leaves Y and Z alone: both hands curl from +Z toward -Y. Negating the axis
+        // here as well turned the left hand into the RIGHT hand rotated half a turn about the finger
+        // axis (thumb at -X, curl toward +Y), which no rotation of a bone frame can ever turn back
+        // into a left hand. Verified numerically: with the sign in, the left middle finger's first
+        // segment came out (0, +0.48, 0.88), the right's (0, -0.48, 0.88). -xlinka
+        float3 flexAxis = splayRot * float3.Right;
 
         // Metacarpal node sits at the wrist end of the metacarpal bone (origin side);
         // we place it slightly back along -forward from the knuckle so the
@@ -146,7 +149,7 @@ internal static class HandPoseModel
         FingerSegmentType seg, Chirality side, float3 pos)
         => emit(finger.ComposeFinger(seg, side), pos);
 
-    /// <summary>Generate a whole hand at a uniform curl/splay.</summary>
+    // Generate a whole hand at a uniform curl/splay.
     public static void GenerateHand(Chirality side, float curl01, float extraSplay, Action<BodyNode, float3> emit)
     {
         foreach (var finger in HandPoseNodes.Fingers)

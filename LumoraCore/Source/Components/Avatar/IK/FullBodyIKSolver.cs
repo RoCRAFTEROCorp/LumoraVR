@@ -14,8 +14,9 @@ namespace Lumora.Core.Components.Avatar.IK;
 //     FABRIK under a per-segment stiffness ramp,
 //   - solves each arm with a SHOULDER swing + analytic two-bone IK + forearm TWIST RELAX,
 //   - solves each leg with analytic two-bone IK, ground-aligned feet and TOE articulation,
-//   - bends elbows/knees toward a DYNAMIC pole (rest joint swung to follow the limb) that an
-//     optional BEND GOAL can steer,
+//   - bends elbows as a SWIVEL ANGLE about the shoulder->hand axis: the rest bend carries small swings, the
+//     hand's position in the shoulder frame decides big ones, and an optional BEND GOAL (elbow tracker)
+//     overrides in the same swivel space; knees keep the rest/preference pole with the same goal blend,
 //   - blends every effector by a per-target POSITION/ROTATION WEIGHT (rest hang <-> full IK),
 //   - STRETCHES limbs slightly past reach, with an anti-lock so they never fully straighten.
 // Tunables are public instance fields so the component can drive them from sync values at runtime.
@@ -32,7 +33,8 @@ public sealed class FullBodyIKSolver
         public float PositionWeight;
         public float RotationWeight;
 
-        // Optional elbow/knee steer: the bend pole is pulled toward BendGoal by BendGoalWeight.
+        // Optional elbow/knee steer. Only the DIRECTION of BendGoal around the root->target axis is used: it is
+        // converted to a swivel angle and the pole swivels toward it by BendGoalWeight (1 = the goal decides).
         public bool HasBendGoal;
         public float3 BendGoal;
 
@@ -65,8 +67,45 @@ public sealed class FullBodyIKSolver
     public float MaxStretch = 1.08f;       // max limb over-extension past rest length
     public float PelvisDamp = 0.65f;       // hips smoothing toward the anchor (1 = snap)
     public float SpineStiffness = 0.2f;    // base pull toward the straight hips->head line
-    public float BendGoalWeight = 0.5f;    // how strongly a bend goal steers the pole
+    // A supplied bend goal is an elbow/knee TRACKER (or the component saying "put it here"), so it decides the
+    // swivel outright. 0.5 was a position lerp between the pole and the goal, which meant a real tracker only
+    // ever got half a vote and the result depended on how far the goal sat from the root. -xlinka
+    public float BendGoalWeight = 1f;      // 0..1 swivel blend from the computed pole toward the bend goal
     public float TwistRelax = 0.5f;        // forearm roll distributed toward the hand
+
+    // Elbow swivel from the HAND POSITION IN THE SHOULDER FRAME. The pole is a point on the circle around the
+    // shoulder->hand axis, parameterised by an angle: 0 is the base direction (down for a reach in front, back
+    // for a hanging arm, both carried by one rotation of the body frame onto the axis), positive swings the
+    // elbow OUTWARD, negative inward. The angle is a sum of three clamped linear terms on where the hand sits
+    // relative to the shoulder, each normalised by arm reach so the same numbers fit every avatar size:
+    //   height:  a hand lifted from the hip to overhead walks the elbow from down, to out, to slightly up;
+    //   reach:   a hand pulled in toward the chest flares the elbow out, an extended arm lets it drop;
+    //   outward: a cross-body hand pushes the elbow out to clear the torso, a hand far to the side drops it.
+    // Then a per-avatar offset, then a clamp so the elbow never ends up above or in front of the axis.
+    // This replaces transporting the rest bend by the minimal rotation for big swings: from a hanging rest to
+    // a hand at chest height that is a 90-135 degree swing whose rotation axis is whatever the cross product
+    // happened to give, and it left the elbow winged behind the torso. Radians; the component converts. -xlinka
+    public float SwivelBase = 0.611f;         // ~35 deg: swivel with the hand at shoulder height, arm half-extended
+    public float SwivelOffset = 0f;           // per-avatar trim added before the clamp
+    public float SwivelHeightGain = 1.309f;   // ~75 deg per reach of hand height above the shoulder
+    public float SwivelHeightMin = -0.436f;   // ~-25 deg: a hand at the hip can only tuck the elbow this far
+    public float SwivelHeightMax = 1.134f;    // ~65 deg: an overhead hand can only lift it this far
+    public float SwivelReachStart = 0.6f;     // reach fraction where pulling the hand in starts to flare the elbow
+    public float SwivelReachGain = 1.047f;    // ~60 deg per reach of pull-in below SwivelReachStart
+    public float SwivelReachMax = 0.524f;     // ~30 deg cap on the flare
+    public float SwivelOutwardStart = 0.1f;   // outward fraction that is neutral (the hand's natural line)
+    public float SwivelOutwardGain = 0.873f;  // ~50 deg per reach of cross-body travel
+    public float SwivelOutwardMin = -0.349f;  // ~-20 deg: a hand far to the side drops the elbow this much
+    public float SwivelOutwardMax = 0.524f;   // ~30 deg: a cross-body hand lifts it this much
+    public float SwivelMin = -0.436f;         // ~-25 deg: never further inward than this
+    public float SwivelMax = 2.443f;          // ~140 deg: never above the axis (180 would be elbow-up)
+    // The authored rest bend still owns SMALL swings (a hanging arm swinging as you walk keeps the artist's
+    // elbow); it is faded out across this band of swing-from-rest so the hand swivel takes over big reaches
+    // without a step. Band placement, measured: the walk counter-swing is ~23 deg from the hang and the crouch
+    // fold ~37 deg (both stay authored), while an A-pose hang to a tool held at chest height is ~59 deg, and
+    // that is the pose the hand swivel exists for, so the band has to be mostly gone by then. -xlinka
+    public float RestPoleSwingKeep = 0.785f;  // ~45 deg: rest bend fully trusted below this swing from rest
+    public float RestPoleSwingDrop = 1.134f;  // ~65 deg: and ignored above this
     // Additive cosmetic offset on the hips anchor. Y carries the vertical body bob (dip while a foot is airborne);
     // X/Z carry the HORIZONTAL body settle that eases the torso toward the centroid of the planted feet (biased to
     // the support foot). Both are computed by the component (smoothed there) and pushed in each solve - the gait
@@ -115,9 +154,28 @@ public sealed class FullBodyIKSolver
     // Wrist roll steering the elbow (0..1): rolling a tracked wrist swings the bend pole around the arm
     // axis, the way a real forearm follows the hand. 0 disables.
     public float WristBendInfluence = 0.5f;
+    // Wrist roll below this (radians) does not move the elbow at all; only the roll BEYOND it steers. A tracked
+    // wrist is never perfectly neutral, and without a dead zone every small roll walked the elbow around the
+    // arm axis and fought the hand-position swivel. -xlinka
+    public float WristBendDeadZone = 0.698f;  // ~40 deg
     // Chest yaw toward tracked hands (0..1): a cross-body or two-handed reach carries the upper torso
     // instead of leaving all the stretch to the shoulder. 0 disables; untracked hands contribute nothing.
     public float ChestFollowHands = 0.2f;
+
+    // What decided each arm's elbow pole on the last solve, for the ARMDIAG line. Source is the dominant voter:
+    // Rest when the authored bend carried more than half, Goal when a bend goal did, Hand otherwise. -xlinka
+    public enum PoleSource : byte { None, Rest, Hand, Goal }
+
+    public struct PoleDebug
+    {
+        public PoleSource Source;
+        public float SwivelRad;      // final pole angle in the arm's swivel frame (after rest/goal/wrist)
+        public float HandSwivelRad;  // the hand-position term alone, clamped
+        public float RestWeight;     // how much the authored rest bend voted (0..1)
+    }
+
+    public PoleDebug LeftArmPole { get; private set; }
+    public PoleDebug RightArmPole { get; private set; }
 
     private const float ToeCurlAngle = 0.5f;     // radians the toe curls at peak step lift
     private const float StiffnessTaper = 0.6f;   // upper spine is (1 - this) as stiff as the base
@@ -126,7 +184,6 @@ public sealed class FullBodyIKSolver
     private const float BreathPeriodSeconds = 4.3f;   // full breath cycle
     private const float BreathPitchRad = 0.021f;      // chest pitch amplitude at BreathingWeight 1 (~1.2 deg)
     private const float ArmSwingReachFraction = 0.30f; // walking hand swing amplitude as a fraction of arm reach
-    private const float ArmIdleDriftFraction = 0.035f; // standing hand drift amplitude as a fraction of arm reach
 
     private HumanoidRig _rig = null!;
     private bool _captured;
@@ -141,12 +198,29 @@ public sealed class FullBodyIKSolver
     // Used to hang untracked arms, stand untracked legs on the floor, and yaw the torso toward the head.
     private float _restStandHeight;                    // hips height above the sole plane in the rest pose (live scale)
     private float _restHeadHeight;                     // head height above the sole plane in the rest pose (live scale)
+
+    // Read by the one-shot pose diagnostic. Everything the solver believes about how this body stands
+    // comes from these three, and all three come from whatever pose the bones happened to be in when
+    // the solver initialised - so when a body stands wrong, this is where to look first.
+    public float RestStandHeight => _restStandHeight;
+    public float3 RestBodyForward => _restBodyForward;
+    public float3 CurrentBodyForward => _curBodyForward;
+    public float RestHeadHeight => _restHeadHeight;
     // Foot BONE height above the sole plane at rest (live scale), per foot. The gait reads these so a
     // planted foot bone sits at its authored height instead of burying the paw in the floor. -xlinka
     public float LeftFootGroundClearance { get; private set; }
     public float RightFootGroundClearance { get; private set; }
     private const float CrouchHipsMinFraction = 0.34f; // deep squat: hips descend toward the heels
     private const float CrouchSpineSlack = 0.92f;      // spine may shorten this much at full crouch (hunch + back-lean)
+    // How far one vertebra may deviate from the one below it. Roughly what a human lumbar/thoracic
+    // joint gives before the next one has to take over; loose enough that a deliberate hunch still
+    // reads, tight enough that the chain cannot double back on itself.
+    private const float SpineMaxBendPerJoint = 0.45f;  // radians, ~26 degrees
+
+    // A back arches backwards far less than it folds forwards. Roughly the ratio the anatomical ranges
+    // give across lumbar and thoracic, and it is the only direction whose limit changed when per-joint
+    // constraints landed: forward and lateral keep the value the crouch work was tuned against.
+    private const float SpineExtensionFraction = 0.45f;
     private float3 _curBodyForward = float3.Backward;  // flattened visual/body forward this frame
     private float3 _curBodyRight = float3.Right;        // body +X (right) this frame
     private floatQ _bodyYawDelta = floatQ.Identity;    // yaw applied to the torso so it follows the body frame
@@ -154,12 +228,22 @@ public sealed class FullBodyIKSolver
     // Body facing at capture (flattened) + the turn from it to the current facing, used to yaw
     // ground-aligned procedural feet and to swing rest-hang/rest-rotation blends with the body.
     private float3 _restBodyForward = float3.Backward;
+    private float _crouchLerp;                         // 0 standing .. 1 fully crouched
+
+    // Crouching folds the arms IN FRONT of the body rather than leaving them hanging through the legs,
+    // and quiets the walk swing while they are there. Fractions of arm reach, so they scale with the
+    // avatar. Forward is the big one: it is what stops the hands intersecting the thighs. -xlinka
+    private const float CrouchArmForward = 0.34f;      // of arm reach, along body forward
+    private const float CrouchArmUp = 0.28f;           // of arm reach, up toward the chest
+    private const float CrouchArmIn = 0.08f;           // of arm reach, toward the body midline
+    private const float CrouchSwingDamp = 0.25f;       // walk swing left at full crouch
     private floatQ _bodyTurn = floatQ.Identity;
 
     // Spine chain (filtered to existing bones, hips..head).
     private readonly List<Slot> _spine = new();
     private float[] _spineLengths = null!;
     private float3[] _spineJoints = null!;
+    private FabrikSolver.JointLimit[] _spineLimits = null!;
 
     // Limb bone slots.
     private Slot _lShoulder = null!, _lUpper = null!, _lLower = null!, _lHand = null!;
@@ -309,6 +393,20 @@ public sealed class FullBodyIKSolver
 
         _spineLengths = new float[_spine.Count - 1];
         _spineJoints = new float3[_spine.Count];
+
+        // Built once, not per frame. Forward flex and lateral bend keep the tuned SpineMaxBendPerJoint
+        // exactly as they were, because the crouch depth work is measured against them and a spine really
+        // does flex that far. Only EXTENSION is tightened: the old symmetric cone let the chain arch
+        // backwards as far as it could fold forwards, which no back does, and it is why a head target
+        // behind the hips produced a bend nothing anatomical would make. -xlinka
+        _spineLimits = new FabrikSolver.JointLimit[_spine.Count - 1];
+        for (int i = 0; i < _spineLimits.Length; i++)
+        {
+            _spineLimits[i] = new FabrikSolver.JointLimit(
+                SpineMaxBendPerJoint,
+                SpineMaxBendPerJoint * SpineExtensionFraction,
+                SpineMaxBendPerJoint);
+        }
 
         _lShoulder = _rig.TryGetBone(BodyNode.LeftShoulder);
         _lUpper = _rig.TryGetBone(BodyNode.LeftUpperArm);
@@ -589,6 +687,19 @@ public sealed class FullBodyIKSolver
         float3 bodyRight = float3.Cross(curFwd, float3.Up);
         _curBodyRight = bodyRight.LengthSquared > 1e-6f ? bodyRight.Normalized : float3.Right;
 
+        // How far into a crouch the body is, 0..1, measured the only way that is avatar-size independent:
+        // how far the head has dropped below where it stands, as a fraction of half the standing height.
+        // The hips and spine already handle crouch; the ARMS did not, and that is most of why a crouched
+        // avatar looked wrong - the arms kept hanging straight down through the thighs and kept swinging
+        // at full walking amplitude while folded up. -xlinka
+        _crouchLerp = 0f;
+        if (GroundY.HasValue && _restHeadHeight > 1e-4f)
+        {
+            float standHeadY = GroundY.Value + _restHeadHeight;
+            float drop = MathF.Max(0f, standHeadY - headTarget.Position.y);
+            _crouchLerp = System.Math.Clamp(drop / (_restHeadHeight * 0.5f), 0f, 1f);
+        }
+
         // Body facing: turn the body frame toward the locomotion/body forward. The head bone itself is pinned later
         // to the live view rotation, so creator view offsets cannot rotate the hips or make W walk sideways.
         float restYaw = MathF.Atan2(_restBodyForward.x, _restBodyForward.z);
@@ -772,7 +883,13 @@ public sealed class FullBodyIKSolver
             _spineJoints[i] = _spine[i].GlobalPosition;
         _spineJoints[0] = hipsFinal;
 
-        FabrikSolver.SolveChain(_spineJoints, _spineLengths, headPos, iterations: 12, tolerance: 0.001f);
+        // Cone-limited per vertebra. Unconstrained FABRIK will meet a head target that is close to the
+        // hips by folding the spine into a hairpin, because segment length is the only rule it knows -
+        // which is what a crouch asks for and where it looked worst. The stiffness pull below is a
+        // SOFT bias toward straight and cannot stop a fold on its own; this is the hard limit that a
+        // spine actually has. -xlinka
+        FabrikSolver.SolveChain(_spineJoints, _spineLengths, headPos, _spineLimits, _curBodyForward,
+            iterations: 12, tolerance: 0.001f);
 
         // Stiffness: pull interior joints toward the straight hips->head line so the spine resists
         // over-bending. Stiffer low (lumbar stable), looser high (thoracic mobile).
@@ -849,6 +966,37 @@ public sealed class FullBodyIKSolver
     // Natural resting hand position for an untracked arm: hang down the body frame from the shoulder root, outward
     // (side = -1 left / +1 right) and back. Independent of the model's authored bind pose, so any rig
     // rests in a clean by-the-side idle on desktop instead of a frozen splay. -xlinka
+    // How extended the authored arm has to be before it counts as a relaxed hang rather than a pose. A
+    // real hanging arm keeps a slight elbow bend and sits well above this; a held or folded one is far
+    // below it.
+    private const float AuthoredHangMinExtension = 0.7f;
+
+    // Do BOTH authored arms read as a relaxed hang? Decided for the pair, never per arm.
+    //
+    // Two tests have to pass: the arm points down, and it is actually EXTENDED. Downward alone accepts a
+    // frozen gesture, because an avatar saved holding something still has a downward shoulder-to-hand
+    // vector while its hand sits tucked near its own shoulder.
+    //
+    // Asking per ARM is what produced the visible fault. On a real avatar the two came out at 94% and 40%
+    // of their own reach - one a genuine hang, the other a held pose - so one arm kept the author's idle
+    // and the other fell back to the computed one, and the body wore two different idles at once. The
+    // authored pose is only usable as an idle if the WHOLE authored pose is one, so both arms decide it
+    // together and both take the same path. -xlinka
+    private bool AuthoredArmsHang()
+    {
+        return ArmRestIsHang(in _lArmRest, _lUpperArmLen + _lLowerArmLen)
+            && ArmRestIsHang(in _rArmRest, _rUpperArmLen + _rLowerArmLen);
+    }
+
+    private static bool ArmRestIsHang(in LimbRestPose rest, float reach)
+    {
+        return rest.Valid
+            && rest.RootToEnd.LengthSquared > 1e-8f
+            && rest.RootToEnd.Normalized.y < -0.35f
+            && reach > 1e-4f
+            && rest.RootToEnd.Length >= AuthoredHangMinExtension * reach;
+    }
+
     private float3 NaturalArmHang(float3 root, float armReach, float side)
     {
         // Keep the wrist visibly beside and slightly behind the torso. This is intentionally component-based instead
@@ -922,8 +1070,7 @@ public sealed class FullBodyIKSolver
         // For a T-pose-authored rig that pose is a bad idle (arms straight out), so fall back to the computed
         // by-the-side hang. Detect via the rest shoulder->hand offset pointing clearly downward. -xlinka
         LimbRestPose restPose = rootNode == BodyNode.LeftUpperArm ? _lArmRest : _rArmRest;
-        bool authoredHangsDown = restPose.Valid && restPose.RootToEnd.LengthSquared > 1e-8f
-            && restPose.RootToEnd.Normalized.y < -0.35f;
+        bool authoredHangsDown = AuthoredArmsHang();
         float3 restEnd = authoredHangsDown
             ? root + _bodyTurn * restPose.RootToEnd
             : NaturalArmHang(root, upperLen + lowerLen, side);
@@ -936,19 +1083,23 @@ public sealed class FullBodyIKSolver
         if (pw < 0.999f && armReach > 1e-4f)
         {
             float life = 1f - pw;
+
+            // Crouch fold, before the idle motions so they ride the folded pose rather than the hanging one.
+            if (_crouchLerp > 1e-3f)
+            {
+                float c = _crouchLerp * life;
+                restEnd += _curBodyForward * (CrouchArmForward * armReach * c)
+                         + float3.Up * (CrouchArmUp * armReach * c)
+                         - _curBodyRight * (CrouchArmIn * armReach * c * side);
+            }
+
             if (ArmSwingWeight > 1e-3f)
             {
+                // A crouched walk barely swings the arms; they are up and braced, not hanging free.
+                float swingDamp = 1f - (1f - CrouchSwingDamp) * _crouchLerp;
                 float swing = MathF.Sin(ArmSwingPhase + (side > 0f ? MathF.PI : 0f))
-                            * ArmSwingWeight * ArmSwingReachFraction * armReach;
+                            * ArmSwingWeight * ArmSwingReachFraction * armReach * swingDamp;
                 restEnd += _curBodyForward * (swing * life);
-            }
-            if (IdleWeight > 1e-3f)
-            {
-                float ph = TimeSeconds * 0.45f + (side > 0f ? 2.1f : 0f);
-                float fwdDrift = MathF.Sin(ph) + 0.6f * MathF.Sin(ph * 1.7f + 1.3f);
-                float sideDrift = MathF.Sin(ph * 0.83f + 0.5f) + 0.5f * MathF.Sin(ph * 1.31f);
-                float amp = ArmIdleDriftFraction * armReach * IdleWeight * life;
-                restEnd += _curBodyForward * (fwdDrift * amp) + _curBodyRight * (sideDrift * amp * 0.6f * side);
             }
         }
 
@@ -978,34 +1129,14 @@ public sealed class FullBodyIKSolver
             }
         }
 
-        // Bend pole starts from the rig's captured bend plane when one exists. If the import gave no usable bend
-        // plane, fall back to a conservative behind/down/out elbow so idle arms do not fold into the chest.
-        float3 preferredPole = ArmBendPreference(rootNode, upper, lower, hand, side);
-        float3 pole = ComputePole(root, goalPos, in restPose, preferredPole, (upperLen + lowerLen) * 0.45f,
-            target.HasBendGoal, target.BendGoal, true);
-
-        // Wrist-led elbow: rolling a tracked wrist swings the bend pole around the arm axis (palm-up flips the
-        // elbow out, palm-down tucks it in), the way a real forearm follows the hand. The roll is the hand
-        // target's twist about the shoulder->goal axis relative to the transported rest wrist, so a neutral
-        // wrist leaves the pole untouched. Explicit knee/elbow trackers (bend goals) take precedence. -xlinka
-        if (WristBendInfluence > 1e-4f && pw > 1e-4f && !target.HasBendGoal
-            && _restRot.TryGetValue(hand, out var wristRest))
-        {
-            float3 limbAxis = goalPos - root;
-            if (limbAxis.LengthSquared > 1e-8f)
-            {
-                limbAxis = limbAxis.Normalized;
-                floatQ delta = target.Rotation * (_bodyTurn * wristRest).Inverse;
-                floatQ twist = TwistAround(delta, limbAxis);
-                float roll = WrapPi(2f * MathF.Atan2(
-                    twist.x * limbAxis.x + twist.y * limbAxis.y + twist.z * limbAxis.z, twist.w));
-                float swingAngle = System.Math.Clamp(
-                    roll * WristBendInfluence * pw * System.Math.Clamp(target.RotationWeight, 0f, 1f),
-                    -MaxWristBendSwing, MaxWristBendSwing);
-                if (MathF.Abs(swingAngle) > 1e-3f)
-                    pole = root + floatQ.AxisAngleRad(limbAxis, swingAngle) * (pole - root);
-            }
-        }
+        // Elbow pole as a swivel angle about shoulder->goal: authored rest bend for small swings, hand position in
+        // the shoulder frame for big ones, an elbow tracker over both, then the wrist roll past its dead zone.
+        float3 pole = ComputeArmPole(root, goalPos, in restPose, upperLen + lowerLen, side, hand, pw, in target,
+            out var poleDebug);
+        if (rootNode == BodyNode.LeftUpperArm)
+            LeftArmPole = poleDebug;
+        else
+            RightArmPole = poleDebug;
 
         Stretch(root, goalPos, ref upperLen, ref lowerLen);
         FabrikSolver.SolveTwoBone(root, pole, goalPos, upperLen, lowerLen, out var mid, out var end);
@@ -1091,27 +1222,191 @@ public sealed class FullBodyIKSolver
         pitch = MathF.Atan2(u, horiz);
     }
 
-    private float3 ArmBendPreference(BodyNode rootNode, Slot? upper, Slot? lower, Slot? hand, float side)
+    // Swivel frame for an arm: rotate the body frame so its forward lands on the shoulder->goal axis, and take
+    // where body-down and body-outward went as the circle's base (u) and positive (v) directions. One rotation
+    // for every reach direction, so the frame turns continuously as the hand moves: a hand in front gets
+    // u = down; a hanging hand gets u = back (the natural hang); an overhead hand gets u = forward with the
+    // height term swinging the elbow round to out/back. v is rebuilt from the cross product so it is exactly
+    // perpendicular and always means OUTWARD for this arm. The one seam is a hand directly BEHIND the
+    // shoulder at shoulder height (axis antiparallel to forward), where the fallback picks the yaw flip;
+    // that pose is rare and the rest bend has long since faded out there. -xlinka
+    private void ArmSwivelFrame(float3 axis, float side, out float3 u, out float3 v)
     {
-        float3 fallback = -_curBodyForward + _curBodyRight * (side * 0.24f) + float3.Down * 0.25f;
-
-        if (TryGuideBend(rootNode, out var guided))
+        floatQ toAxis = FabrikSolver.FromToRotation(_curBodyForward, axis, float3.Up);
+        u = toAxis * float3.Down;
+        u -= axis * float3.Dot(u, axis);
+        if (u.LengthSquared < 1e-8f)
         {
-            float f = float3.Dot(guided, _curBodyForward);
-            float outward = float3.Dot(guided, _curBodyRight) * side;
-            if (f < 0.20f || outward > 0.20f)
-                return guided + float3.Down * 0.12f;
+            u = _curBodyForward * -1f;
+            u -= axis * float3.Dot(u, axis);
+            if (u.LengthSquared < 1e-8f)
+                u = float3.Cross(axis, _curBodyRight);
+        }
+        u = u.Normalized;
+        // side * cross(u, axis) is where the body's outward axis lands under the same rotation.
+        v = float3.Cross(u, axis) * side;
+        v = v.LengthSquared > 1e-8f ? v.Normalized : float3.Cross(axis, u);
+    }
+
+    // Hand-position swivel: three clamped linear terms on the hand's height / forward reach / outward offset in the
+    // shoulder frame (each divided by arm reach), a base, the per-avatar offset, then the hard clamp. -xlinka
+    private float HandSwivel(float3 limb, float reach, float side)
+    {
+        float inv = reach > 1e-4f ? 1f / reach : 0f;
+        float up = float3.Dot(limb, float3.Up) * inv;
+        float forward = float3.Dot(limb, _curBodyForward) * inv;
+        float outward = float3.Dot(limb, _curBodyRight) * side * inv;
+
+        float swivel = SwivelBase + SwivelOffset
+            + System.Math.Clamp(SwivelHeightGain * up, SwivelHeightMin, SwivelHeightMax)
+            + System.Math.Clamp(SwivelReachGain * (SwivelReachStart - forward), 0f, SwivelReachMax)
+            + System.Math.Clamp(SwivelOutwardGain * (SwivelOutwardStart - outward), SwivelOutwardMin, SwivelOutwardMax);
+        return System.Math.Clamp(swivel, SwivelMin, SwivelMax);
+    }
+
+    // Elbow pole for one arm. Everything is a DIRECTION on the circle around the shoulder->goal axis, blended as
+    // ANGLES about that axis (shortest arc), never as positions: a position lerp toward a bend goal weighted the
+    // vote by how far the goal sat from the shoulder, and a goal at weight 1 still did not land on the goal.
+    //   1. hand-position swivel (always defined, clamped),
+    //   2. the authored rest bend transported onto the axis, voting by how small the swing from rest is,
+    //   3. a bend goal (elbow tracker) voting BendGoalWeight, unclamped: a tracker is authoritative,
+    //   4. wrist roll past its dead zone, only when there is no goal.
+    // Pole distance is cosmetic: SolveTwoBone only reads the bend plane. -xlinka
+    private float3 ComputeArmPole(float3 root, float3 goalPos, in LimbRestPose restPose, float reach, float side,
+        Slot? hand, float positionWeight, in Target target, out PoleDebug debug)
+    {
+        debug = default;
+        float poleDist = MathF.Max(reach * 0.45f, 0.05f);
+        float3 limb = goalPos - root;
+        if (limb.LengthSquared < 1e-8f)
+        {
+            // Goal on the shoulder: no axis to swivel about. Elbow down and back, the hang.
+            float3 hangDir = float3.Down * 0.8f - _curBodyForward * 0.5f + _curBodyRight * (side * 0.3f);
+            return root + hangDir.Normalized * poleDist;
+        }
+        float3 axis = limb.Normalized;
+        ArmSwivelFrame(axis, side, out float3 u, out float3 v);
+
+        float handSwivel = HandSwivel(limb, reach, side);
+        float3 dir = u * MathF.Cos(handSwivel) + v * MathF.Sin(handSwivel);
+        debug.HandSwivelRad = handSwivel;
+        debug.Source = PoleSource.Hand;
+
+        // Rest bend: the captured elbow offset carried by the minimal rotation from rest root->end onto the live
+        // axis. Trustworthy while the swing from rest is small (that is the walking counter-swing and the idle
+        // drift), meaningless for a big reach, so its vote fades across [RestPoleSwingKeep, RestPoleSwingDrop].
+        if (TryRestBendDirection(axis, in restPose, out float3 restDir, out float swing))
+        {
+            float restW = 1f - SmoothStep(RestPoleSwingKeep, RestPoleSwingDrop, swing);
+            if (restW > 1e-4f)
+            {
+                dir = SwivelToward(axis, dir, restDir, restW);
+                debug.RestWeight = restW;
+                if (restW >= 0.5f)
+                    debug.Source = PoleSource.Rest;
+            }
         }
 
-        if (TryCurrentBendDirection(upper, lower, hand, out var live))
+        // Bend goal in the same angle space. Direction only; a goal sitting on the axis says nothing.
+        if (target.HasBendGoal && TryPerpendicular(target.BendGoal - root, axis, out float3 goalDir))
         {
-            float f = float3.Dot(live, _curBodyForward);
-            float outward = float3.Dot(live, _curBodyRight) * side;
-            if (f < 0.05f || outward > 0.25f)
-                return live + float3.Down * 0.12f;
+            float goalW = System.Math.Clamp(BendGoalWeight, 0f, 1f);
+            if (goalW > 1e-4f)
+            {
+                dir = SwivelToward(axis, dir, goalDir, goalW);
+                if (goalW >= 0.5f)
+                    debug.Source = PoleSource.Goal;
+            }
         }
 
-        return fallback;
+        // Wrist-led elbow: rolling a tracked wrist swings the pole around the arm axis (palm-up flips the elbow
+        // out, palm-down tucks it in), the way a real forearm follows the hand. The roll is the hand target's
+        // twist about the axis relative to the transported rest wrist; only the part past the dead zone counts,
+        // so a wrist that is merely not neutral leaves the swivel alone. Elbow trackers take precedence. -xlinka
+        if (WristBendInfluence > 1e-4f && positionWeight > 1e-4f && !target.HasBendGoal
+            && hand != null && _restRot.TryGetValue(hand, out var wristRest))
+        {
+            floatQ delta = target.Rotation * (_bodyTurn * wristRest).Inverse;
+            floatQ twist = TwistAround(delta, axis);
+            float roll = WrapPi(2f * MathF.Atan2(
+                twist.x * axis.x + twist.y * axis.y + twist.z * axis.z, twist.w));
+            float deadZone = MathF.Max(WristBendDeadZone, 0f);
+            float past = MathF.Abs(roll) - deadZone;
+            if (past > 0f)
+            {
+                float swingAngle = System.Math.Clamp(
+                    MathF.CopySign(past, roll) * WristBendInfluence * positionWeight
+                        * System.Math.Clamp(target.RotationWeight, 0f, 1f),
+                    -MaxWristBendSwing, MaxWristBendSwing);
+                if (MathF.Abs(swingAngle) > 1e-3f)
+                    dir = floatQ.AxisAngleRad(axis, swingAngle) * dir;
+            }
+        }
+
+        // Reported in the (u, v) frame, not by the right-hand rule about the axis: that rule's sign flips with
+        // side, this one reads positive = outward on both arms, the same as HandSwivel's own output.
+        debug.SwivelRad = MathF.Atan2(float3.Dot(dir, v), float3.Dot(dir, u));
+        return root + dir * poleDist;
+    }
+
+    // The authored rest elbow offset carried onto the live limb axis by the minimal rotation from the rest
+    // root->end, as a unit direction perpendicular to the axis, plus the swing angle it took to get there. False
+    // when the rig has no usable rest bend (A/T-pose with a dead-straight arm) or the transported offset
+    // collapses onto the axis. -xlinka
+    private static bool TryRestBendDirection(float3 axis, in LimbRestPose restPose, out float3 bendDir, out float swing)
+    {
+        bendDir = float3.Zero;
+        swing = 0f;
+        if (!restPose.Valid || restPose.RootToEnd.LengthSquared < 1e-8f)
+            return false;
+
+        float3 restAxis = restPose.RootToEnd.Normalized;
+        swing = MathF.Acos(System.Math.Clamp(float3.Dot(restAxis, axis), -1f, 1f));
+
+        floatQ carry = FabrikSolver.FromToRotation(restPose.RootToEnd, axis, restPose.PlaneNormal);
+        float3 bend = carry * restPose.RootToMid;
+        bend -= axis * float3.Dot(bend, axis);
+        float minBend = MathF.Max(restPose.RootToEnd.Length * 0.015f, 0.003f);
+        if (bend.LengthSquared <= minBend * minBend)
+            return false;
+
+        bendDir = bend.Normalized;
+        return true;
+    }
+
+    // Unit component of v perpendicular to axis; false when v lies along the axis.
+    private static bool TryPerpendicular(float3 v, float3 axis, out float3 dir)
+    {
+        dir = v - axis * float3.Dot(v, axis);
+        if (dir.LengthSquared < 1e-8f)
+            return false;
+        dir = dir.Normalized;
+        return true;
+    }
+
+    // Signed angle (radians) from one perpendicular unit direction to another, measured about axis.
+    private static float SignedAngleAbout(float3 axis, float3 from, float3 to)
+        => MathF.Atan2(float3.Dot(float3.Cross(from, to), axis), float3.Dot(from, to));
+
+    // Swing a perpendicular unit direction toward another about the axis by fraction t of the SHORTER arc.
+    private static float3 SwivelToward(float3 axis, float3 from, float3 to, float t)
+    {
+        if (t <= 0f)
+            return from;
+        if (t >= 1f)
+            return to;
+        float angle = SignedAngleAbout(axis, from, to);
+        if (MathF.Abs(angle) < 1e-5f)
+            return from;
+        return floatQ.AxisAngleRad(axis, angle * t) * from;
+    }
+
+    private static float SmoothStep(float edge0, float edge1, float x)
+    {
+        if (edge1 - edge0 < 1e-6f)
+            return x >= edge1 ? 1f : 0f;
+        float t = System.Math.Clamp((x - edge0) / (edge1 - edge0), 0f, 1f);
+        return t * t * (3f - 2f * t);
     }
 
     private void SolveLeg(BodyNode rootNode, Slot? hip, Slot? knee, Slot? foot, Slot? toe, floatQ toeRel,
@@ -1136,8 +1431,18 @@ public sealed class FullBodyIKSolver
         // through BendGoal. -xlinka
         float3 preferredPole = LegBendPreference(rootNode, hip, knee, foot);
         LimbRestPose restPose = rootNode == BodyNode.LeftUpperLeg ? _lLegRest : _rLegRest;
-        float3 pole = ComputePole(root, goalPos, in restPose, preferredPole, (upperLen + lowerLen) * 0.55f,
-            target.HasBendGoal, target.BendGoal, false);
+        // The AUTHORED bend wins for legs.
+        //
+        // LegBendPreference asks PreferRearLegBend, which returns true when the rig's left/right labels
+        // sit on the swapped physical sides. That is a real thing to detect, but it says nothing about
+        // which way the animal's knee goes - measured on a digitigrade cat with swapped labels, the
+        // preference came back REAR while the authored knee points clearly FORWARD, ComputePole rejected
+        // the captured bend for being opposed, and both knees inverted. The rig's own pose is the only
+        // real evidence of which way its joints fold, and now that the import keeps that pose instead of
+        // overwriting it with a bind pose, it is evidence we can trust. The preference stays as the
+        // fallback for when there is no usable captured bend. -xlinka
+        float3 pole = ComputeLegPole(root, goalPos, in restPose, preferredPole, (upperLen + lowerLen) * 0.55f,
+            target.HasBendGoal, target.BendGoal);
 
         Stretch(root, goalPos, ref upperLen, ref lowerLen);
         FabrikSolver.SolveTwoBone(root, pole, goalPos, upperLen, lowerLen, out var mid, out var end);
@@ -1225,67 +1530,47 @@ public sealed class FullBodyIKSolver
         WriteGlobalRotation(toe, toeRot);
     }
 
-    // Pole vector for two-bone IK. Primary path is the stable rest-bend behaviour:
-    // transport the captured root->mid offset by the rotation from rest root->end to current root->target. That keeps
-    // elbows and digitigrade hocks on the side the avatar was authored with. Only if the captured bend is too straight
-    // do we fall back to body-frame preferences.
-    private float3 ComputePole(float3 root, float3 targetPos, in LimbRestPose restPose, float3 preferredBendDirection,
-        float poleDistance, bool hasBendGoal, float3 bendGoal, bool allowOpposedRestPole)
+    // Knee pole for two-bone IK. Primary path is the stable rest-bend behaviour: transport the captured root->mid
+    // offset by the rotation from rest root->end to current root->target. That keeps digitigrade hocks on the side
+    // the avatar was authored with (a leg never swings far enough from standing for that transport to go wrong the
+    // way an arm's does). Only if the captured bend is too straight do we fall back to body-frame preferences. A
+    // knee tracker then swivels the result about the axis toward the goal by BendGoalWeight, direction only. The
+    // legs deliberately do NOT get the hand-position swivel model; there is no equivalent measured rule for a foot
+    // and the authored knee has not been the problem. -xlinka
+    private float3 ComputeLegPole(float3 root, float3 targetPos, in LimbRestPose restPose, float3 preferredBendDirection,
+        float poleDistance, bool hasBendGoal, float3 bendGoal)
     {
         float3 limb = targetPos - root;
         float dist = MathF.Max(poleDistance, 0.05f);
-        float3 pole;
-
-        if (restPose.Valid && limb.LengthSquared > 1e-8f && restPose.RootToEnd.LengthSquared > 1e-8f)
-        {
-            floatQ swing = FabrikSolver.FromToRotation(restPose.RootToEnd, limb, restPose.PlaneNormal);
-            float3 transportedMid = root + swing * restPose.RootToMid;
-            float3 limbDir = limb.Normalized;
-            float3 bend = transportedMid - root;
-            bend -= limbDir * float3.Dot(bend, limbDir);
-            float minBend = MathF.Max(restPose.RootToEnd.Length * 0.015f, 0.003f);
-            if (bend.LengthSquared > minBend * minBend)
-            {
-                float3 bendDir = bend.Normalized;
-                float3 prefDir = preferredBendDirection.LengthSquared > 1e-8f
-                    ? preferredBendDirection.Normalized
-                    : bendDir;
-                // Digitigrade legs can carry a stale forward rest pole; when the chosen leg bend is clearly rear,
-                // let that preference win instead of accepting the captured pole. - xlinka
-                bool acceptRestPole = allowOpposedRestPole || float3.Dot(bendDir, prefDir) > -0.15f;
-                if (acceptRestPole)
-                {
-                    float restDistance = MathF.Max(restPose.BendDistance, dist * 0.35f);
-                    pole = root + bendDir * MathF.Max(restDistance, 0.05f);
-                    if (hasBendGoal)
-                        pole = float3.Lerp(pole, bendGoal, System.Math.Clamp(BendGoalWeight, 0f, 1f));
-                    return pole;
-                }
-            }
-        }
-
-        float3 limbDirFallback = limb;
         float3 pref = preferredBendDirection.LengthSquared > 1e-8f ? preferredBendDirection.Normalized : _curBodyForward;
-        float3 poleDir = pref;
 
-        if (limbDirFallback.LengthSquared > 1e-8f)
+        if (limb.LengthSquared < 1e-8f)
+            return root + pref * dist;
+        float3 axis = limb.Normalized;
+
+        float3 poleDir;
+        if (TryRestBendDirection(axis, in restPose, out float3 restDir, out _))
         {
-            limbDirFallback = limbDirFallback.Normalized;
-            poleDir = pref - limbDirFallback * float3.Dot(pref, limbDirFallback);
+            poleDir = restDir;
+        }
+        else
+        {
+            poleDir = pref - axis * float3.Dot(pref, axis);
             if (poleDir.LengthSquared < 1e-8f)
             {
-                poleDir = float3.Cross(_curBodyRight, limbDirFallback);
+                poleDir = float3.Cross(_curBodyRight, axis);
                 if (poleDir.LengthSquared < 1e-8f)
-                    poleDir = float3.Cross(_curBodyForward, limbDirFallback);
+                    poleDir = float3.Cross(_curBodyForward, axis);
                 if (float3.Dot(poleDir, pref) < 0f)
                     poleDir = -poleDir;
             }
+            poleDir = poleDir.LengthSquared > 1e-8f ? poleDir.Normalized : pref;
         }
 
-        pole = root + (poleDir.LengthSquared > 1e-8f ? poleDir.Normalized : pref) * dist;
-        if (hasBendGoal)
-            pole = float3.Lerp(pole, bendGoal, System.Math.Clamp(BendGoalWeight, 0f, 1f));
-        return pole;
+        if (hasBendGoal && TryPerpendicular(bendGoal - root, axis, out float3 goalDir))
+            poleDir = SwivelToward(axis, poleDir, goalDir, System.Math.Clamp(BendGoalWeight, 0f, 1f));
+
+        return root + poleDir * dist;
     }
 
     private float3 LegBendPreference(BodyNode rootNode, Slot? hip, Slot? knee, Slot? foot)

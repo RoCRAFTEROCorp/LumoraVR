@@ -5,6 +5,7 @@ using System.Collections.Generic;
 using Lumora.Core;
 using Lumora.Core.Input;
 using Lumora.Core.Math;
+using Lumora.Core.Components.Interaction;
 
 namespace Lumora.Core.Components.Avatar;
 
@@ -56,6 +57,120 @@ public class AvatarForm : Component, IAvatarEquippable
         base.OnInit();
         IsActive.Value = true;
         Scale.Value = float3.One;
+    }
+
+    // CLICK-TO-EQUIP
+    //
+    // This lives on the avatar root component rather than on whatever built the avatar, because it has to
+    // hold for EVERY avatar: one made in the studio, one imported from a package, one loaded back out of
+    // inventory. It used to be wired by the studio's creation flow alone, so an imported avatar had no
+    // click behaviour at all and the only way to wear it was the radial menu on middle-click - which is
+    // not where anyone looks for it.
+    //
+    // Re-wired in OnStart, not once at creation: RayTarget.Activated is a plain C# event, so nothing
+    // survives a save and reload. The component that owns the behaviour has to re-establish it every time
+    // the avatar comes back. -xlinka
+    private RayTarget _equipTarget = null!;
+
+    public override void OnStart()
+    {
+        base.OnStart();
+        EnsureEquipTarget();
+    }
+
+    public void EnsureEquipTarget()
+    {
+        if (Slot == null || Slot.IsDestroyed || _equipTarget != null)
+            return;
+
+        // An avatar someone is already WEARING is not an offer. Without this, every remote player in the
+        // room grows a half-metre laser target on their body that steals hover from whatever is behind
+        // them and does nothing when clicked. The confirm refuses a worn avatar anyway; this stops the
+        // target existing in the first place. -xlinka
+        if (Slot.ActiveUserRoot != null)
+            return;
+
+        var target = Slot.GetComponent<RayTarget>() ?? Slot.AttachComponent<RayTarget>();
+        target.HoverRadius.Value = 0.5f;
+        // Beat the root Grabbable for the laser's hovered target so a LEFT-click (use/interact) lands on this
+        // RayTarget. Grab is GRIP/right-click and resolves the Grabbable by walking parents, so it's unaffected.
+        target.InteractionPriority.Value = 10;
+        target.Activated += OnEquipRayActivated;
+        _equipTarget = target;
+    }
+
+    private void OnEquipRayActivated(float3 _) => ConfirmEquip();
+
+    // Left-click (use) on the avatar pops a small "Equip Avatar / Cancel" confirm, then equips.
+    // Falls back to a direct equip if no context menu is available.
+    private void ConfirmEquip()
+    {
+        var avatar = Slot;
+        if (avatar == null || avatar.IsDestroyed)
+            return;
+
+        // Already worn: nothing to offer.
+        if (IsEquipped || avatar.ActiveUserRoot != null)
+            return;
+
+        var userRootSlot = World?.LocalUser?.Root?.Slot;
+        var menu = userRootSlot?.GetComponentInChildren<UI.ContextMenuSystem>();
+        if (userRootSlot == null || menu == null)
+        {
+            TryEquip();
+            return;
+        }
+
+        // Idempotent: the activation can fire repeatedly while the laser sits on the avatar, and
+        // re-opening rebuilds the whole menu visual every frame.
+        if (menu.IsOpen.Value)
+            return;
+
+        // Anchor the confirm to the hand that OWNS the menu, so the camera-freeze / mouse-aim AND the opening-press
+        // guard engage (both key off context.Side, and the desktop aim only runs for the owner hand). On DESKTOP the
+        // menu is right-hand-owned; in VR it's the hand whose laser is on the avatar. Matching the wrong hand made
+        // the camera not freeze, so moving the mouse turned the view and the menu edge-closed.
+        bool vr = Engine.Current?.InputInterface?.IsVRActive == true;
+        var ctx = new UI.ContextMenuContext { Target = avatar };
+        foreach (var hand in userRootSlot.GetComponentsInChildren<HandTool>())
+        {
+            bool isOwner = vr
+                ? (hand.Laser != null && ReferenceEquals(hand.Laser.CurrentRayTarget, _equipTarget))
+                : hand.Side.Value == Chirality.Right;
+            if (!isOwner)
+                continue;
+            ctx.Pointer = hand.Laser?.Slot;
+            ctx.Side = hand.Side.Value;
+            break;
+        }
+
+        menu.OpenConfirm("Equip Avatar?", "Equip Avatar", new[] { 0.14f, 0.30f, 0.18f, 0.92f }, TryEquip, ctx);
+    }
+
+    private void TryEquip()
+    {
+        var avatar = Slot;
+        if (avatar == null || avatar.IsDestroyed)
+            return;
+
+        var userRoot = World?.LocalUser?.Root;
+        if (userRoot == null)
+        {
+            Logging.Logger.Warn("AvatarForm: no local user root to equip onto");
+            return;
+        }
+        var manager = userRoot.Slot.GetComponent<AvatarEquipManager>() ?? userRoot.Slot.AttachComponent<AvatarEquipManager>();
+        if (manager.UserRoot.Target == null)
+            manager.UserRoot.Target = userRoot;
+        manager.EquipAvatar(avatar);
+    }
+
+    public override void OnDestroy()
+    {
+        if (_equipTarget != null && !_equipTarget.IsDestroyed)
+            _equipTarget.Activated -= OnEquipRayActivated;
+        _equipTarget = null!;
+        base.OnDestroy();
     }
 
     public void Equip(AvatarSocket slot)

@@ -93,6 +93,10 @@ public class AvatarAssembler : Component, IAvatarAssembler, IAvatarSocketFiller
         BuildControllerNode(bodyNodes, user, Chirality.Left);
         BuildControllerNode(bodyNodes, user, Chirality.Right);
 
+        // One slot per connected tracker, under the user root. The component refuses to run for a
+        // non-local user, so which world this is answers itself.
+        userSlot.AttachComponent<TrackerSlotManager>();
+
         // Per-user finger pose plumbing: a streamed source. The owner writes local
         // tracking into a finger stream; remote peers read it. Desktop and untracked
         // users resolve to no live data, so their hands rest in the avatar's authored
@@ -353,6 +357,12 @@ public class AvatarAssembler : Component, IAvatarAssembler, IAvatarSocketFiller
         var piece = manager.World.RootSlot.AddSlot("BasicHead");
         piece.Persistent.Value = false;
 
+        // The default pieces are the usual answer to "what is this grey blob following me", and until
+        // now nothing logged when one was built - only when one equipped. A piece that is built and
+        // fails to socket still carries an AvatarPoseDriver, so it rides the body node anyway and looks
+        // exactly like a bug with no line in the log to explain it. -xlinka
+        LumoraLogger.Log("AvatarAssembler: built default BasicHead (grey sphere) to fill an empty Head socket");
+
         piece.AttachComponent<AvatarPoseDriver>().Node.Value = BodyNode.Head;
         piece.AttachComponent<DiscardOnDequip>();
 
@@ -382,6 +392,7 @@ public class AvatarAssembler : Component, IAvatarAssembler, IAvatarSocketFiller
 
     private static Slot BuildDefaultHand(AvatarEquipManager manager, BodyNode node)
     {
+        LumoraLogger.Log($"AvatarAssembler: built default {node} placeholder to fill an empty socket");
         bool isLeft = node == BodyNode.LeftHand;
         var piece = manager.World.RootSlot.AddSlot(isLeft ? "BasicLeftHand" : "BasicRightHand");
         piece.Persistent.Value = false;

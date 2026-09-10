@@ -7,11 +7,9 @@ using Lumora.Core.Math;
 
 namespace Lumora.Core.Components.Avatar;
 
-/// <summary>
-/// Applies an additional per-finger curl and splay on top of an upstream finger
-/// pose, in position space. Curl folds each finger further toward the palm; splay
-/// fans it about the knuckle.
-/// </summary>
+// Applies an additional per-finger curl and splay on top of an upstream finger
+// pose, in position space. Curl folds each finger further toward the palm; splay
+// fans it about the knuckle.
 // POSITION-SPACE CURL - the faithful-but-lossy bit, documented honestly:
 // Curl is naturally angular. With only wrist-local POSITIONS to work with, we curl
 // a finger by rigidly rotating its node chain, joint by joint, about a flex axis at
@@ -31,17 +29,17 @@ namespace Lumora.Core.Components.Avatar;
 [ComponentCategory("Users/Avatar/Hands")]
 public sealed class HandPoseModifier : HandPoseProcessor
 {
-    /// <summary>Upstream pose to modify.</summary>
+    // Upstream pose to modify.
     public readonly SyncRef<IHandPoseSourceComponent> Source = null!;
 
-    /// <summary>Extra curl per finger, 0..1-ish (added flex about the knuckle).</summary>
+    // Extra curl per finger, 0..1-ish (added flex about the knuckle).
     public readonly Sync<float> ThumbCurl = new();
     public readonly Sync<float> IndexCurl = new();
     public readonly Sync<float> MiddleCurl = new();
     public readonly Sync<float> RingCurl = new();
     public readonly Sync<float> PinkyCurl = new();
 
-    /// <summary>Extra splay per finger, radians (fans about wrist Y at the knuckle).</summary>
+    // Extra splay per finger, radians (fans about wrist Y at the knuckle).
     public readonly Sync<float> ThumbSplay = new();
     public readonly Sync<float> IndexSplay = new();
     public readonly Sync<float> MiddleSplay = new();
@@ -135,8 +133,10 @@ public sealed class HandPoseModifier : HandPoseProcessor
         floatQ splayRot = floatQ.AxisAngleRad(float3.Up, splay);
 
         // Flex axis: wrist X carried through the splay, so it stays square to the
-        // (now splayed) finger. Mirrored by hand so both fold toward the palm.
-        float3 flexAxis = (splayRot * float3.Right) * xSign;
+        // (now splayed) finger. Same axis for both hands: a mirror across the YZ plane keeps the
+        // curl direction (+Z toward -Y), so mirroring the axis here un-curled the left hand. Same
+        // fix as HandPoseModel. -xlinka
+        float3 flexAxis = splayRot * float3.Right;
 
         float addedCurl = CurlFor(finger);
 
