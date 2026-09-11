@@ -269,8 +269,7 @@ internal sealed class ScratchSpaceWorldTemplate : WorldTemplateDefinition
         groundMesh.UVScale.Value = new float3(100f, 1f, 100f);
 
         var groundMaterial = groundSlot.AttachComponent<GridSpaceGroundMaterial>();
-        groundMaterial.BlendMode.Value = BlendMode.Opaque;
-        groundMaterial.Culling.Value = Culling.Back;
+        groundMaterial.HorizonColor.Value = new colorHDR(0.39f, 0.42f, 0.48f, 1f); // this sky just under its horizon line
 
         var groundRenderer = groundSlot.AttachComponent<MeshRenderer>();
         groundRenderer.Mesh.Target = groundMesh;
@@ -601,8 +600,7 @@ internal sealed class ScratchSpaceWorldTemplate : WorldTemplateDefinition
         CreateOrb<PBS_Specular>(root, "PBS_Specular", index++, material =>
         {
             material.AlbedoColor.Value = new colorHDR(0.22f, 0.44f, 0.92f, 1f);
-            material.SpecularColor.Value = new colorHDR(1.0f, 0.92f, 0.72f, 1f);
-            material.Smoothness.Value = 0.9f;
+            material.SpecularColor.Value = new colorHDR(1.0f, 0.92f, 0.72f, 0.9f);
         });
 
         CreateOrb<UnlitMaterial>(root, "Unlit", index++, material =>
@@ -624,8 +622,8 @@ internal sealed class ScratchSpaceWorldTemplate : WorldTemplateDefinition
         CreateOrb<GridSpaceGroundMaterial>(root, "GridSpaceGround", index++, material =>
         {
             material.BaseNearColor.Value = new colorHDR(0.045f, 0.040f, 0.035f, 1f);
-            material.LineNearColor.Value = new colorHDR(0.34f, 0.58f, 0.98f, 1f);
-            material.LineWidth.Value = 1.3f;
+            material.MinorLineColor.Value = new colorHDR(0.34f, 0.58f, 0.98f, 1f);
+            material.MinorLineWidth.Value = 1.3f;
         });
 
         CreateOrb<MetaballMaterial>(root, "Metaball", index++, material =>
@@ -637,14 +635,7 @@ internal sealed class ScratchSpaceWorldTemplate : WorldTemplateDefinition
             material.Culling.Value = Culling.None;
         });
 
-        CreateBoxPreview<LocalHomeRisingMaterial>(root, "LocalHomeRising", index++, new float3(0.42f, 0.42f, 0.42f), material =>
-        {
-            material.BlobCount.Value = 36;
-            material.VolumeExtents.Value = new float2(0.2f, 0.2f);
-            material.VolumeHeight.Value = 0.42f;
-            material.VolumeOffset.Value = new float3(0f, -0.21f, 0f);
-            material.Culling.Value = Culling.None;
-        });
+        CreateBubblePreview(root, "LocalHomeRising", index++);
 
         CreateOrb<FresnelMaterial>(root, "Fresnel", index++, material =>
         {
@@ -834,6 +825,45 @@ internal sealed class ScratchSpaceWorldTemplate : WorldTemplateDefinition
         renderer.ShadowCastMode.Value = ShadowCastMode.On;
 
         return material;
+    }
+
+    // The rising material only makes sense on a BubbleFieldMesh (it reads the bubble index and
+    // shape from the mesh), so its preview is a miniature of the home's field, not a box. -xlinka
+    private static void CreateBubblePreview(Slot parent, string name, int index)
+    {
+        var slot = parent.AddSlot(name);
+        slot.LocalPosition.Value = GetOrbPosition(index);
+        PreviewLabel(parent, name, index);
+        slot.AttachComponent<Grabbable>();
+
+        const float extent = 0.2f;
+        const float height = 0.42f;
+        var offset = new float3(0f, -0.21f, 0f);
+
+        var mesh = slot.AttachComponent<BubbleFieldMesh>();
+        mesh.Count.Value = 36;
+        mesh.VolumeExtents.Value = new float2(extent, extent);
+        mesh.VolumeHeight.Value = height;
+        mesh.VolumeOffset.Value = offset;
+        mesh.BoundsMargin.Value = 0.1f;
+
+        var collider = slot.AttachComponent<BoxCollider>();
+        collider.Size.Value = new float3(extent * 2f, height, extent * 2f);
+        collider.Type.Value = ColliderType.Trigger;
+
+        var material = slot.AttachComponent<LocalHomeRisingMaterial>();
+        material.BlobCount.Value = 36;
+        material.BlobRadius.Value = 0.03f;
+        material.VolumeExtents.Value = new float2(extent, extent);
+        material.VolumeHeight.Value = height;
+        material.VolumeOffset.Value = offset;
+        material.RippleRadius.Value = 0.12f;
+        material.RippleWidth.Value = 0.01f;
+
+        var renderer = slot.AttachComponent<MeshRenderer>();
+        renderer.Mesh.Target = mesh;
+        renderer.Material.Target = material;
+        renderer.ShadowCastMode.Value = ShadowCastMode.Off;
     }
 
     private static T CreateBoxPreview<T>(Slot parent, string name, int index, float3 size, Action<T>? configure = null)

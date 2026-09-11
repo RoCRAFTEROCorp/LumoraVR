@@ -1,112 +1,101 @@
 shader_type spatial;
-render_mode cull_back;
 
-// Glossy Aperture-style floor: light panels with thin blue accents, recessed
-// seams (parallaxed deep layer + cell-inset darkening), low-roughness specular
-// so the directional light kicks back as a clean highlight.
-// Uniform names match GridSpaceGroundMaterial.cs. - xlinka
+// Void-grid floor. Uniform names match GridSpaceGroundMaterial.cs (PascalCase member -> snake_case).
+//
+// specular_disabled: the directional light contributes diffuse and shadows only, so it can never
+// bloom a highlight on the floor no matter how low the sun sits. ambient_light_disabled: the floor
+// samples the sky for neither irradiance nor reflections. Its tint comes from EMISSION, so a warm
+// sky cannot mud a cool floor and there is no reflection to smear across it. Shadows still land
+// because the diffuse path is intact. -xlinka
+render_mode cull_back, diffuse_lambert, specular_disabled, ambient_light_disabled;
 
-uniform vec4 base_near_color : source_color = vec4(0.045, 0.040, 0.035, 1.0);
-uniform vec4 base_far_color : source_color = vec4(0.015, 0.013, 0.010, 1.0);
-uniform vec4 line_near_color : source_color = vec4(0.34, 0.58, 0.98, 1.0);
-uniform vec4 line_far_color : source_color = vec4(0.50, 0.72, 1.00, 1.0);
-uniform float minor_scale : hint_range(0.1, 8.0) = 1.0;
-uniform float major_scale : hint_range(1.0, 64.0) = 8.0;
-uniform float line_width : hint_range(0.2, 2.5) = 1.0;
-uniform float major_line_width : hint_range(0.4, 3.5) = 1.6;
-uniform float radial_fade : hint_range(0.2, 3.0) = 1.1;
-uniform float horizon_start : hint_range(1.0, 200.0) = 12.0;
-uniform float horizon_end : hint_range(2.0, 400.0) = 48.0;
-uniform float parallax_depth : hint_range(0.0, 1.0) = 0.55;
-uniform float gloss : hint_range(0.0, 1.0) = 0.85;
+// ---------------------------------------------------------------- surface
+uniform vec4 base_near_color : source_color = vec4(0.110, 0.120, 0.145, 1.0);
+uniform vec4 base_far_color : source_color = vec4(0.090, 0.100, 0.125, 1.0);
+// self_lit scales the emission that carries the palette; light_response scales how much the
+// directional light (and therefore shadow contrast) is allowed on top of it.
+uniform float self_lit : hint_range(0.0, 2.0) = 1.0;
+uniform float light_response : hint_range(0.0, 4.0) = 1.0;
 
-varying vec3 world_pos;
+// ---------------------------------------------------------------- grid
+// World-space XZ by default so the grid is anchored to the world origin and independent of mesh
+// UV scale; UV mode is kept for meshes that are not a floor.
+uniform bool world_space_grid = true;
+uniform vec2 grid_offset = vec2(0.0);
+uniform float minor_scale : hint_range(0.1, 10.0) = 1.0;
+uniform float major_scale : hint_range(1.0, 100.0) = 5.0;
+uniform vec4 minor_line_color : source_color = vec4(0.200, 0.215, 0.250, 1.0);
+uniform vec4 major_line_color : source_color = vec4(0.330, 0.370, 0.460, 1.0);
+// Widths and softness are screen pixels, held constant at every distance.
+uniform float minor_line_width : hint_range(0.5, 4.0) = 1.0;
+uniform float major_line_width : hint_range(0.5, 6.0) = 1.5;
+uniform float line_softness : hint_range(0.25, 2.0) = 1.0;
+// A level fades out per axis once its cell is fewer than this many pixels across (fully gone at
+// half that). Minor fades first; major persists major_scale/minor_scale times further.
+uniform float minor_fade_pixels : hint_range(2.0, 40.0) = 10.0;
+uniform float major_fade_pixels : hint_range(2.0, 40.0) = 8.0;
+
+// ---------------------------------------------------------------- depth
+// Grazing-angle lift in place of a specular lobe.
+uniform vec4 sheen_color : source_color = vec4(0.55, 0.62, 0.75, 1.0);
+uniform float sheen_strength : hint_range(0.0, 1.0) = 0.05;
+uniform float sheen_power : hint_range(1.0, 8.0) = 3.0;
+// Distance haze. Set horizon_color to the sky's horizon so the floor's far edge dissolves into it.
+uniform vec4 horizon_color : source_color = vec4(0.5, 0.5, 0.5, 1.0);
+uniform float horizon_start : hint_range(0.0, 500.0) = 12.0;
+uniform float horizon_end : hint_range(1.0, 1000.0) = 90.0;
+
+varying vec2 grid_uv;
 
 void vertex()
 {
-    world_pos = (MODEL_MATRIX * vec4(VERTEX, 1.0)).xyz;
+    vec3 world_pos = (MODEL_MATRIX * vec4(VERTEX, 1.0)).xyz;
+    grid_uv = (world_space_grid ? world_pos.xz : UV) + grid_offset;
 }
 
-float grid_line(vec2 uv, float scale, float width_px)
+// Coverage of one grid level in screen space. The half-width is width_px scaled by the per-axis
+// derivative, so a line is the same number of pixels wide at 2 m and at 40 m, with a soft_px band of
+// smoothstep on its edge for the antialiasing. Each axis then fades on its OWN derivative: a floor
+// seen at a grazing angle compresses the along-view axis far sooner than the across-view one, so
+// the lines running across the view drop out first while the ones converging on the vanishing
+// point stay crisp. The fade lands while a cell is still several times wider than the line, which
+// is before the lines pack closer than their AA band and start to moire. -xlinka
+float grid_level(vec2 coord, float width_px, float soft_px, float fade_px)
 {
-    vec2 cell = uv / scale;
-    vec2 deriv = max(fwidth(cell), vec2(0.0001));
-    vec2 dist = abs(fract(cell - 0.5) - 0.5) / deriv;
-    vec2 line_mask = vec2(1.0) - smoothstep(vec2(width_px), vec2(width_px + 1.0), dist);
-    vec2 kill = vec2(1.0) - smoothstep(vec2(0.4), vec2(0.9), deriv);
-    return max(line_mask.x * kill.x, line_mask.y * kill.y);
-}
-
-// Darkening inside each major cell that peaks at the seam and falls off
-// quickly toward the center. Reads as a recessed panel edge. - xlinka
-float seam_shadow(vec2 uv, float scale, float falloff_px)
-{
-    vec2 cell = uv / scale;
-    vec2 deriv = max(fwidth(cell), vec2(0.0001));
-    vec2 dist = abs(fract(cell - 0.5) - 0.5) / deriv;
-    float e = min(dist.x, dist.y);
-    float kill = 1.0 - smoothstep(0.4, 0.9, max(deriv.x, deriv.y));
-    return (1.0 - smoothstep(0.0, falloff_px, e)) * kill;
+    vec2 deriv = max(fwidth(coord), vec2(0.000001));
+    vec2 dist = abs(fract(coord + 0.5) - 0.5);
+    vec2 half_w = min(width_px * 0.5 * deriv, vec2(0.5));
+    vec2 soft = soft_px * deriv;
+    vec2 line = vec2(1.0) - smoothstep(half_w, half_w + soft, dist);
+    vec2 cell_px = vec2(1.0) / deriv;
+    vec2 vis = smoothstep(vec2(fade_px * 0.5), vec2(fade_px), cell_px);
+    line *= vis;
+    return max(line.x, line.y);
 }
 
 void fragment()
 {
-    vec3 cam = INV_VIEW_MATRIX[3].xyz;
-    vec3 to_cam = cam - world_pos;
-    float cam_dist_xz = length(to_cam.xz);
-    float total = max(length(to_cam), 0.001);
+    float cam_dist = length(VERTEX);
+    float haze_end = max(horizon_end, horizon_start + 0.01);
+    float haze = smoothstep(horizon_start, haze_end, cam_dist);
+    float depth_t = smoothstep(0.0, haze_end, cam_dist);
 
-    // Parallax shift along the view direction, scaled by view obliqueness.
-    // Stronger now (0.04 vs the old 0.006) so the deeper layer is visible at
-    // grazing angles. - xlinka
-    vec2 view_tangent = -to_cam.xz / total;
-    float oblique = clamp(1.0 - abs(to_cam.y) / total, 0.0, 1.0);
-    vec2 parallax_uv = UV + view_tangent * parallax_depth * 0.04 * oblique;
+    float minor = grid_level(grid_uv / minor_scale, minor_line_width, line_softness, minor_fade_pixels);
+    float major = grid_level(grid_uv / major_scale, major_line_width, line_softness, major_fade_pixels);
 
-    float horizon = clamp((cam_dist_xz - horizon_start) / max(horizon_end - horizon_start, 0.001), 0.0, 1.0);
-    float radial = clamp(length(UV - vec2(0.5)) * radial_fade, 0.0, 1.0);
+    vec3 surface = mix(base_near_color.rgb, base_far_color.rgb, depth_t);
+    surface = mix(surface, minor_line_color.rgb, minor);
+    surface = mix(surface, major_line_color.rgb, major);
 
-    // Surface lines
-    float minor = grid_line(UV, minor_scale, line_width);
-    float major = grid_line(UV, major_scale, major_line_width);
-    float minor_deriv = max(fwidth(UV.x / minor_scale), fwidth(UV.y / minor_scale));
-    float major_deriv = max(fwidth(UV.x / major_scale), fwidth(UV.y / major_scale));
-    float minor_stability = 1.0 - smoothstep(0.18, 0.45, minor_deriv);
-    float major_stability = 1.0 - smoothstep(0.35, 0.85, major_deriv);
-    minor *= minor_stability * (1.0 - horizon * 0.85);
-    major *= major_stability;
-    float grid_mask = clamp(max(minor * 0.35, major), 0.0, 1.0);
+    float ndv = clamp(dot(normalize(NORMAL), normalize(VIEW)), 0.0, 1.0);
+    float sheen = pow(1.0 - ndv, sheen_power) * sheen_strength;
+    vec3 lit = surface * self_lit + sheen_color.rgb * sheen;
 
-    // Deep parallax line layer (the "inside wall" of the seam, visible at oblique angles)
-    float deep_line = grid_line(parallax_uv, major_scale, major_line_width * 0.7);
-    deep_line *= major_stability * (1.0 - horizon * 0.7);
-    float deep_shadow = seam_shadow(UV, major_scale, 5.0);
-
-    vec3 panel_col = mix(base_near_color.rgb, base_far_color.rgb, clamp(radial * 0.40, 0.0, 1.0));
-
-    // Recess: darken in a band along each major seam, then darken further at
-    // the parallaxed deep line position. The combination reads as a sunken
-    // panel with shadowed walls. - xlinka
-    panel_col *= 1.0 - deep_shadow * 0.45;
-    panel_col = mix(panel_col, panel_col * 0.35, deep_line * 0.55 * (1.0 - horizon));
-
-    vec3 line_col = mix(line_near_color.rgb, line_far_color.rgb, radial);
-    vec3 col = mix(panel_col, line_col, grid_mask);
-
-    // Fresnel sheen so the floor catches light at grazing angles, gloss
-    // controls how much. - xlinka
-    vec3 view_dir = -to_cam / total;
-    float fres = pow(1.0 - clamp(view_dir.y, 0.0, 1.0), 5.0);
-    col += vec3(fres * gloss * 0.18) * (1.0 - horizon);
-
-    // Horizon fade picks up a faint warm tint so the black floor doesn't
-    // clash with the sunrise sky right at the seam line. - xlinka
-    vec3 horizon_col = mix(base_near_color.rgb, vec3(0.10, 0.06, 0.04), 0.6);
-    col = mix(col, horizon_col, horizon);
-
-    ALBEDO = col;
-    EMISSION = line_col * grid_mask * 0.22 * (1.0 - horizon);
-    ROUGHNESS = mix(0.55, 0.15, gloss);
+    // The haze takes the light response down with it: a fully hazed floor is atmosphere, and
+    // atmosphere does not show a shadow. -xlinka
+    ALBEDO = surface * light_response * (1.0 - haze);
+    EMISSION = mix(lit, horizon_color.rgb, haze);
+    ROUGHNESS = 1.0;
     METALLIC = 0.0;
-    SPECULAR = 0.5 + gloss * 0.4;
+    SPECULAR = 0.0;
 }

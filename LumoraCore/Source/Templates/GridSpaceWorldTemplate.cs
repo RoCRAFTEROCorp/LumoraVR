@@ -25,10 +25,12 @@ internal sealed class GridSpaceWorldTemplate : WorldTemplateDefinition
         var spawnPoints = spawnSlot.AttachComponent<CirclePointGenerator>();
         spawnPoints.Radius.Value = 4f;
         spawnArea.SpawnPointGenerator.Target = spawnPoints;
+        // Quiet marker in the floor's own palette: a low lip of a ring and a faint cool pool. The
+        // disc and ring are additive, so alpha is the strength. -xlinka
         spawnSlot.AddSlot("Visual").AttachComponent<GlowCircle>()
-            .Setup(4f, 0.2f,
-                new colorHDR(0.85f, 0.83f, 0.78f, 0.3f), // faint white pool (alpha scales additive strength)
-                new colorHDR(1.0f, 0.72f, 0.28f, 1f));   // gold ring
+            .Setup(4f, 0.08f,
+                new colorHDR(0.45f, 0.52f, 0.68f, 0.10f),
+                new colorHDR(0.42f, 0.52f, 0.72f, 0.42f));
 
         // Warm low-angle key light. Rotation derived so the slot's local -Z
         // (Godot DirectionalLight photon direction) is exactly opposite the
@@ -62,13 +64,31 @@ internal sealed class GridSpaceWorldTemplate : WorldTemplateDefinition
         groundSlot.LocalPosition.Value = new float3(0f, 0f, 0f);
         groundSlot.Tag.Value = "floor";
 
+        // 300 m so the far edge sits past the haze from anywhere near spawn; the grid is world-space
+        // so the mesh size and UV scale do not touch its cell size. -xlinka
         var groundMesh = groundSlot.AttachComponent<BoxMesh>();
-        groundMesh.Size.Value = new float3(100f, 0.1f, 100f);
-        groundMesh.UVScale.Value = new float3(100f, 1f, 100f);
+        groundMesh.Size.Value = new float3(300f, 0.1f, 300f);
+        groundMesh.UVScale.Value = new float3(300f, 1f, 300f);
 
+        // Cool slate floor under a warm sky. The floor lights itself (ambient is off in its shader),
+        // so these are the colours you get; the sun only adds warmth and shadow on top. HorizonColor
+        // is this sky's colour just under its horizon line (0.81 horizon + 0.19 bottom), so the far
+        // floor dissolves into the sky instead of meeting it at a seam. -xlinka
         var groundMaterial = groundSlot.AttachComponent<GridSpaceGroundMaterial>();
-        groundMaterial.BlendMode.Value = BlendMode.Opaque;
-        groundMaterial.Culling.Value = Culling.Back;
+        groundMaterial.BaseNearColor.Value = new colorHDR(0.110f, 0.120f, 0.145f, 1f);
+        groundMaterial.BaseFarColor.Value = new colorHDR(0.090f, 0.100f, 0.125f, 1f);
+        groundMaterial.MinorLineColor.Value = new colorHDR(0.200f, 0.215f, 0.250f, 1f);
+        groundMaterial.MajorLineColor.Value = new colorHDR(0.330f, 0.370f, 0.460f, 1f);
+        groundMaterial.MinorScale.Value = 1f;
+        groundMaterial.MajorScale.Value = 5f;
+        groundMaterial.MinorLineWidth.Value = 1.0f;
+        groundMaterial.MajorLineWidth.Value = 1.5f;
+        groundMaterial.LightResponse.Value = 1.6f;
+        groundMaterial.SheenColor.Value = new colorHDR(0.55f, 0.62f, 0.75f, 1f);
+        groundMaterial.SheenStrength.Value = 0.06f;
+        groundMaterial.HorizonColor.Value = new colorHDR(0.97f, 0.58f, 0.40f, 1f);
+        groundMaterial.HorizonStart.Value = 14f;
+        groundMaterial.HorizonEnd.Value = 110f;
 
         var groundRenderer = groundSlot.AttachComponent<MeshRenderer>();
         groundRenderer.Mesh.Target = groundMesh;
@@ -80,18 +100,25 @@ internal sealed class GridSpaceWorldTemplate : WorldTemplateDefinition
         groundCollider.Size.Value = groundMesh.Size.Value;
         groundCollider.Offset.Value = new float3(0f, -groundMesh.Size.Value.y * 0.5f, 0f);
 
-        var orbSlot = world.RootSlot.AddSlot("GridMaterialOrb");
+        // Grabbable preview sphere. A satin dielectric with the platform's own fresnel, so it shows
+        // the sky and the sun the way a material ball should, instead of wearing the floor's planar
+        // grid with a seam. -xlinka
+        var orbSlot = world.RootSlot.AddSlot("MaterialOrb");
         orbSlot.LocalPosition.Value = new float3(0.95f, 1.25f, -1.05f);
         orbSlot.AttachComponent<Grabbable>();
 
         var orbMesh = orbSlot.AttachComponent<SphereMesh>();
         orbMesh.Radius.Value = 0.17f;
-        orbMesh.Segments.Value = 28;
-        orbMesh.Rings.Value = 16;
-        orbMesh.UVScale.Value = new float2(6f, 3f);
+        orbMesh.Segments.Value = 32;
+        orbMesh.Rings.Value = 20;
+
+        var orbMaterial = orbSlot.AttachComponent<PBS_Metallic>();
+        orbMaterial.AlbedoColor.Value = new colorHDR(0.66f, 0.70f, 0.76f, 1f);
+        orbMaterial.Metallic.Value = 0f;
+        orbMaterial.Smoothness.Value = 0.6f;
 
         var orbRenderer = orbSlot.AttachComponent<MeshRenderer>();
         orbRenderer.Mesh.Target = orbMesh;
-        orbRenderer.Material.Target = groundMaterial;
+        orbRenderer.Material.Target = orbMaterial;
     }
 }
