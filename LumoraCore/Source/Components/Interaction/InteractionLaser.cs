@@ -17,6 +17,9 @@ namespace Lumora.Core.Components.Interaction;
 public sealed class InteractionLaser : Component
 {
     public readonly Sync<float> MaxDistance = new();
+
+    // How long the beam is DRAWN when it hits nothing. Independent of the reach above.
+    private const float BeamIdleLength = 8f;
     public readonly Sync<float> BeamRadius = new();
     public readonly Sync<float> BeamStartOffset = new();
     public readonly Sync<Chirality> ControllerSide = new();
@@ -151,7 +154,12 @@ public sealed class InteractionLaser : Component
     public override void OnInit()
     {
         base.OnInit();
-        MaxDistance.Value = 8f;
+        // How far the laser REACHES. The other platform puts no limit on this in a world at all
+        // (MaxLaserDistance is float.MaxValue outside userspace, where it clamps to the dash distance),
+        // and 8m meant you had to walk up to anything you wanted to pick up. Finite rather than
+        // infinite only because this feeds a physics raycast. The DRAWN beam is capped separately by
+        // BeamIdleLength, or pointing at the sky would paint a line to the horizon. -xlinka
+        MaxDistance.Value = 512f;
         BeamRadius.Value = 0.003f;
         BeamStartOffset.Value = 0.020f;
         ControllerSide.Value = Chirality.Right;
@@ -511,8 +519,8 @@ public sealed class InteractionLaser : Component
         _beamMesh.Segments.Value = 16;
         _beamMesh.Capped.Value = true;
         _beamMesh.StartPoint.Value = float3.Zero;
-        _beamMesh.DirectTargetPoint.Value = float3.Backward * MaxDistance.Value;
-        _beamMesh.ActualTargetPoint.Value = float3.Backward * MaxDistance.Value;
+        _beamMesh.DirectTargetPoint.Value = float3.Backward * BeamIdleLength;
+        _beamMesh.ActualTargetPoint.Value = float3.Backward * BeamIdleLength;
         _beamMesh.StartPointColor.Value = IdleColor.Value.ToLDR();
         _beamMesh.EndPointColor.Value = IdleColor.Value.ToLDR();
 
@@ -532,7 +540,7 @@ public sealed class InteractionLaser : Component
         _beamRenderer.SortingOrder.Value = 110;
 
         _pointSlot = _beamSlot.AddSlot("Point");
-        _pointSlot.LocalPosition.Value = float3.Backward * MaxDistance.Value;
+        _pointSlot.LocalPosition.Value = float3.Backward * BeamIdleLength;
 
         _beamSlot.ActiveSelf.Value = false;
     }
@@ -622,8 +630,8 @@ public sealed class InteractionLaser : Component
             _directLineMesh = _directLineSlot.AttachComponent<SegmentMesh>();
             _directLineMesh.Radius.Value = BeamRadius.Value * 0.75f;
             _directLineMesh.Sides.Value = 6;
-            _directLineMesh.PointA.Value = float3.Backward * MaxDistance.Value;
-            _directLineMesh.PointB.Value = float3.Backward * MaxDistance.Value;
+            _directLineMesh.PointA.Value = float3.Backward * BeamIdleLength;
+            _directLineMesh.PointB.Value = float3.Backward * BeamIdleLength;
             _directLineMesh.PointAColor.Value = new color(1f, 1f, 1f, 0.18f);
             _directLineMesh.PointBColor.Value = new color(1f, 1f, 1f, 0.18f);
 
@@ -829,6 +837,18 @@ public sealed class InteractionLaser : Component
                 origin.y + direction.y * beamLength,
                 origin.z + direction.z * beamLength);
 
+        // What gets DRAWN when the ray hits nothing. The cast runs to the full reach so distant things
+        // are still grabbable; the beam stops short so a miss is a short pointer, not a stripe across
+        // the world. -xlinka
+        float3 visualEndPoint = beamEndPoint;
+        if (hoveredTarget == null && beamLength > BeamIdleLength)
+        {
+            visualEndPoint = new float3(
+                origin.x + direction.x * BeamIdleLength,
+                origin.y + direction.y * BeamIdleLength,
+                origin.z + direction.z * BeamIdleLength);
+        }
+
         _aimPoint = beamEndPoint;
         _hasAimPoint = true;
         _lastCastDistance = beamLength;
@@ -863,11 +883,11 @@ public sealed class InteractionLaser : Component
         {
             visualOrigin = Slot.GlobalPosition;
         }
-        float3 visualDir = beamEndPoint - visualOrigin;
+        float3 visualDir = visualEndPoint - visualOrigin;
         float visualLen = visualDir.Length;
         visualDir = visualLen > 0.0001f ? visualDir / visualLen : direction;
 
-        PositionBeam(visualOrigin, visualDir, visualLen, beamEndPoint, delta);
+        PositionBeam(visualOrigin, visualDir, visualLen, visualEndPoint, delta);
 
         if (_beamMesh != null)
         {
@@ -886,7 +906,15 @@ public sealed class InteractionLaser : Component
             SetIfChanged(_beamMesh.Radius, BeamRadius.Value);
             // Cursor sizing still uses the CAST distance so the reticle keeps a stable on-screen size; only
             // the beam geometry uses the hand origin. -xlinka
-            UpdateLaserVisual(delta, hoveredTarget != null, wantedColor, _lastCastDistance);
+            // The VISUAL distance, not the cast distance. The cursor is sized by how far away it is so it
+            // keeps a constant angular size, and on a miss the cast now runs to the full reach - so
+            // looking at the sky sized the cursor for a point hundreds of metres away and filled the
+            // screen with it. It is drawn at the capped beam end, so it must be sized for there too.
+            // -xlinka
+            float visualDistance = hoveredTarget != null
+                ? _lastCastDistance
+                : MathF.Min(_lastCastDistance, BeamIdleLength);
+            UpdateLaserVisual(delta, hoveredTarget != null, wantedColor, visualDistance);
         }
     }
 

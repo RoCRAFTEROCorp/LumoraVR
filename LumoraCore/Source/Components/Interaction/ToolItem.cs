@@ -24,6 +24,10 @@ public abstract class ToolItem : Component
 
     public float3 Tip => Slot.LocalPointToGlobal(LocalTip);
 
+    // The slot carrying this tool's in-hand visual, when it has one. Read by the hand's TOOLHOLD trace
+    // to say where the thing being held actually is in the world; null means "the tool's own slot".
+    public virtual Slot? HeldVisual => null;
+
     public virtual float3 TipForward => TipReference.Target?.Forward ?? Slot.Forward;
 
     public virtual float3 LocalTip

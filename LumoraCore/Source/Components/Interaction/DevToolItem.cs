@@ -27,7 +27,9 @@ public sealed class DevToolItem : ToolItem, ILaserHitClassifier
 
     private TransformHandle? _activeHandle;
     private Slot? _visualSlot;
-    private UnlitMaterial? _visualMaterial;
+    private OverlayFresnelMaterial? _visualMaterial;
+
+    public override Slot? HeldVisual => _visualSlot;
 
     public override bool UsesLaser => true;
 
@@ -277,16 +279,24 @@ public sealed class DevToolItem : ToolItem, ILaserHitClassifier
         _visualSlot.LocalRotation.Value = floatQ.AxisAngle(float3.Right, -System.MathF.PI * 0.5f);
         _visualSlot.LocalScale.Value = float3.One;
 
+        // The source platform's dev tool: a 5cm truncated cone, 5cm ahead of the tool root, drawn in an
+        // OVERLAY fresnel so it stays visible through the hand holding it and whatever it is pointed
+        // into. Ours was a plain unlit alpha cone in the ordinary pass, which the paw wrapped round it
+        // covered up: in the front-view screenshot it survived as one green pixel-dot at the heel of the
+        // palm and read as "no tool at all". Sizes and the black-to-red fresnel are theirs (red is what
+        // their users see; green is their dev-mode tint). -xlinka
         var cone = _visualSlot.GetComponent<ConeMesh>() ?? _visualSlot.AttachComponent<ConeMesh>();
-        cone.RadiusBase.Value = 0.012f;
-        cone.RadiusTop.Value = 0f;
-        cone.Height.Value = 0.045f;
+        cone.RadiusBase.Value = 0.015f;
+        cone.RadiusTop.Value = 0.0025f;
+        cone.Height.Value = 0.05f;
         cone.Segments.Value = 16;
 
-        _visualMaterial = _visualSlot.GetComponent<UnlitMaterial>() ?? _visualSlot.AttachComponent<UnlitMaterial>();
-        _visualMaterial.TintColor.Value = new colorHDR(0.2f, 1f, 0.45f, 1f);
-        _visualMaterial.BlendMode.Value = BlendMode.Alpha;
-        _visualMaterial.Culling.Value = Culling.None;
+        _visualMaterial = _visualSlot.GetComponent<OverlayFresnelMaterial>() ?? _visualSlot.AttachComponent<OverlayFresnelMaterial>();
+        _visualMaterial.Exponent.Value = 1f;
+        _visualMaterial.FrontNearColor.Value = new colorHDR(0f, 0f, 0f, 1f);
+        _visualMaterial.FrontFarColor.Value = new colorHDR(1f, 0f, 0f, 1f);
+        _visualMaterial.BehindNearColor.Value = new colorHDR(0f, 0f, 0f, 0.25f);
+        _visualMaterial.BehindFarColor.Value = new colorHDR(0.8f, 0f, 0f, 0.25f);
 
         var renderer = _visualSlot.GetComponent<MeshRenderer>() ?? _visualSlot.AttachComponent<MeshRenderer>();
         renderer.Mesh.Target = cone;

@@ -492,10 +492,23 @@ public class ContextMenuSystem : Component
         var input = Engine.Current?.InputInterface;
         bool vrActive = input?.VR_Active == true;
 
+        // F6 free-cam flies a drone camera away from the body and parks the head wherever mouse look last
+        // left it, so the head is the wrong viewpoint the whole time it is up. `external` below is a flag
+        // the PLATFORM publishes each frame off the head output's pose override (HeadOutput.
+        // UpdateScreenPositioning -> InputInterface.SetDesktopCameraOverride); the free-cam flag is written
+        // by the camera controller in the mode switch itself (DesktopCameraController.SwitchMode ->
+        // UserInputState.SetFreeCamActive), so it cannot be a frame - or a missed publish - out of step with
+        // the mode the user is actually flying. Either one is enough to anchor on the camera, because a
+        // free-cam that falls through to the head branch opens the ring at the avatar's body, metres behind
+        // the lens the user is looking through. -xlinka
+        bool freeCam = !vrActive
+            && input?.DesktopCameraPoseValid == true
+            && UserInputState.FocusedFreeCamActive;
+
         // The viewpoint the menu opens in front of and turns to face. First person is the head; third-person
         // and free-cam are a camera flying somewhere else entirely, and putting the menu on the parked head
         // there would drop it off screen (or inside the avatar's skull) where nothing can click it. -xlinka
-        bool external = input?.DesktopExternalCameraAim == true;
+        bool external = freeCam || input?.DesktopExternalCameraAim == true;
         bool hasView = external || head != null;
         float3 viewPosition = external ? input!.DesktopCameraPosition : (head?.GlobalPosition ?? float3.Zero);
         floatQ viewRotation = external ? input!.DesktopCameraRotation : (head?.GlobalRotation ?? floatQ.Identity);
@@ -508,7 +521,11 @@ public class ContextMenuSystem : Component
         // (FaceLocalUser turns it toward the viewer either way.)
         if (!vrActive && hasView)
         {
-            float scale = Slot.ActiveUserRoot?.GlobalScale ?? 1f;
+            // The drone camera is not the avatar and does not grow with it, so its stand-off distance must
+            // not ride the user's scale: a 10x user would otherwise get the ring parked 5 m off the lens at
+            // its fixed 0.46 m across. Avatar scale still drives the first-person/third-person placement,
+            // where the viewpoint really is the (scaled) head. -xlinka
+            float scale = freeCam ? 1f : (Slot.ActiveUserRoot?.GlobalScale ?? 1f);
             var viewDirection = viewRotation * float3.Backward;
             _menuRoot.GlobalPosition = viewPosition + viewDirection * (0.5f * scale);
         }
@@ -526,7 +543,21 @@ public class ContextMenuSystem : Component
         // Face the viewpoint ONCE here (yaw billboard). The menu is a child of the user root, so after this
         // it rides along rigidly with no per-frame world re-derivation - locked in place when you move
         // (never re-faces or re-positions the menu per frame).
-        if (hasView)
+        if (freeCam)
+        {
+            // A drone camera spends most of its life pitched at the ground. The yaw billboard below keeps
+            // the ring vertical, so a steep pitch shows it edge-on, and past ~89 degrees the flattened
+            // direction falls under the epsilon and NO rotation is written at all - the ring silently keeps
+            // whatever yaw the body happens to be standing at. Square it to the lens instead. Free-cam
+            // composes yaw*pitch with no roll (DesktopCameraController.UpdateFreeCam), so camera-up is a
+            // safe reference. -xlinka
+            if (Utility.UserFacing.TryLookRotation(
+                    _menuRoot.GlobalPosition, viewPosition, viewRotation * float3.Up, yawOnly: false, out var facing))
+            {
+                _menuRoot.GlobalRotation = facing;
+            }
+        }
+        else if (hasView)
         {
             var toView = viewPosition - _menuRoot.GlobalPosition;
             toView.y = 0f;

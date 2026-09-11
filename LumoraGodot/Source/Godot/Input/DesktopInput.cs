@@ -2,55 +2,30 @@
 // Licensed under the LumoraVR Source Available License. See LICENSE in the project root.
 
 using Godot;
-using Lumora.Core.Components;
 using LumoraLogger = Lumora.Core.Logging.Logger;
 using Lumora.Source.UI;
 using Lumora.Source.Godot.UI;
 
 namespace Lumora.Source.Input;
 
-// Desktop camera-side scene overlay: cursor reticle, UI raycast, and a cheap
-// idle/reach hand pose. Input data (movement axis, buttons) lives on the
-// InputInterface drivers now, this node is purely scene-side concerns.
-// - xlinka
+// Desktop camera-side scene overlay: the screen reticle over the composited dash and the free-cursor
+// ray the laser follows while the OS cursor is unlocked. Movement and buttons live on the
+// InputInterface drivers; this node is scene-side only.
+//
+// It used to also cast a RayCast3D against the UI layer every frame and every physics tick and pose
+// a pair of idle hands off the result. Nothing read either: the laser does its own hit test in the
+// engine and the hands come from the avatar. -xlinka
 public partial class DesktopInput : Node3D
 {
-    private const float MaxRayDistance = 100f;
-    private const uint UICollisionLayer = 1u << 3;
-
     private Camera3D _camera = null!;
     private Control _cursorUI = null!;
     private CircleCursor _cursorDot = null!;
-    private RayCast3D _interactionRay = null!;
-
-    private Vector3 _leftHandPosition;
-    private Vector3 _rightHandPosition;
-    private Quaternion _leftHandRotation = Quaternion.Identity;
-    private Quaternion _rightHandRotation = Quaternion.Identity;
-
-    private const float HandIdleOffset = 0.3f;
-    private const float HandInteractionLerpSpeed = 8f;
-
-    private float _interactionLerp;
-    private Vector3 _interactionTargetPoint;
-    private bool _isHoveringUI;
-    private Vector3 _headPosition;
-    private Quaternion _headRotation = Quaternion.Identity;
-    private float _playerHeight = 1.8f;
 
     public Camera3D Camera => _camera;
-    public bool IsHoveringUI => _isHoveringUI;
-    public Vector3 InteractionPoint => _interactionTargetPoint;
-
-    public Vector3 LeftHandPosition => _leftHandPosition;
-    public Vector3 RightHandPosition => _rightHandPosition;
-    public Quaternion LeftHandRotation => _leftHandRotation;
-    public Quaternion RightHandRotation => _rightHandRotation;
 
     public override void _Ready()
     {
         CreateCursorUI();
-        CreateInteractionRay();
         LumoraLogger.Log("DesktopInput initialized");
     }
 
@@ -95,29 +70,11 @@ public partial class DesktopInput : Node3D
         _cursorDot.QueueRedraw();
     }
 
-    private void CreateInteractionRay()
-    {
-        _interactionRay = new RayCast3D();
-        _interactionRay.Name = "DesktopInteractionRay";
-        _interactionRay.TargetPosition = new Vector3(0, 0, -MaxRayDistance);
-        _interactionRay.CollisionMask = UICollisionLayer;
-        _interactionRay.CollideWithAreas = true;
-        _interactionRay.CollideWithBodies = false;
-        _interactionRay.Enabled = true;
-        AddChild(_interactionRay);
-    }
-
     public override void _Process(double delta)
     {
         UpdateCamera();
         UpdateCursorPosition();
         UpdateCursorRay();
-
-        if (!DashboardToggle.IsDashboardVisible)
-        {
-            UpdateInteractionRay();
-            UpdateHandSimulation((float)delta);
-        }
     }
 
     // Push the free-cursor ray and camera projection info to the engine while
@@ -167,12 +124,6 @@ public partial class DesktopInput : Node3D
         // (via HeadOutput's pose override) instead of swapping in a separate camera, so the dashboard,
         // cursor ray and laser - which all key off this pose - follow the view in all modes. - xlinka
         _camera = Lumora.Source.Godot.Bootstrap.XRModeManager.Instance?.CurrentCamera ?? _camera;
-
-        if (_camera != null)
-        {
-            _headPosition = _camera.GlobalPosition;
-            _headRotation = _camera.GlobalTransform.Basis.GetRotationQuaternion();
-        }
     }
 
     private void UpdateCursorPosition()
@@ -190,80 +141,9 @@ public partial class DesktopInput : Node3D
             _cursorDot.Position = _cursorDot.GetViewport().GetMousePosition() - _cursorDot.Size / 2f;
     }
 
-    private void UpdateInteractionRay()
-    {
-        if (_camera == null || _interactionRay == null)
-            return;
-
-        _interactionRay.GlobalPosition = _camera.GlobalPosition;
-        _interactionRay.GlobalRotation = _camera.GlobalRotation;
-
-        _interactionRay.ForceRaycastUpdate();
-
-        _isHoveringUI = false;
-        if (_interactionRay.IsColliding())
-        {
-            var collider = _interactionRay.GetCollider();
-            if (collider is Area3D)
-            {
-                _isHoveringUI = true;
-                _interactionTargetPoint = _interactionRay.GetCollisionPoint();
-            }
-        }
-    }
-
-    private void UpdateHandSimulation(float delta)
-    {
-        if (_camera == null)
-            return;
-
-        var forward = _headRotation * Vector3.Forward;
-        var right = _headRotation * Vector3.Right;
-        var down = Vector3.Down;
-
-        var hipsPos = _headPosition + down * (_playerHeight * 0.5f);
-
-        var leftIdlePos = hipsPos - right * HandIdleOffset + forward * 0.05f;
-        var rightIdlePos = hipsPos + right * HandIdleOffset + forward * 0.05f;
-
-        var leftIdleRot = Quaternion.FromEuler(new Vector3(Mathf.DegToRad(90), 0, Mathf.DegToRad(-90)));
-        var rightIdleRot = Quaternion.FromEuler(new Vector3(Mathf.DegToRad(90), 0, Mathf.DegToRad(90)));
-
-        float targetLerp = _isHoveringUI ? 1f : 0f;
-        _interactionLerp = Mathf.Lerp(_interactionLerp, targetLerp, delta * HandInteractionLerpSpeed);
-
-        if (_isHoveringUI && _interactionLerp > 0.01f)
-        {
-            var toTarget = _interactionTargetPoint - _headPosition;
-            var targetDir = toTarget.Normalized();
-            var reachDistance = Mathf.Min(toTarget.Length() - 0.1f, 0.6f);
-
-            var interactionPos = _headPosition + targetDir * reachDistance;
-            var interactionRot = new Quaternion(new Vector3(0, 1, 0), Mathf.Atan2(targetDir.X, targetDir.Z));
-
-            _rightHandPosition = rightIdlePos.Lerp(interactionPos, _interactionLerp);
-            _rightHandRotation = rightIdleRot.Slerp(interactionRot, _interactionLerp);
-
-            _leftHandPosition = leftIdlePos;
-            _leftHandRotation = leftIdleRot;
-        }
-        else
-        {
-            _leftHandPosition = leftIdlePos;
-            _rightHandPosition = rightIdlePos;
-            _leftHandRotation = leftIdleRot;
-            _rightHandRotation = rightIdleRot;
-        }
-    }
-
     public void SetCamera(Camera3D camera)
     {
         _camera = camera;
-    }
-
-    public void SetPlayerHeight(float height)
-    {
-        _playerHeight = height;
     }
 }
 

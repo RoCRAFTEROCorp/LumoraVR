@@ -336,6 +336,13 @@ public class LocomotionController : Component
         bool freeCam = _inputState?.FreeCamActive ?? false;
         bool lookSuppressed = _inputState?.MouseLookSuppressed ?? false;
         bool inputSuppressed = _inputState?.DesktopInputSuppressed ?? false;
+
+        // Third person still turns the body, just not with raw mouse look: the camera orbits and the
+        // avatar comes round to face where it is pointing once you start walking. Runs before the
+        // early-out below, which exists to keep the mouse OFF the head in that mode.
+        if (IsThirdPerson && !inputSuppressed)
+            UpdateThirdPersonFacing();
+
         if (_mouse == null || !_mouseCaptured || freeCam || lookSuppressed || inputSuppressed)
             return;
 
@@ -347,6 +354,85 @@ public class LocomotionController : Component
         _pitch -= mouseDelta.y * MouseSensitivity;
         float maxPitchRad = MaxPitch * (float)System.Math.PI / 180f;
         _pitch = System.Math.Clamp(_pitch, -maxPitchRad, maxPitchRad);
+    }
+
+    // THIRD-PERSON BODY ALIGNMENT
+    //
+    // In third person the mouse drives the orbit, not the head, so nothing was turning the avatar at
+    // all: you could spin the camera all the way round and the body stayed pointing wherever it was
+    // when you pressed F5, and WASD kept pushing you along that stale direction. The other platform
+    // aligns the body to the camera once you are MOVING, after a short dwell, rather than snapping the
+    // instant the camera moves - so you can look around a stationary character freely, and the moment
+    // you walk, the character comes round to where you are looking.
+    //
+    // The dwell is what stops a nudge of the mouse from yanking the body. Turn rate scales with how
+    // hard you are pushing the stick, so a slow walk turns gently and a sprint turns sharply. -xlinka
+    private const float AlignDwellSeconds = 0.15f;
+    private const float AlignRate = 8f;
+    // How far the head may turn away from the body before it stops following the camera.
+    private const float HeadYawLimit = 1.4f;   // radians, ~80 degrees
+
+    // Genuinely in third person, which is NOT the same as "the mouse is not driving the head".
+    // MouseLookSuppressed is overloaded: F5 sets it, and so does opening a context menu in FIRST
+    // person, because the menu takes the mouse for its own pointer. Keying the third-person body and
+    // head work off that flag meant opening a menu while standing in first person made this code turn
+    // the avatar to face the camera - which is exactly the "why does opening the context menu rotate
+    // me" report. Ask the camera state instead: external camera, and not the free-cam. -xlinka
+    private bool IsThirdPerson =>
+        _inputState?.ExternalCameraActive == true && _inputState?.FreeCamActive != true;
+    private float _alignDwell;
+    private float _thirdPersonHeadYaw;
+
+    private void UpdateThirdPersonFacing()
+    {
+        var input = _inputInterface;
+        if (input == null || !input.DesktopCameraPoseValid)
+            return;
+
+        float dt = World?.Time.Delta ?? (1f / 60f);
+        var axis = LocomotionInputHelper.ReadMovementAxis(input);
+        float push = axis.Length;
+
+        // The camera's own yaw and pitch, read in the SAME euler convention the head and body
+        // rotations are built from, so no sign guessing.
+        var camEuler = input.DesktopCameraRotation.ToEuler();
+        float camYaw = camEuler.y;
+        float camPitch = camEuler.x;
+
+        // HEAD: tracks the camera every frame, yaw and pitch both. This is the half that makes the
+        // avatar look like it answers the mouse, and the half we did not have - the head carries only
+        // pitch normally and third person suppressed even that, so looking up and down in F5 moved
+        // nothing at all. The yaw is stored relative to the body and CLAMPED, so the head turns to
+        // follow the camera round to the side and then stops rather than the neck spinning.
+        float maxPitchRad = MaxPitch * (float)System.Math.PI / 180f;
+        _pitch = System.Math.Clamp(camPitch, -maxPitchRad, maxPitchRad);
+        _thirdPersonHeadYaw = System.Math.Clamp(WrapAngle(camYaw - _yaw), -HeadYawLimit, HeadYawLimit);
+
+        // BODY: only once you are actually walking. Turning it while you stand made the avatar rotate
+        // to face the camera as you orbited it, which is not what the other platform does and is not
+        // what anyone wants to look at. The dwell keeps a nudge of the stick from yanking it round.
+        if (push <= 0.01f)
+        {
+            _alignDwell = 0f;
+            return;
+        }
+
+        _alignDwell += dt;
+        if (_alignDwell < AlignDwellSeconds)
+            return;
+
+        float delta = WrapAngle(camYaw - _yaw);
+        _yaw += delta * System.Math.Clamp(AlignRate * dt * System.Math.Clamp(push, 0f, 1f), 0f, 1f);
+    }
+
+    // Shortest way round, so a turn across the +/-pi seam does not take the long way.
+    private static float WrapAngle(float radians)
+    {
+        const float twoPi = MathF.PI * 2f;
+        radians %= twoPi;
+        if (radians > MathF.PI) radians -= twoPi;
+        else if (radians < -MathF.PI) radians += twoPi;
+        return radians;
     }
 
     private const float POS_THRESHOLD_SQ = 0.0001f * 0.0001f;
@@ -419,7 +505,10 @@ public class LocomotionController : Component
         if (1.0f - (bodyDot < 0 ? -bodyDot : bodyDot) > ROT_THRESHOLD)
             SetRootRotationAroundHead(newBodyRot);
 
-        var newHeadRot = floatQ.FromEuler(new float3(_pitch, 0, 0));
+        // Yaw on the head is third person only: in first person the body IS the look direction, so a
+        // head yaw there would double it.
+        float headYaw = IsThirdPerson ? _thirdPersonHeadYaw : 0f;
+        var newHeadRot = floatQ.FromEuler(new float3(_pitch, headYaw, 0));
         var currentHeadRot = _userRoot.HeadSlot.LocalRotation.Value;
         float headDot = floatQ.Dot(newHeadRot, currentHeadRot);
         if (1.0f - (headDot < 0 ? -headDot : headDot) > ROT_THRESHOLD)
@@ -427,36 +516,72 @@ public class LocomotionController : Component
 
         // Drive hand aim on the CONTROLLER slots (hands are grip-offset
         // children of controllers - writing the hand child would bypass the
-        // tool/laser). Right hand pitches with the camera; while the context
-        // menu is open it raises into view pointing at the menu.
+        // tool/laser). The right hand pitches with the camera; both stay at
+        // their resting height.
+        //
+        // The controller slot used to jump up to chest height whenever a context menu opened. Desktop arms
+        // carry NO IK weight (there is no hand tracker to weigh), so the avatar's actual arm cannot follow
+        // it - the hand and its laser slid ~30cm up the body on their own while the arm stayed hanging at
+        // the side. That is the "hands moving up when laser selecting something" report. The hand stays
+        // put now; aiming is TryAimHandAtLaserTarget's job, and it rotates in place.
+        //
+        // An equipped tool is the one case that DOES lift the hand, and it works because the missing half is
+        // there now: HandTool drives the node to a hold pose in front of the head and AvatarIK weights the
+        // arm to match, so the arm comes up with it instead of being left behind. That hand owns its node
+        // outright while it holds, so hand the rest pose over rather than writing it - two components
+        // writing one transform field alternate every frame and the hand jitters between them. -xlinka
         float restPitch = -MathF.PI / 2f;
-        bool menuOpen = IsLocalContextMenuOpen();
 
         var rightController = ResolveControllerSlot(ref _rightControllerSlot, Input.BodyNode.RightController);
         if (rightController != null)
         {
             float aimPitch = MathF.Min(MathF.Max(restPitch + _pitch, -MathF.PI / 2f), 0f);
             var targetRot = floatQ.Euler(-MathF.PI / 2f, aimPitch, 0f);
-            var targetPos = menuOpen
-                ? new float3(0.16f, headHeight - 0.28f, -0.28f)
-                : new float3(0.25f, 1.0f, 0f);
+            var restPos = new float3(0.25f, 1.0f, 0f);
 
-            SetIfChanged(rightController.LocalPosition, targetPos);
-            if (!TryAimHandAtLaserTarget(rightController, dt))
-                SetIfChanged(rightController.LocalRotation, targetRot);
+            if (!OfferRestToHandTool(ref _rightHandTool, rightController, restPos, targetRot))
+            {
+                SetIfChanged(rightController.LocalPosition, restPos);
+                if (!TryAimHandAtLaserTarget(rightController, dt))
+                    SetIfChanged(rightController.LocalRotation, targetRot);
+            }
         }
 
         var leftController = ResolveControllerSlot(ref _leftControllerSlot, Input.BodyNode.LeftController);
         if (leftController != null)
         {
-            SetIfChanged(leftController.LocalPosition, new float3(-0.25f, 1.0f, 0f));
-            SetIfChanged(leftController.LocalRotation, floatQ.Euler(MathF.PI / 2f, restPitch, 0f));
+            var restPos = new float3(-0.25f, 1.0f, 0f);
+            var restRot = floatQ.Euler(MathF.PI / 2f, restPitch, 0f);
+
+            if (!OfferRestToHandTool(ref _leftHandTool, leftController, restPos, restRot))
+            {
+                SetIfChanged(leftController.LocalPosition, restPos);
+                SetIfChanged(leftController.LocalRotation, restRot);
+            }
         }
+    }
+
+    private Interaction.HandTool? _leftHandTool;
+    private Interaction.HandTool? _rightHandTool;
+
+    // Give this controller's rest pose to the tool rig hanging off it. True means that rig is currently
+    // driving the node (a tool held in view) and this component must keep its hands off it this frame.
+    private static bool OfferRestToHandTool(ref Interaction.HandTool? cache, Slot controller,
+        in float3 restPosition, in floatQ restRotation)
+    {
+        if (cache == null || cache.IsDestroyed || !ReferenceEquals(cache.Slot?.Parent, controller))
+            cache = controller.GetComponentInChildren<Interaction.HandTool>(includeSelf: false);
+
+        // A tool rig that has stopped updating cannot let go of the node on its own, and its last answer
+        // would strand the hand wherever it was. Disabled means we take the node back. -xlinka
+        if (cache == null || cache.IsDestroyed || !cache.Enabled.Value || cache.Slot?.IsActive != true)
+            return false;
+
+        return cache.OfferRestPose(restPosition, restRotation);
     }
 
     private Slot? _leftControllerSlot;
     private Slot? _rightControllerSlot;
-    private UI.ContextMenuSystem? _contextMenuCache;
     private Interaction.InteractionLaser? _rightLaserCache;
 
     // Rate the pointing hand eases onto the view's aim, in 1/s. Fast enough that the beam lands where you are
@@ -511,13 +636,6 @@ public class LocomotionController : Component
         return cache;
     }
 
-    private bool IsLocalContextMenuOpen()
-    {
-        if (_contextMenuCache == null || _contextMenuCache.IsDestroyed)
-            _contextMenuCache = _userRoot?.Slot?.GetComponentInChildren<UI.ContextMenuSystem>();
-        return _contextMenuCache?.IsOpen.Value == true;
-    }
-
     private static void SetIfChanged(Sync<float3> field, in float3 value)
     {
         if ((field.Value - value).LengthSquared > POS_THRESHOLD_SQ)
@@ -558,7 +676,14 @@ public class LocomotionController : Component
 
     public void GetMovementBasis(out float3 forward, out float3 right)
     {
-        if (_userRoot != null && _userRoot.HeadSlot != null)
+        // Third person walks relative to the CAMERA. The head does not turn in this mode, so taking the
+        // basis off it left movement bound to whichever way you happened to be facing when the mode was
+        // entered: you would orbit behind the character and W still walked the old way. -xlinka
+        if (IsThirdPerson && _inputInterface?.DesktopCameraPoseValid == true)
+        {
+            forward = _inputInterface.DesktopCameraRotation * float3.Backward;
+        }
+        else if (_userRoot != null && _userRoot.HeadSlot != null)
         {
             forward = _userRoot.HeadFacingDirection;
         }
