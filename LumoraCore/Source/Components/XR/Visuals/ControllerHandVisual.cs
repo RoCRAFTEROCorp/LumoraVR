@@ -39,22 +39,26 @@ public sealed class ControllerHandVisual : Component
 
     private readonly struct BoneEntry
     {
-        public readonly BodyNode     NodeA;
-        public readonly BodyNode     NodeB;
-        public readonly Slot         VisualSlot;
-        public readonly CylinderMesh Cylinder;
-        public BoneEntry(BodyNode a, BodyNode b, Slot slot, CylinderMesh mesh)
-            { NodeA = a; NodeB = b; VisualSlot = slot; Cylinder = mesh; }
+        public readonly BodyNode NodeA;
+        public readonly BodyNode NodeB;
+        public BoneEntry(BodyNode a, BodyNode b) { NodeA = a; NodeB = b; }
     }
 
     // PRIVATE STATE
 
     private Slot         _handSkeletonRoot = null!;
     private PBS_Metallic _handMaterial = null!;
+    private HandSkeletonMesh _skeletonMesh = null!;
     private List<JointEntry> _joints = null!;
     private List<BoneEntry>  _bones = null!;
     private Dictionary<BodyNode, float3> _jointWorldPositions = null!;
     private Dictionary<BodyNode, float3> _restPoseLocalPositions = null!;
+
+    // Scratch pose handed to the mesh each frame, in the skeleton root's local space. Sized once.
+    private float3[] _poseJoints = Array.Empty<float3>();
+    private float[] _poseRadii = Array.Empty<float>();
+    private (int a, int b)[] _poseBones = Array.Empty<(int, int)>();
+    private Dictionary<BodyNode, int> _jointIndex = null!;
 
     // FINGER TOPOLOGY
 
@@ -101,6 +105,7 @@ public sealed class ControllerHandVisual : Component
         base.OnStart();
         _joints = new List<JointEntry>();
         _bones  = new List<BoneEntry>();
+        _jointIndex = new Dictionary<BodyNode, int>(32);
         _jointWorldPositions   = new Dictionary<BodyNode, float3>(32);
         _restPoseLocalPositions = BuildRestPoseLocalPositions(HandSide.Value, HandScale.Value);
         // The skeleton is a per-viewer visual: RefreshVisuals drives every joint/bone each frame from THIS
@@ -146,6 +151,8 @@ public sealed class ControllerHandVisual : Component
         // Child slots are destroyed with the parent slot; just release list references.
         _joints = null!;
         _bones  = null!;
+        _jointIndex = null!;
+        _skeletonMesh = null!;
         _jointWorldPositions = null!;
         _restPoseLocalPositions = null!;
         base.OnDestroy();
@@ -169,6 +176,15 @@ public sealed class ControllerHandVisual : Component
         _handMaterial.Metallic.Value      = 0.25f;
         _handMaterial.Smoothness.Value    = 0.55f;
         _handMaterial.RenderQueue.Value   = 60;
+
+        // ONE mesh for the whole hand. Joints keep a slot each (a touch probe sits on a fingertip
+        // slot), but nothing renders per joint or per bone any more: the mesh below is rewritten in
+        // place from the pose every frame and drawn once. -xlinka
+        _skeletonMesh = _handSkeletonRoot.AttachComponent<HandSkeletonMesh>();
+        var renderer = _handSkeletonRoot.AttachComponent<MeshRenderer>();
+        renderer.Mesh.Target     = _skeletonMesh;
+        renderer.Material.Target = _handMaterial;
+        renderer.SortingOrder.Value = 60;
 
         Chirality side    = HandSide.Value;
         float scale = MathF.Max(HandScale.Value, 0.2f);
@@ -196,39 +212,25 @@ public sealed class ControllerHandVisual : Component
                 CreateBoneVisual(nodes[i], nodes[i + 1], bRadius);
         }
 
+        _poseJoints = new float3[_joints.Count];
+        _poseRadii = new float[_joints.Count];
+        for (int i = 0; i < _joints.Count; i++)
+            _poseRadii[i] = jRadius;
+        _poseBones = new (int, int)[_bones.Count];
+
         _handSkeletonRoot.ActiveSelf.Value = true;
     }
 
     private void CreateJointVisual(BodyNode node, float radius)
     {
-        var slot   = _handSkeletonRoot.AddSlot($"Joint_{node}");
-        var sphere = slot.AttachComponent<SphereMesh>();
-        sphere.Radius.Value   = radius;
-        sphere.Segments.Value = 8;
-        sphere.Rings.Value    = 6;
-
-        var renderer = slot.AttachComponent<MeshRenderer>();
-        renderer.Mesh.Target     = sphere;
-        renderer.Material.Target = _handMaterial;
-        renderer.SortingOrder.Value = 60;
-
+        var slot = _handSkeletonRoot.AddSlot($"Joint_{node}");
+        _jointIndex[node] = _joints.Count;
         _joints.Add(new JointEntry(node, slot));
     }
 
     private void CreateBoneVisual(BodyNode nodeA, BodyNode nodeB, float radius)
     {
-        var slot     = _handSkeletonRoot.AddSlot($"Bone_{nodeA}_{nodeB}");
-        var cylinder = slot.AttachComponent<CylinderMesh>();
-        cylinder.Radius.Value   = radius;
-        cylinder.Height.Value   = 0.03f; // Overwritten every frame once tracking is active.
-        cylinder.Segments.Value = 6;
-
-        var renderer = slot.AttachComponent<MeshRenderer>();
-        renderer.Mesh.Target     = cylinder;
-        renderer.Material.Target = _handMaterial;
-        renderer.SortingOrder.Value = 60;
-
-        _bones.Add(new BoneEntry(nodeA, nodeB, slot, cylinder));
+        _bones.Add(new BoneEntry(nodeA, nodeB));
     }
 
     // PER-FRAME UPDATE
@@ -269,41 +271,34 @@ public sealed class ControllerHandVisual : Component
             _jointWorldPositions[joint.Node] = jointWorldPos;
         }
 
-        // Orient and size each bone cylinder between its two joint positions.
-        float bRadius = BoneRadius.Value * MathF.Max(HandScale.Value, 0.2f);
+        // Hand the whole pose to the one mesh. The default hand gets disposed when a real avatar is
+        // equipped over the hands while this refresh can still run for a frame; a disposed mesh is
+        // skipped rather than written. -xlinka
+        var mesh = _skeletonMesh;
+        var root = _handSkeletonRoot;
+        if (mesh == null || mesh.IsDestroyed || root == null || root.IsDestroyed || _poseJoints.Length != _joints.Count)
+            return;
+
+        for (int i = 0; i < _joints.Count; i++)
+        {
+            _poseJoints[i] = _jointWorldPositions.TryGetValue(_joints[i].Node, out var world)
+                ? root.GlobalPointToLocal(world)
+                : float3.Zero;
+        }
+
+        int written = 0;
         foreach (var bone in _bones)
         {
-            // The default hand visual's cylinders get disposed when a real avatar is equipped over the hands, but
-            // this per-frame refresh can still run for a frame+ - writing a disposed Cylinder.Height spams the log
-            // ("Cannot modify disposed element: Height", tens of thousands). Skip disposed bones. -xlinka
-            if (bone.VisualSlot == null || bone.VisualSlot.IsDestroyed || bone.Cylinder == null || bone.Cylinder.IsDestroyed)
-                continue;
-
-            if (!_jointWorldPositions.TryGetValue(bone.NodeA, out var posA) ||
-                !_jointWorldPositions.TryGetValue(bone.NodeB, out var posB))
-            {
-                bone.VisualSlot.ActiveSelf.Value = false;
-                continue;
-            }
-
-            float3 diff = new float3(posB.x - posA.x, posB.y - posA.y, posB.z - posA.z);
-            float  dist = diff.Length;
-
-            if (dist < 0.0005f)
-            {
-                bone.VisualSlot.ActiveSelf.Value = false;
-                continue;
-            }
-
-            bone.VisualSlot.ActiveSelf.Value = true;
-            bone.VisualSlot.GlobalPosition   = new float3(
-                (posA.x + posB.x) * 0.5f,
-                (posA.y + posB.y) * 0.5f,
-                (posA.z + posB.z) * 0.5f);
-            bone.VisualSlot.GlobalRotation   = AlignYToDirection(diff);
-            bone.Cylinder.Height.Value       = dist;
-            bone.Cylinder.Radius.Value       = bRadius;
+            // A bone without both ends collapses to a point inside the mesh instead of vanishing from
+            // the index buffer, so the topology never has to be rebuilt for a lost joint.
+            int a = -1, b = -1;
+            bool ok = _jointIndex.TryGetValue(bone.NodeA, out a) && _jointIndex.TryGetValue(bone.NodeB, out b)
+                      && _jointWorldPositions.ContainsKey(bone.NodeA) && _jointWorldPositions.ContainsKey(bone.NodeB);
+            _poseBones[written++] = ok ? (a, b) : (-1, -1);
         }
+
+        float bRadius = BoneRadius.Value * MathF.Max(HandScale.Value, 0.2f);
+        mesh.SetPose(_poseJoints, _poseRadii, _poseBones, bRadius);
     }
 
     private float3 GetFallbackJointWorldPosition(BodyNode node)
@@ -405,31 +400,4 @@ public sealed class ControllerHandVisual : Component
             nodes[i] = finger.ComposeFinger(segments[i], chirality);
         return nodes;
     }
-
-    // CylinderMesh geometry extends along local Y, so this orients bone cylinders correctly between
-    // two joint positions
-    private static floatQ AlignYToDirection(float3 direction)
-    {
-        float len = direction.Length;
-        if (len < 0.0001f) return floatQ.Identity;
-
-        float3 dir = new float3(direction.x / len, direction.y / len, direction.z / len);
-
-        // Rotation axis = cross(Up, dir). Angle = acos(Up  dot  dir).
-        float3 axis    = float3.Cross(float3.Up, dir);
-        float  axisLen = axis.Length;
-
-        if (axisLen < 0.001f)
-        {
-            // Direction is nearly parallel or anti-parallel to world Up.
-            return float3.Dot(float3.Up, dir) > 0f
-                ? floatQ.Identity
-                : floatQ.AxisAngle(float3.Forward, MathF.PI);
-        }
-
-        float3 normAxis = new float3(axis.x / axisLen, axis.y / axisLen, axis.z / axisLen);
-        float  angle    = MathF.Acos(System.Math.Clamp(float3.Dot(float3.Up, dir), -1f, 1f));
-        return floatQ.AxisAngle(normAxis, angle);
-    }
 }
-
