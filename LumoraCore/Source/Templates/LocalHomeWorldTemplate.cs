@@ -117,8 +117,15 @@ internal sealed class LocalHomeWorldTemplate : WorldTemplateDefinition
         var risingBallsSlot = groundSlot.AddSlot("RisingBalls");
         risingBallsSlot.LocalPosition.Value = new float3(0f, groundHeight * 0.5f + risingVolumeHeight * 0.5f + risingVolumeLift, 0f);
 
-        var risingBallsMesh = risingBallsSlot.AttachComponent<BoxMesh>();
-        risingBallsMesh.Size.Value = new float3(risingDiskRadius * 2f, risingVolumeHeight, risingDiskRadius * 2f);
+        // Real geometry, one surface: a sphere, a neck and a floor ring per bubble, placed by the
+        // material's vertex shader. The volume here has to match the material's or the culling box
+        // is wrong. -xlinka
+        var risingVolumeOffset = new float3(0f, -risingVolumeHeight * 0.5f - risingVolumeLift, 0f);
+        var risingBallsMesh = risingBallsSlot.AttachComponent<BubbleFieldMesh>();
+        risingBallsMesh.Count.Value = groundMaterial.BlobCount.Value;
+        risingBallsMesh.VolumeExtents.Value = new float2(risingDiskRadius, risingDiskRadius);
+        risingBallsMesh.VolumeHeight.Value = risingVolumeHeight;
+        risingBallsMesh.VolumeOffset.Value = risingVolumeOffset;
 
         var risingBallsMaterial = risingBallsSlot.AttachComponent<LocalHomeRisingMaterial>();
         risingBallsMaterial.TintA.Value = groundMaterial.TintA.Value;
@@ -129,13 +136,17 @@ internal sealed class LocalHomeWorldTemplate : WorldTemplateDefinition
         risingBallsMaterial.RiseSpeed.Value = groundMaterial.RiseSpeed.Value;
         risingBallsMaterial.VolumeExtents.Value = new float2(risingDiskRadius, risingDiskRadius);
         risingBallsMaterial.VolumeHeight.Value = risingVolumeHeight;
-        risingBallsMaterial.VolumeOffset.Value = new float3(0f, -risingVolumeHeight * 0.5f - risingVolumeLift, 0f);
+        risingBallsMaterial.VolumeOffset.Value = risingVolumeOffset;
         risingBallsMaterial.RimStrength.Value = groundMaterial.RimStrength.Value;
         risingBallsMaterial.RimFalloff.Value = groundMaterial.RimFalloff.Value;
         risingBallsMaterial.FresnelPower.Value = groundMaterial.FresnelPower.Value;
         risingBallsMaterial.AlphaScale.Value = 0.92f;
         risingBallsMaterial.EmissionStrength.Value = 1.05f;
         risingBallsMaterial.TimeScale.Value = groundMaterial.TimeScale.Value;
+        risingBallsMaterial.RippleColor.Value = groundMaterial.RippleColor.Value;
+        risingBallsMaterial.RippleStrength.Value = groundMaterial.RippleStrength.Value;
+        risingBallsMaterial.RippleRadius.Value = groundMaterial.RippleRadius.Value;
+        risingBallsMaterial.RippleWidth.Value = groundMaterial.RippleWidth.Value;
         risingBallsMaterial.RenderQueue.Value = 35;
 
         var risingBallsRenderer = risingBallsSlot.AttachComponent<MeshRenderer>();

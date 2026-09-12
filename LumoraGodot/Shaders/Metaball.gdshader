@@ -33,56 +33,11 @@ void vertex() {
     world_pos = (MODEL_MATRIX * vec4(VERTEX, 1.0)).xyz;
 }
 
-float hash11(float n) {
-    return fract(sin(n) * 43758.5453123);
-}
-
-float blob_life(int i, float t) {
-    float fi = float(i);
-    float phase = hash11(fi * 8.213);
-    return fract(t * rise_speed + phase);
-}
-
-// Polar disk layout. Must stay in lockstep with LocalHomeRising.gdshader's
-// blob_center so ripples land directly under the rising orbs. - xlinka
-vec3 blob_center(int i, float t, vec3 origin) {
-    float fi = float(i);
-    float r_rand = hash11(fi * 1.137 + 7.31);
-    float a_rand = hash11(fi * 3.751 + 0.91);
-    float disk_radius = min(volume_extents.x, volume_extents.y);
-    float r = sqrt(r_rand) * disk_radius;
-    float a = a_rand * 6.28318530718;
-    float rx = cos(a) * r;
-    float rz = sin(a) * r;
-    float life = blob_life(i, t);
-    float y = mix(-0.06, volume_height + 0.28, life);
-    return origin + vec3(rx, y, rz);
-}
-
-float blob_ripples(vec2 p, float t, vec3 origin) {
-    float ripples = 0.0;
-
-    for (int i = 0; i < 96; i++) {
-        if (i >= blob_count) {
-            break;
-        }
-
-        float life = blob_life(i, t);
-        vec3 center = blob_center(i, t, origin);
-        float d = distance(p, center.xz);
-        float lift = smoothstep(0.04, 0.42, life);
-        float ring_radius = mix(blob_radius * 1.35, ripple_radius, lift);
-        float width = ripple_width + blob_smoothness * 0.025;
-        float ring = 1.0 - smoothstep(width * 0.35, width, abs(d - ring_radius));
-        float contact = 1.0 - smoothstep(0.30, 0.72, life);
-        float fade = smoothstep(0.0, 0.08, life) * (1.0 - smoothstep(0.80, 1.0, life));
-        float center_pull = 1.0 - smoothstep(0.0, blob_radius * 1.8, d);
-        ripples += ring * fade;
-        ripples += center_pull * contact * 0.50;
-    }
-
-    return clamp(ripples, 0.0, 1.0);
-}
+// The ripple rings under each bubble used to be evaluated here: a loop over every bubble in every
+// pixel of the floor, which on a standalone headset was most of the frame. They are now one quad
+// per bubble inside the BubbleFieldMesh, drawn by LocalHomeRising.gdshader, so the floor only pays
+// for its own wave lines and edge. The blob_* uniforms stay declared so the material component
+// can keep writing them. - xlinka
 
 float mesh_edge(vec2 local_p) {
     vec2 normalized = local_p / max(volume_extents, vec2(0.001));
@@ -109,9 +64,8 @@ void fragment() {
 
     float edge = mesh_edge(local_p);
     float waves = wave_lines(floor_world.xz, t) * wave_strength;
-    float ripples = blob_ripples(floor_world.xz, t, origin) * ripple_strength;
-    float line_mask = clamp(edge * 1.15 + waves * 0.40 + ripples * 0.80, 0.0, 1.0);
-    float tint_mix = clamp(waves * 0.45 + ripples * 0.35, 0.0, 1.0);
+    float line_mask = clamp(edge * 1.15 + waves * 0.40, 0.0, 1.0);
+    float tint_mix = clamp(waves * 0.45, 0.0, 1.0);
 
     vec3 final_rgb = mix(ripple_color.rgb, tint_b.rgb, tint_mix);
     vec3 final_emission = final_rgb * (0.38 + line_mask * 1.10) * emission_strength * line_strength;

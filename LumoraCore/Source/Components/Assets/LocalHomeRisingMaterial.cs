@@ -7,6 +7,11 @@ namespace Lumora.Core.Assets;
 
 // Hyper-specific to the LocalHome world. If another world wants rising orbs,
 // fork this rather than dragging LocalHome's tuning along for the ride. - xlinka
+//
+// Meant for a BubbleFieldMesh: the shader is vertex-animated and reads the bubble index and part
+// from the mesh (UV0) and the shape parameters from UV1. On any other mesh it draws nothing useful.
+// The floor ripple rings live here too now, one quad per bubble, so the floor shader no longer
+// loops over every bubble per pixel. -xlinka
 [ComponentCategory("Assets/Materials")]
 public sealed class LocalHomeRisingMaterial : MaterialProvider
 {
@@ -25,6 +30,10 @@ public sealed class LocalHomeRisingMaterial : MaterialProvider
     public readonly Sync<float> AlphaScale;
     public readonly Sync<float> EmissionStrength;
     public readonly Sync<float> TimeScale;
+    public readonly Sync<colorHDR> RippleColor;
+    public readonly Sync<float> RippleStrength;
+    public readonly Sync<float> RippleRadius;
+    public readonly Sync<float> RippleWidth;
     public readonly Sync<BlendMode> BlendMode;
     public readonly Sync<Culling> Culling;
     public readonly Sync<int> RenderQueue;
@@ -48,8 +57,12 @@ public sealed class LocalHomeRisingMaterial : MaterialProvider
         AlphaScale = new Sync<float>(this, 0.92f);
         EmissionStrength = new Sync<float>(this, 1.05f);
         TimeScale = new Sync<float>(this, 1.0f);
+        RippleColor = new Sync<colorHDR>(this, new colorHDR(0.70f, 1.00f, 0.92f, 1f));
+        RippleStrength = new Sync<float>(this, 0.62f);
+        RippleRadius = new Sync<float>(this, 0.58f);
+        RippleWidth = new Sync<float>(this, 0.032f);
         BlendMode = new Sync<BlendMode>(this, Assets.BlendMode.Transparent);
-        Culling = new Sync<Culling>(this, Assets.Culling.Front);
+        Culling = new Sync<Culling>(this, Assets.Culling.Back);
         RenderQueue = new Sync<int>(this, 35);
     }
 
@@ -74,6 +87,10 @@ public sealed class LocalHomeRisingMaterial : MaterialProvider
         asset.SetFloat("AlphaScale", AlphaScale.Value);
         asset.SetFloat("EmissionStrength", EmissionStrength.Value);
         asset.SetFloat("TimeScale", TimeScale.Value);
+        asset.SetColor("RippleColor", RippleColor.Value);
+        asset.SetFloat("RippleStrength", RippleStrength.Value);
+        asset.SetFloat("RippleRadius", RippleRadius.Value);
+        asset.SetFloat("RippleWidth", RippleWidth.Value);
     }
 
     // TintA is the blob colour the shader starts from; TintB is the far end of the same ramp.
