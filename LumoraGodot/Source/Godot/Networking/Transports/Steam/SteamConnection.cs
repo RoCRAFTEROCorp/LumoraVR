@@ -1,5 +1,10 @@
 // Copyright (c) 2026 LUMORAVR LTD. All rights reserved.
 // Licensed under the LumoraVR Source Available License. See LICENSE in the project root.
+// Steam is a desktop-only transport. The Steamworks binding has no Android build, and a type that
+// merely MENTIONS a Steamworks type cannot be loaded there: the whole engine init failed on a Pico 4
+// with 'Could not load type of field SteamNetworkManager:_listenerMap', long before any runtime
+// 'is this Android' check could run. Compile the transport out on mobile entirely. -xlinka
+#if GODOT_PC
 
 using System;
 using System.Collections.Generic;
@@ -351,3 +356,4 @@ public sealed class SteamConnection : IConnection
     public override string ToString()
         => $"SteamConnection({_remoteId.m_SteamID}, state={_state}, handles=[{string.Join(",", _connections)}])";
 }
+#endif

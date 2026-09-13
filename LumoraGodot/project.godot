@@ -42,10 +42,6 @@ window/size/always_on_top.editor=false
 
 project/assembly_name="Lumora"
 
-[editor]
-
-run/main_run_args="--Lumora-Debug"
-
 [filesystem]
 
 import/blender/enabled=false

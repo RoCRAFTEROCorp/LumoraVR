@@ -4,13 +4,14 @@
 using Godot;
 using System;
 using Lumora.Core;
+using LumoraLogger = Lumora.Core.Logging.Logger;
 
 namespace Lumora.Source.Godot.UI;
 
-/// <summary>
-/// Professional loading UI for engine initialization.
-/// Displays progress bar, status text, and phase transitions during boot.
-/// </summary>
+// Boot progress UI. The 2D Control covers the desktop window; once the XR viewport is live a
+// VrLoadingEnvironment child mirrors the same status and progress into the headset, because OpenXR
+// composites only the 3D viewport and a 2D Control never reaches it. Every state change goes through
+// SetStatus/SetProgress so both views always agree. -xlinka
 public partial class LoadingScreen : Control
 {
 	// UI NODE REFERENCES
@@ -21,9 +22,12 @@ public partial class LoadingScreen : Control
 	private Control _loadingSpinner = null!;
 	private Label _versionLabel = null!;
 
+	private VrLoadingEnvironment? _vrEnvironment;
+
 	// STATE
 	private float _targetProgress = 0f;
 	private float _currentProgress = 0f;
+	private string _status = "Initializing...";
 	private bool _isVisible = true;
 	private bool _fadeOutQueued = false;
 
@@ -66,29 +70,63 @@ public partial class LoadingScreen : Control
 		}
 	}
 
-	/// <summary>
-	/// Update loading progress (0-100).
-	/// </summary>
-	public void SetProgress(float percentage)
+	// Grows the headset twin. Called by the runner the moment the XR viewport is configured, which is
+	// mid-phase-2, so the twin is seeded with whatever the 2D screen already shows. Returns false and
+	// leaves the 2D screen alone when XR is not actually presenting; both may coexist (PCVR shows the
+	// Control on the monitor and the environment in the headset). -xlinka
+	public bool AttachVrEnvironment(Camera3D? xrCamera, Viewport? xrViewport)
 	{
-		_targetProgress = Mathf.Clamp(percentage, 0f, 100f);
-	}
+		if (_vrEnvironment != null && GodotObject.IsInstanceValid(_vrEnvironment))
+			return true;
 
-	/// <summary>
-	/// Update status text message.
-	/// </summary>
-	public void SetStatus(string status)
-	{
-		if (_statusLabel != null)
+		if (xrCamera == null || xrViewport == null)
 		{
-			_statusLabel.Text = status;
+			LumoraLogger.Warn("LoadingScreen: VR environment skipped - no XR camera or viewport to follow.");
+			return false;
+		}
+
+		var primary = XRServer.PrimaryInterface;
+		if (!xrViewport.UseXR || primary == null || !primary.IsInitialized())
+		{
+			LumoraLogger.Log($"LoadingScreen: VR environment skipped - XR viewport not presenting (UseXR={xrViewport.UseXR}, primary={(primary == null ? "none" : primary.GetName())}).");
+			return false;
+		}
+
+		try
+		{
+			_vrEnvironment = new VrLoadingEnvironment { Name = "VrLoadingEnvironment" };
+			_vrEnvironment.Bind(xrCamera, xrViewport);
+			_vrEnvironment.SetStatus(_status);
+			_vrEnvironment.SetProgress(_targetProgress);
+			_vrEnvironment.SnapProgress(_currentProgress);
+			AddChild(_vrEnvironment);
+			LumoraLogger.Log($"LoadingScreen: VR environment attached to '{xrCamera.Name}' in viewport '{xrViewport.Name}' (UseXR={xrViewport.UseXR}).");
+			return true;
+		}
+		catch (Exception ex)
+		{
+			LumoraLogger.Warn($"LoadingScreen: VR environment failed to attach ({ex.Message}); headset stays on the bare world.");
+			_vrEnvironment = null;
+			return false;
 		}
 	}
 
-	/// <summary>
-	/// Update progress for a specific initialization phase.
-	/// Automatically calculates percentage and sets appropriate message.
-	/// </summary>
+	public void SetProgress(float percentage)
+	{
+		_targetProgress = Mathf.Clamp(percentage, 0f, 100f);
+		_vrEnvironment?.SetProgress(_targetProgress);
+	}
+
+	public void SetStatus(string status)
+	{
+		_status = status ?? string.Empty;
+		if (_statusLabel != null)
+		{
+			_statusLabel.Text = _status;
+		}
+		_vrEnvironment?.SetStatus(_status);
+	}
+
 	public void SetPhase(int phaseNumber, int totalPhases, string phaseName)
 	{
 		// Calculate percentage (each phase is equal weight)
@@ -97,9 +135,6 @@ public partial class LoadingScreen : Control
 		SetStatus($"[{phaseNumber}/{totalPhases}] {phaseName}");
 	}
 
-	/// <summary>
-	/// Hide the loading screen with fade-out animation.
-	/// </summary>
 	public new void Hide()
 	{
 		if (!_isVisible)
@@ -107,12 +142,14 @@ public partial class LoadingScreen : Control
 
 		_isVisible = false;
 		Visible = false;
+		// Control visibility does not propagate to a Node3D child, and QueueFree lands a frame later;
+		// dismiss the headset twin now so the world does not get one frame of dome over it.
+		if (_vrEnvironment != null && GodotObject.IsInstanceValid(_vrEnvironment))
+			_vrEnvironment.Dismiss();
+		_vrEnvironment = null;
 		QueueFree(); // Remove immediately since animation player was removed
 	}
 
-	/// <summary>
-	/// Show the loading screen with fade-in animation.
-	/// </summary>
 	public new void Show()
 	{
 		if (_isVisible)
@@ -122,9 +159,6 @@ public partial class LoadingScreen : Control
 		Visible = true;
 	}
 
-	/// <summary>
-	/// Update progress bar and percentage label.
-	/// </summary>
 	private void UpdateProgressDisplay(float percentage)
 	{
 		if (_progressBar != null)
@@ -138,9 +172,6 @@ public partial class LoadingScreen : Control
 		}
 	}
 
-	/// <summary>
-	/// Called when animation finishes (for cleanup).
-	/// </summary>
 	private void _on_animation_finished(StringName animName)
 	{
 		// AnimationPlayer removed; keep handler to avoid errors if signal still exists
@@ -148,10 +179,6 @@ public partial class LoadingScreen : Control
 
 	// PHASE-SPECIFIC HELPER METHODS
 
-	/// <summary>
-	/// Predefined status messages for each initialization phase.
-	/// Makes it easy for LumoraEngineRunner to call without knowing exact text.
-	/// </summary>
 	public static class PhaseMessages
 	{
 		public const string EnvironmentSetup = "Setting up environment...";
@@ -161,7 +188,7 @@ public partial class LoadingScreen : Control
 		public const string SystemIntegration = "Connecting input and audio systems...";
 		public const string UserspaceSetup = "Loading user interface...";
 		public const string Ready = "Ready!";
-		
+
 		// World synchronization phases
 		public const string ConnectingToWorld = "Connecting to world...";
 		public const string WaitingForJoinGrant = "Requesting access...";
@@ -170,9 +197,6 @@ public partial class LoadingScreen : Control
 		public const string WorldReady = "World ready!";
 	}
 
-	/// <summary>
-	/// Shorthand method to update phase using enum index.
-	/// </summary>
 	public void UpdatePhase(int phaseIndex, string customMessage = null!)
 	{
 		string[] defaultMessages = new[]

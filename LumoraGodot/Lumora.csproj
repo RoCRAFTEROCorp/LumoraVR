@@ -7,7 +7,7 @@
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="DiscordRichPresence" Version="1.2.1.24" />
-    <PackageReference Include="Steamworks.NET" Version="2024.8.0" />
+    <PackageReference Include="Steamworks.NET" Version="2024.8.0" Condition="'$(GodotTargetPlatform)' != 'android' And '$(GodotTargetPlatform)' != 'ios'" />
     <PackageReference Include="LiteNetLib" Version="2.0.2" />
     <PackageReference Include="Wasmtime" Version="22.0.0" />
   </ItemGroup>
@@ -51,6 +51,9 @@
     <DefineConstants Condition="$(RuntimeIdentifier.Contains('linux'))">$(DefineConstants);LINUX</DefineConstants>
     <DefineConstants Condition="$(RuntimeIdentifier.Contains('osx')) Or $(RuntimeIdentifier.Contains('mac'))">$(DefineConstants);OSX</DefineConstants>
     <DefineConstants Condition="$(RuntimeIdentifier.Contains('win'))">$(DefineConstants);WINDOWS</DefineConstants>
+    <!-- Android had no define at all, so a build-time platform check could not be written for the one
+         platform that most needs different code. Godot exports Android as linux-bionic RIDs. -xlinka -->
+    <DefineConstants Condition="$(RuntimeIdentifier.Contains('android')) Or $(RuntimeIdentifier.Contains('bionic'))">$(DefineConstants);ANDROID</DefineConstants>
   </PropertyGroup> 
   <PropertyGroup Condition="'$(RuntimeIdentifier)' == ''">
     <DefineConstants Condition="$([MSBuild]::IsOsPlatform('Linux'))">$(DefineConstants);LINUX</DefineConstants>
