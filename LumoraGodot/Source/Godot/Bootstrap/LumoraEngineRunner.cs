@@ -15,7 +15,9 @@ using Lumora.Core.Input;
 using Lumora.Core.Math;
 using Lumora.Nexus.Transport.LNL;
 using Lumora.Core.Networking.Sync;
+#if GODOT_PC
 using Lumora.Godot.Networking.Transports.Steam;
+#endif
 using Lumora.Core.Components.Meshes;
 using Lumora.Core.Templates;
 using Lumora.Source.Godot.Input.Drivers;
@@ -36,7 +38,7 @@ namespace Lumora.Source.Godot.Bootstrap;
 
 public partial class LumoraEngineRunner : Node
 {
-	private const string DebugFlag = "--Lumora-Debug";
+	private const string DebugFlag = LaunchArgs.DebugFlag;
 	private const string DebugConsoleFlag = "--Lumora-DebugConsole";
 	private const string DebugConsoleScenePath = "res://Scenes/UI/Debug/DebugWindow.tscn";
 	private const string DebugConsoleMutexName = "Lumora.DebugConsole.SingleInstance";
@@ -50,6 +52,7 @@ public partial class LumoraEngineRunner : Node
 	[Export] public bool AutoConnectLocalHome { get; set; } = true;
 	[Export] public int LocalHomePort { get; set; } = 44844;
 	[Export] public int MaximumXrRefreshRate { get; set; } = 90;
+	private const float StandaloneMaxRefreshRate = 72f;
 
 	// CORE SYSTEMS
 	private Lumora.Core.Engine _engine = null!;
@@ -69,6 +72,7 @@ public partial class LumoraEngineRunner : Node
 	private LocalDB _localDB = null!;
 	private InspectorInputHandler _inspectorInputHandler = null!;
 	private DebugUdpSender? _debugUdpSender;
+	private FrameTimeLog? _frameLog;
 
 	// STATE
 	private bool _engineInitialized = false;
@@ -77,6 +81,7 @@ public partial class LumoraEngineRunner : Node
 	private double _debugPerfTimer;
 	private double _debugMemoryTimer;
 	private double _debugRenderProfileTimer;
+	private double _debugFrameTimer;
 	private double _debugNetworkTimer;
 	private readonly List<Lumora.Core.UpdateManager.ProfileEntry> _profByTypeBuffer = new();
 	private readonly List<Lumora.Core.UpdateManager.ProfileEntry> _profBySlotBuffer = new();
@@ -96,9 +101,95 @@ public partial class LumoraEngineRunner : Node
 	// SCENE REFERENCES
 	private Node3D _inputRoot = null!;
 	private Camera3D _mainCamera = null!;
-	private SubViewport _xrViewport = null!;
+	private Viewport _xrViewport = null!;
+
+	// Where the headset renders from. On a standalone headset XR goes on the ROOT viewport; on desktop
+	// the dedicated SubViewport stays so the monitor can show the DesktopCamera mirror while the
+	// headset shows the XR camera.
+	//
+	// Measured on a Pico 4, same scene, 1.3x eye buffer: root viewport 13.3 ms GPU at a flat 72 fps;
+	// SubViewport 12.2 ms GPU at 62 fps. Less GPU work and fewer frames, because with the SubViewport
+	// the root window is still presented every frame and the Android surface cannot disable vsync
+	// ("V-Sync mode Disabled is not available" at boot), so the present blocks on the flat display
+	// instead of the headset. With XR on the root, the frame goes to OpenXR and that wait is gone.
+	// --xr-subviewport forces the other path on standalone, --xr-root forces this one on desktop. -xlinka
+	private static bool UseRootViewportForXr
+		=> LaunchArgs.HasFlag("--xr-root") || (OS.HasFeature("android") && !LaunchArgs.HasFlag("--xr-subviewport"));
 	private bool _vrInitializedAtBoot;
 	private double _discordPresenceTimer;
+
+	// Fallback for image formats the engine's own decoder cannot read - WebP above all, which imported
+	// avatars use constantly. Godot decodes it here and hands back straight RGBA rows in the same
+	// top-down order everything else uses.
+	private static byte[]? DecodeImageWithGodot(byte[] encoded, out int width, out int height)
+	{
+		width = 0;
+		height = 0;
+		if (encoded == null || encoded.Length == 0)
+			return null;
+
+		using var image = new Image();
+		var error = image.LoadWebpFromBuffer(encoded);
+		if (error != Error.Ok)
+			error = image.LoadPngFromBuffer(encoded);
+		if (error != Error.Ok)
+			error = image.LoadJpgFromBuffer(encoded);
+		if (error != Error.Ok)
+			error = image.LoadBmpFromBuffer(encoded);
+		if (error != Error.Ok)
+			error = image.LoadTgaFromBuffer(encoded);
+		if (error != Error.Ok)
+			error = image.LoadKtxFromBuffer(encoded);
+		if (error != Error.Ok)
+			error = image.LoadDdsFromBuffer(encoded);
+		// SVG is listed as importable and this was the only reader that never tried it. Text, so it
+		// goes last: the binary sniffers above reject it instantly. 1.0 is the document's own size.
+		if (error != Error.Ok)
+			error = image.LoadSvgFromBuffer(encoded, 1.0f);
+		if (error != Error.Ok)
+			return null;
+
+		// KTX and DDS arrive already block-compressed; the engine side wants bytes it can scan and
+		// resample, and Convert refuses a compressed source. Decompress needs the matching decoder in
+		// this build, so a failure here is a real "cannot read", not a crash.
+		if (image.IsCompressed() && image.Decompress() != Error.Ok)
+			return null;
+
+		if (image.GetFormat() != Image.Format.Rgba8)
+			image.Convert(Image.Format.Rgba8);
+
+		width = image.GetWidth();
+		height = image.GetHeight();
+		return image.GetData();
+	}
+
+	// EXR only. The engine decodes Radiance itself; EXR needs the platform's reader, and that reader
+	// is bound in this Godot build but lives in a module that not every export template carries.
+	// A missing module comes back as an error from the load call, which is the honest outcome: the
+	// texture fails to load with a reason instead of tone-mapping to 8-bit behind the user's back.
+	// Output is RGBA half floats, 8 bytes per texel, top-down rows. -xlinka
+	private static byte[]? DecodeHdrImageWithGodot(byte[] encoded, out int width, out int height)
+	{
+		width = 0;
+		height = 0;
+		if (encoded == null || encoded.Length == 0)
+			return null;
+
+		using var image = new Image();
+		var error = image.LoadExrFromBuffer(encoded);
+		if (error != Error.Ok)
+		{
+			LumoraLogger.Warn($"LumoraEngineRunner: EXR decode unavailable on this build ({error})");
+			return null;
+		}
+
+		if (image.GetFormat() != Image.Format.Rgbah)
+			image.Convert(Image.Format.Rgbah);
+
+		width = image.GetWidth();
+		height = image.GetHeight();
+		return image.GetData();
+	}
 
 	private void LogCallback(LumoraLogger.LogLevel level,String message){
 		switch(level){
@@ -132,17 +223,32 @@ public partial class LumoraEngineRunner : Node
 		Vr
 	}
 
+	private double _hostDiscordMs;
+
 	public override void _Ready()
 	{
 		LumoraLogger.LogToGameEngine += LogCallback;
+		Lumora.Core.Assets.TextureVariantStore.PlatformDecoder = DecodeImageWithGodot;
+		Lumora.Core.Assets.TextureVariantStore.PlatformHdrDecoder = DecodeHdrImageWithGodot;
 		// Godot object picking logs in stereo and is not part of engine-side interaction. - xlinka
 		GetViewport().PhysicsObjectPicking = false;
 
+		// Every Node3D transform is written once per render frame from the engine update below
+		// (input -> world update -> slot flush -> camera), all before the frame renders. Physics
+		// interpolation assumes transforms only change on the fixed physics tick and smears every
+		// engine-driven node between stale tick snapshots while the camera, which opts out, stays
+		// crisp: hands, held objects, the avatar and the context menu all jittered under it. The
+		// project setting says the same, but the editor rewrites project.godot without comments and
+		// the last write folded that setting into a junk key, so the rule is enforced here. -xlinka
+		GetTree().PhysicsInterpolation = false;
+
+#if GODOT_PC
 		if (ShouldUseSteam() && !SteamManager.Initialize())
 		{
 			GetTree().Quit();
 			return;
 		}
+#endif
 
 		if (HasCommandLineFlag(DebugConsoleFlag))
 		{
@@ -165,11 +271,17 @@ public partial class LumoraEngineRunner : Node
 		if (HasCommandLineFlag(DebugFlag))
 		{
 			_debugUdpSender = new DebugUdpSender();
+			// Per-receiver input timing: the particle sim, cloth, dynamic bones and both IK solvers all
+			// run through that dispatch, and without this they are an unattributed lump inside the sync
+			// phase. Same opt-in gate as the update profiler. -xlinka
+			Lumora.Core.Input.InputInterface.ProfileReceivers = true;
 			// Per-slot/per-component update profiling carries a small per-frame cost, so only turn it on when the
 			// debug console is actually attached (--lumora-debug). Normal runs pay nothing. -xlinka
 			Lumora.Core.UpdateManager.ProfilingEnabled = true;
 			LaunchDebugConsoleProcess();
 		}
+
+		_frameLog = FrameTimeLog.FromCommandLine();
 
 		InitializeLoadingScreen();
 
@@ -192,24 +304,7 @@ public partial class LumoraEngineRunner : Node
 	// still comes up underneath, which costs little and keeps one startup path. -xlinka
 	private System.Threading.CancellationTokenSource? _serviceModes;
 
-	// --flag=value off either arg list. Godot splits what came before "--" from what came after, and a
-	// service is launched with the flag on whichever side the operator happened to use. -xlinka
-	private static string? ReadCommandLineValue(string flag)
-	{
-		foreach (var raw in OS.GetCmdlineArgs())
-		{
-			var arg = raw.Trim();
-			if (arg.StartsWith(flag + "=", System.StringComparison.OrdinalIgnoreCase))
-				return arg.Substring(flag.Length + 1).Trim('"');
-		}
-		foreach (var raw in OS.GetCmdlineUserArgs())
-		{
-			var arg = raw.Trim();
-			if (arg.StartsWith(flag + "=", System.StringComparison.OrdinalIgnoreCase))
-				return arg.Substring(flag.Length + 1).Trim('"');
-		}
-		return null;
-	}
+	private static string? ReadCommandLineValue(string flag) => LaunchArgs.ReadValue(flag);
 
 	private void StartServiceModes()
 	{
@@ -240,31 +335,9 @@ public partial class LumoraEngineRunner : Node
 		}
 	}
 
-	private static bool HasCommandLineFlag(string flag)
-	{
-		foreach (var arg in GetAllCommandLineArgs())
-		{
-			if (arg.Trim().Equals(flag, StringComparison.OrdinalIgnoreCase))
-			{
-				return true;
-			}
-		}
+	private static bool HasCommandLineFlag(string flag) => LaunchArgs.HasFlag(flag);
 
-		return false;
-	}
-
-	private static IEnumerable<string> GetAllCommandLineArgs()
-	{
-		foreach (var arg in OS.GetCmdlineArgs())
-		{
-			yield return arg;
-		}
-
-		foreach (var arg in OS.GetCmdlineUserArgs())
-		{
-			yield return arg;
-		}
-	}
+	private static IEnumerable<string> GetAllCommandLineArgs() => LaunchArgs.All();
 
 	private static XrLaunchMode ParseXrModeValue(string value)
 	{
@@ -607,20 +680,97 @@ public partial class LumoraEngineRunner : Node
 
 		_vrInitializedAtBoot = true;
 
-		LumoraLogger.Log("XR Device: OpenXR (Active) - dedicated XR viewport renders HMD, root viewport stays desktop");
+		LumoraLogger.Log(UseRootViewportForXr
+			? "XR Device: OpenXR (Active) - root viewport renders the HMD"
+			: "XR Device: OpenXR (Active) - dedicated XR viewport renders HMD, root viewport stays desktop");
+		TrimStandaloneRendering();
+		AttachVrLoadingEnvironment();
 		await Task.Delay(120);
 	}
 
-	private SubViewport EnsureXRViewport()
+	// On a standalone headset, render the scene ONCE and skip the post passes.
+	//
+	// Measured on a Pico 4 at 1 fps: the XR viewport alone took 270 ms of GPU at 1504x1504 with glow
+	// on, and the frame was 800 ms. The rest was the ROOT viewport. On desktop it is the monitor
+	// mirror and earns its keep; on a standalone headset the device's flat display is never visible
+	// while the headset is worn, yet the desktop camera was still drawing the whole world into it every
+	// frame at full resolution. Disable3D leaves it as a 2D surface, which is what the runtime's own
+	// mirror wants anyway. Glow is a full-resolution multi-pass bloom chain on the mobile renderer and
+	// is decoration; off. -xlinka
+	private void TrimStandaloneRendering()
+	{
+		if (!OS.HasFeature("android"))
+			return;
+
+		var root = GetViewport();
+		bool rootIsEyeRender = _xrViewport == root;
+		if (!rootIsEyeRender)
+		{
+			root.Disable3D = true;
+			root.Msaa3D = Viewport.Msaa.Disabled;
+			root.ScreenSpaceAA = Viewport.ScreenSpaceAAEnum.Disabled;
+		}
+
+		int glowOff = 0;
+		foreach (var env in new[] { root.World3D?.Environment, _xrViewport?.World3D?.Environment, _xrViewport?.GetCamera3D()?.Environment })
+		{
+			if (env == null || !env.GlowEnabled)
+				continue;
+			env.GlowEnabled = false;
+			glowOff++;
+		}
+
+		LumoraLogger.Log(rootIsEyeRender
+			? $"Standalone: root viewport IS the eye render; glow disabled on {glowOff} environment(s)"
+			: $"Standalone: root viewport 3D disabled (headset viewport is the only 3D render); glow disabled on {glowOff} environment(s)");
+	}
+
+	// The headset shows whatever the XR viewport renders from the moment UseXR flips on, and until now
+	// that was the bare bootstrap world: near-black for four more phases, indistinguishable from a hung
+	// process. The 2D LoadingScreen is a Control and OpenXR composites only the 3D viewport, so the
+	// loading screen grows a 3D twin here, driven by the same UpdatePhase calls. Camera comes from the
+	// XR viewport's current camera (what the headset actually renders from), with the scene's
+	// %XRCamera3D as the fallback. -xlinka
+	private void AttachVrLoadingEnvironment()
+	{
+		if (_loadingScreen == null || !GodotObject.IsInstanceValid(_loadingScreen))
+			return;
+
+		if (_xrViewport == null || !GodotObject.IsInstanceValid(_xrViewport))
+		{
+			LumoraLogger.Warn("LoadingScreen: VR environment skipped - XR viewport missing after OpenXR init.");
+			return;
+		}
+
+		var xrCamera = _xrViewport.GetCamera3D()
+			?? GetTree()?.CurrentScene?.GetNodeOrNull<Camera3D>("%XRCamera3D");
+		if (xrCamera == null)
+		{
+			LumoraLogger.Warn("LoadingScreen: VR environment skipped - XR viewport has no current camera and %XRCamera3D was not found.");
+			return;
+		}
+
+		_loadingScreen.AttachVrEnvironment(xrCamera, _xrViewport);
+	}
+
+	private Viewport EnsureXRViewport()
 	{
 		if (_xrViewport != null && GodotObject.IsInstanceValid(_xrViewport))
 			return _xrViewport;
 
 		var sceneRoot = GetTree()?.CurrentScene ?? this;
-		_xrViewport = sceneRoot.GetNodeOrNull<SubViewport>("%XRViewport");
-		if (_xrViewport == null)
+
+		if (UseRootViewportForXr)
 		{
-			_xrViewport = new SubViewport
+			_xrViewport = GetViewport();
+			LumoraLogger.Log("XR: rendering the headset from the ROOT viewport (no XR SubViewport).");
+			return _xrViewport;
+		}
+
+		var sub = sceneRoot.GetNodeOrNull<SubViewport>("%XRViewport");
+		if (sub == null)
+		{
+			sub = new SubViewport
 			{
 				Name = "XRViewport",
 				UniqueNameInOwner = true,
@@ -628,20 +778,21 @@ public partial class LumoraEngineRunner : Node
 				RenderTargetUpdateMode = SubViewport.UpdateMode.Always
 			};
 
-			sceneRoot.AddChild(_xrViewport);
-			_xrViewport.Owner = GetTree()?.CurrentScene;
+			sceneRoot.AddChild(sub);
+			sub.Owner = GetTree()?.CurrentScene;
 		}
 
 		var rootViewport = GetViewport();
 		if (rootViewport?.World3D != null)
-			_xrViewport.World3D = rootViewport.World3D;
+			sub.World3D = rootViewport.World3D;
 
-		_xrViewport.PhysicsObjectPicking = false;
+		sub.PhysicsObjectPicking = false;
 
 		var xrOrigin = sceneRoot.GetNodeOrNull<XROrigin3D>("%XROrigin3D");
-		if (xrOrigin != null && GodotObject.IsInstanceValid(xrOrigin) && xrOrigin.GetParent() != _xrViewport)
-			xrOrigin.Reparent(_xrViewport, keepGlobalTransform: true);
+		if (xrOrigin != null && GodotObject.IsInstanceValid(xrOrigin) && xrOrigin.GetParent() != sub)
+			xrOrigin.Reparent(sub, keepGlobalTransform: true);
 
+		_xrViewport = sub;
 		return _xrViewport;
 	}
 
@@ -704,11 +855,18 @@ public partial class LumoraEngineRunner : Node
 		else
 		{
 			LumoraLogger.Log($"OpenXR: Available refresh rates: {availableRates}");
+			// A standalone headset stops at 72. The Pico 4 offers 90, an 11.1 ms budget the 1.2x
+			// supersampled frame does not fit, and missing it means the compositor halves us to 45.
+			// 72 Hz is 13.9 ms, which fits with room; a steady 72 beats a 90 that keeps falling over. -xlinka
+			float ceiling = OS.HasFeature("android") ? StandaloneMaxRefreshRate : MaximumXrRefreshRate;
+			newRate = 0f;
 			foreach (float rate in availableRates)
 			{
-				if (rate > newRate && rate <= MaximumXrRefreshRate)
+				if (rate > newRate && rate <= ceiling)
 					newRate = rate;
 			}
+			if (newRate <= 0f)
+				newRate = currentRefreshRate;
 		}
 
 		if (newRate > 0.0f && Math.Abs(currentRefreshRate - newRate) > 0.01f)
@@ -841,6 +999,15 @@ public partial class LumoraEngineRunner : Node
 			if (string.IsNullOrWhiteSpace(resourceRoot))
 			{
 				resourceRoot = System.IO.Path.GetDirectoryName(OS.GetExecutablePath()) ?? string.Empty;
+			}
+			// On Android the executable path is the literal "apk", whose directory is empty, so BOTH
+			// fallbacks came back blank and every res:// asset failed with "Resource root not set":
+			// no fonts, and Helio text without a font draws nothing. The root only has to be a stable
+			// prefix the hooks strip back off, so a synthetic folder under user data does the job. -xlinka
+			if (string.IsNullOrWhiteSpace(resourceRoot))
+			{
+				resourceRoot = System.IO.Path.Combine(OS.GetUserDataDir(), "res");
+				LumoraLogger.Log($"LumoraEngineRunner: no on-disk resource root on this platform; using '{resourceRoot}' as the res:// prefix");
 			}
 			_engine.ResourceRoot = resourceRoot;
 			LoadBundledLocales();
@@ -1281,12 +1448,16 @@ public partial class LumoraEngineRunner : Node
 			LumoraLogger.Warn("LumoraEngineRunner: No InputInterface available in _Process");
 		}
 
+#if GODOT_PC
 		if (ShouldUseSteam())
 			SteamManager.RunCallbacks();
+#endif
 
 		// Discord rich presence: pump callbacks every frame, refresh the presence a few times a
 		// second (the update itself de-dups, so this only sends when the world/state changes).
+		long _discordTs = System.Diagnostics.Stopwatch.GetTimestamp();
 		DiscordManager.Poll();
+		_hostDiscordMs = (System.Diagnostics.Stopwatch.GetTimestamp() - _discordTs) * (1000.0 / System.Diagnostics.Stopwatch.Frequency);
 		_discordPresenceTimer += delta;
 		if (_discordPresenceTimer >= 3.0)
 		{
@@ -1298,14 +1469,27 @@ public partial class LumoraEngineRunner : Node
 		// changed callbacks fire during SteamManager.RunCallbacks() above, so
 		// dispatching transports after that ensures connection state transitions
 		// are observed in the same frame they occur. - xlinka
+		// The first clean capture put 33% of the frame in "unaccounted" even after the engine phases
+		// were instrumented, and engine input/coroutines/fixed/assets all came back at ~0. So the time
+		// is either OUR work here in _Process outside Engine.Update, or Godot's own frame. Splitting
+		// those two apart is the difference between a bug we can fix and a platform cost we cannot.
+		// -xlinka
+		long _hostTs = System.Diagnostics.Stopwatch.GetTimestamp();
+		double _hostMspt = 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+
 		NetworkManagerRegistry.UpdateAll();
+		_hostNetworkMs = (System.Diagnostics.Stopwatch.GetTimestamp() - _hostTs) * _hostMspt;
 
 		// Run engine update loop (includes one input pass + world updates).
 		// Avoid a duplicate InputInterface.UpdateInputs call here.
+		long _engineTs = System.Diagnostics.Stopwatch.GetTimestamp();
 		_engine?.Update(delta);
 		_engine?.LateUpdate(delta);
+		_hostEngineMs = (System.Diagnostics.Stopwatch.GetTimestamp() - _engineTs) * _hostMspt;
 
+		long _tailTs = System.Diagnostics.Stopwatch.GetTimestamp();
 		UpdateGodotMetrics(delta);
+		SendDebugFrame(delta);
 		SendDebugPerf(delta);
 		SendDebugMemory(delta);
 		SendDebugRenderProfile(delta);
@@ -1314,7 +1498,15 @@ public partial class LumoraEngineRunner : Node
 		_headOutput?.UpdatePositioning(_engine);
 		_dashOverlay?.Tick(_engine);
 		_worldLoadOverlay?.Tick(_engine);
+		// Includes the telemetry send itself, so the profiler is honest about its own cost.
+		_hostTailMs = (System.Diagnostics.Stopwatch.GetTimestamp() - _tailTs) * _hostMspt;
+
+		_frameLog?.Record(this, delta, _hostNetworkMs, _hostEngineMs, _hostTailMs);
 	}
+
+	private double _hostNetworkMs;
+	private double _hostEngineMs;
+	private double _hostTailMs;
 
 	public override void _Input(InputEvent @event)
 	{
@@ -1458,7 +1650,13 @@ public partial class LumoraEngineRunner : Node
 		var world = _engine.WorldManager.FocusedWorld;
 		var metrics = world.Metrics;
 		var fps = world.LocalUser?.FPS.Value ?? (float)global::Godot.Engine.GetFramesPerSecond();
-		var frameTime = fps > 0f ? 1000f / fps : 0f;
+
+		// Frame time used to be 1000/fps, where fps is the REPLICATED LocalUser.FPS - a value rounded to
+		// a whole number and only written every 30 frames. So the profiler graph was drawing a derived,
+		// quantised, stale number and calling it a measurement: a frame time of 16.67 there could be
+		// anything from 16.1 to 17.2 ms, and a single 200 ms hitch never showed up at all. This is the
+		// real process delta. -xlinka
+		var frameTime = (float)(delta * 1000.0);
 
 		_debugUdpSender.SendPerf(
 			fps,
@@ -1532,6 +1730,184 @@ public partial class LumoraEngineRunner : Node
 			topComponents);
 	}
 
+	// Per-frame cost breakdown for the Frame tab. Sampled at the same rate as the other telemetry, but
+	// what it reports is the LAST frame in full rather than an average, so a spike stays a spike.
+	//
+	// ViewportSetMeasureRenderTime is enabled once and only under --Lumora-Debug: Godot has to fence the
+	// GPU to answer it, so it is not something to leave on for everyone. -xlinka
+	private readonly HashSet<Rid> _measuredViewports = new();
+	private readonly List<Lumora.Core.UpdateManager.ProfileEntry> _hookCostBuffer = new();
+	private readonly List<SubViewport> _liveViewportBuffer = new();
+	private readonly List<DebugUdpSender.FrameViewport> _viewportStatsBuffer = new();
+	private readonly List<Lumora.Core.Input.InputInterface.ReceiverProfileEntry> _receiverProfileBuffer = new();
+
+	private void SendDebugFrame(double delta)
+	{
+		if (_debugUdpSender == null || _engine?.WorldManager?.FocusedWorld == null)
+		{
+			return;
+		}
+
+		_debugFrameTimer += delta;
+		if (_debugFrameTimer < DebugPerfSendIntervalSec)
+		{
+			return;
+		}
+		_debugFrameTimer = 0;
+
+		var world = _engine.WorldManager.FocusedWorld;
+		var profile = world.LastFrameProfile;
+		var enginePhases = _engine.LastEnginePhases;
+
+		var perf = Performance.Singleton;
+
+		Rid viewport = GetViewport()?.GetViewportRid() ?? default;
+		double renderCpuMs = 0.0, renderGpuMs = 0.0;
+		long drawsVisible = 0, drawsShadow = 0, drawsCanvas = 0, objectsVisible = 0, objectsShadow = 0;
+
+		if (viewport.IsValid)
+		{
+			EnsureMeasured(viewport);
+			renderCpuMs = RenderingServer.ViewportGetMeasuredRenderTimeCpu(viewport);
+			renderGpuMs = RenderingServer.ViewportGetMeasuredRenderTimeGpu(viewport);
+
+			drawsVisible = RenderingServer.ViewportGetRenderInfo(viewport,
+				RenderingServer.ViewportRenderInfoType.Visible, RenderingServer.ViewportRenderInfo.DrawCallsInFrame);
+			drawsShadow = RenderingServer.ViewportGetRenderInfo(viewport,
+				RenderingServer.ViewportRenderInfoType.Shadow, RenderingServer.ViewportRenderInfo.DrawCallsInFrame);
+			drawsCanvas = RenderingServer.ViewportGetRenderInfo(viewport,
+				RenderingServer.ViewportRenderInfoType.Canvas, RenderingServer.ViewportRenderInfo.DrawCallsInFrame);
+			objectsVisible = RenderingServer.ViewportGetRenderInfo(viewport,
+				RenderingServer.ViewportRenderInfoType.Visible, RenderingServer.ViewportRenderInfo.ObjectsInFrame);
+			objectsShadow = RenderingServer.ViewportGetRenderInfo(viewport,
+				RenderingServer.ViewportRenderInfoType.Shadow, RenderingServer.ViewportRenderInfo.ObjectsInFrame);
+		}
+
+		// Every offscreen viewport costed separately. The dash alone renders the world again, and so does
+		// every mirror and camera; a single global draw-call total can never say which of them is the
+		// expensive one. -xlinka
+		_liveViewportBuffer.Clear();
+		Lumora.Godot.Hooks.RenderTextureHook.CollectLiveViewports(_liveViewportBuffer);
+		_viewportStatsBuffer.Clear();
+		_viewportStatsBuffer.Add(new DebugUdpSender.FrameViewport("main", drawsVisible + drawsShadow + drawsCanvas,
+			renderGpuMs, renderCpuMs));
+		foreach (var sub in _liveViewportBuffer)
+		{
+			var rid = sub.GetViewportRid();
+			if (!rid.IsValid)
+				continue;
+			EnsureMeasured(rid);
+			long draws =
+				RenderingServer.ViewportGetRenderInfo(rid, RenderingServer.ViewportRenderInfoType.Visible, RenderingServer.ViewportRenderInfo.DrawCallsInFrame)
+				+ RenderingServer.ViewportGetRenderInfo(rid, RenderingServer.ViewportRenderInfoType.Shadow, RenderingServer.ViewportRenderInfo.DrawCallsInFrame)
+				+ RenderingServer.ViewportGetRenderInfo(rid, RenderingServer.ViewportRenderInfoType.Canvas, RenderingServer.ViewportRenderInfo.DrawCallsInFrame);
+			var size = sub.Size;
+			_viewportStatsBuffer.Add(new DebugUdpSender.FrameViewport(
+				$"{sub.Name} {size.X}x{size.Y}",
+				draws,
+				RenderingServer.ViewportGetMeasuredRenderTimeGpu(rid),
+				RenderingServer.ViewportGetMeasuredRenderTimeCpu(rid)));
+		}
+
+		// VMA's own accounting, which is closer to the truth than the RenderingInfo totals, plus the
+		// driver's one-frame report. Null on the Compatibility backend and under --headless, so all of it
+		// stays at zero rather than pretending.
+		long gpuTexture = 0, gpuBuffer = 0, gpuTotal = 0, driverAllocs = 0, driverMem = 0;
+		string perfReport = string.Empty;
+		var device = RenderingServer.GetRenderingDevice();
+		if (device != null)
+		{
+			gpuTexture = (long)device.GetMemoryUsage(RenderingDevice.MemoryType.Textures);
+			gpuBuffer = (long)device.GetMemoryUsage(RenderingDevice.MemoryType.Buffers);
+			gpuTotal = (long)device.GetMemoryUsage(RenderingDevice.MemoryType.Total);
+			driverAllocs = (long)device.GetDriverAllocationCount();
+			driverMem = (long)device.GetDriverTotalMemory();
+			perfReport = device.GetPerfReport() ?? string.Empty;
+		}
+
+		_hookCostBuffer.Clear();
+		world.UpdateManager?.CollectHookCost(_hookCostBuffer);
+		var topHooks = _hookCostBuffer
+			.OrderByDescending(e => e.Ms)
+			.Take(24)
+			.Select(e => (e.Name, e.Ms, e.Count));
+
+		_debugUdpSender.SendFrame(new DebugUdpSender.FramePacket
+		{
+			HostNetworkMs = _hostNetworkMs,
+			HostEngineMs = _hostEngineMs,
+			HostTailMs = _hostTailMs,
+			EngineInputMs = enginePhases.InputMs,
+			EngineCoroutinesMs = enginePhases.CoroutinesMs,
+			EngineFixedMs = enginePhases.FixedMs,
+			EngineAssetsMs = enginePhases.AssetsMs,
+			CpuFrameMs = delta * 1000.0,
+			WorldTotalMs = profile.TotalMs,
+			SyncMs = profile.SyncMs,
+			PreMs = profile.PreMs,
+			CompMs = profile.CompMs,
+			ChangeMs = profile.ChangeMs,
+			HooksMs = profile.HooksMs,
+			EndMs = profile.EndMs,
+			LateMs = profile.LateMs,
+			RenderCpuMs = renderCpuMs,
+			RenderGpuMs = renderGpuMs,
+			FrameSetupCpuMs = RenderingServer.GetFrameSetupTimeCpu(),
+			DrawsVisible = drawsVisible,
+			DrawsShadow = drawsShadow,
+			DrawsCanvas = drawsCanvas,
+			ObjectsVisible = objectsVisible,
+			ObjectsShadow = objectsShadow,
+			GpuTextureBytes = gpuTexture,
+			GpuBufferBytes = gpuBuffer,
+			GpuTotalBytes = gpuTotal,
+			OrphanNodes = (long)perf.GetMonitor(Performance.Monitor.ObjectOrphanNodeCount),
+			StaticMemBytes = (long)perf.GetMonitor(Performance.Monitor.MemoryStatic),
+			PhysicsActiveObjects = (long)perf.GetMonitor(Performance.Monitor.Physics3DActiveObjects),
+			PhysicsCollisionPairs = (long)perf.GetMonitor(Performance.Monitor.Physics3DCollisionPairs),
+			PhysicsIslands = (long)perf.GetMonitor(Performance.Monitor.Physics3DIslandCount),
+			PipeCanvas = PipelineDelta(0, perf, Performance.Monitor.PipelineCompilationsCanvas),
+			PipeMesh = PipelineDelta(1, perf, Performance.Monitor.PipelineCompilationsMesh),
+			PipeSurface = PipelineDelta(2, perf, Performance.Monitor.PipelineCompilationsSurface),
+			PipeDraw = PipelineDelta(3, perf, Performance.Monitor.PipelineCompilationsDraw),
+			PipeSpecialization = PipelineDelta(4, perf, Performance.Monitor.PipelineCompilationsSpecialization),
+			DriverAllocationCount = driverAllocs,
+			DriverTotalMemBytes = driverMem,
+			PerfReport = perfReport,
+			HookCosts = topHooks,
+			Viewports = _viewportStatsBuffer,
+		});
+
+		_pipelineBaselineTaken = true;
+	}
+
+	// The PipelineCompilations monitors are CUMULATIVE lifetime counters, not per-frame counts - the
+	// first real capture made that obvious: the series was monotonic and sat flat at 411 for the whole
+	// tail. Reporting the raw value meant the console would shout "411 shader compiles this frame"
+	// forever after the first one, which is worse than not reporting it. The delta is the actual signal:
+	// nonzero means the driver stopped to compile something THIS sample. -xlinka
+	private readonly long[] _lastPipelineCounts = new long[5];
+	private bool _pipelineBaselineTaken;
+
+	private long PipelineDelta(int index, PerformanceInstance perf, Performance.Monitor monitor)
+	{
+		long current = (long)perf.GetMonitor(monitor);
+		long previous = _lastPipelineCounts[index];
+		_lastPipelineCounts[index] = current;
+		// First sample has no previous to subtract, and the startup compiles are not news.
+		if (!_pipelineBaselineTaken)
+			return 0;
+		return current > previous ? current - previous : 0;
+	}
+
+	// Measurement is per viewport and has to be switched on before it reports anything. It costs a GPU
+	// fence, so it is only ever enabled under --Lumora-Debug and only once per viewport.
+	private void EnsureMeasured(Rid viewport)
+	{
+		if (_measuredViewports.Add(viewport))
+			RenderingServer.ViewportSetMeasureRenderTime(viewport, true);
+	}
+
 	private void SendDebugRenderProfile(double delta)
 	{
 		if (_debugUdpSender == null || _engine?.WorldManager?.FocusedWorld == null)
@@ -1562,6 +1938,14 @@ public partial class LumoraEngineRunner : Node
 			_profByTypeBuffer.Clear();
 			_profBySlotBuffer.Clear();
 			updateManager.CollectProfile(_profByTypeBuffer, _profBySlotBuffer);
+
+			// Input receivers are components too, and they are the expensive ones, so they belong in the
+			// same by-type list rather than a tab of their own. The "(input)" suffix matches the phase
+			// tagging the update profiler already uses.
+			_receiverProfileBuffer.Clear();
+			_engine.InputInterface?.CollectReceiverProfile(_receiverProfileBuffer);
+			foreach (var entry in _receiverProfileBuffer)
+				_profByTypeBuffer.Add(new Lumora.Core.UpdateManager.ProfileEntry(entry.Name, entry.Ms, entry.Count));
 
 			var topComponents = _profByTypeBuffer
 				.OrderByDescending(e => e.Ms)
@@ -1840,6 +2224,8 @@ public partial class LumoraEngineRunner : Node
 		_ownsDebugConsoleLock = false;
 
 		_debugUdpSender?.Dispose();
+		_frameLog?.Dispose();
+		_frameLog = null;
 		// Stop transports before the SteamAPI shuts down - the Steam manager
 		// frees its sockets/poll groups via SteamNetworkingSockets calls that
 		// need the API still up. - xlinka
@@ -1847,8 +2233,10 @@ public partial class LumoraEngineRunner : Node
 		NetworkManagerRegistry.StopAll();
 		_engine?.Dispose();
 		_headOutput?.Dispose();
+#if GODOT_PC
 		if (ShouldUseSteam())
 			SteamManager.Shutdown();
+#endif
 
 		base._ExitTree();
 	}
@@ -1867,6 +2255,7 @@ public partial class LumoraEngineRunner : Node
 		var lnl = new LNLNetworkManager();
 		NetworkManagerRegistry.Register(lnl);
 
+#if GODOT_PC
 		if (ShouldUseSteam() && SteamManager.Initialized)
 		{
 			var steam = new SteamNetworkManager();
@@ -1879,5 +2268,6 @@ public partial class LumoraEngineRunner : Node
 				LumoraLogger.Warn("LumoraEngineRunner: SteamNetworkManager unavailable - falling back to LNL only");
 			}
 		}
+#endif
 	}
 }

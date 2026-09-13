@@ -9,27 +9,22 @@ using LumoraLogger = Lumora.Core.Logging.Logger;
 
 namespace Lumora.Source.Godot.Bootstrap;
 
-/// <summary>
-/// Manages camera rendering for VR and screen modes.
-/// Handles position/rotation, FOV, and view overrides.
-/// </summary>
+// Camera rendering for VR and screen modes: position/rotation, FOV, and view overrides.
 public partial class HeadOutput : Node
 {
-    /// <summary>
-    /// Output type determines how camera is positioned and rendered.
-    /// </summary>
+    // Decides how the camera is positioned and rendered.
     public enum OutputType
     {
-        /// <summary>VR headset rendering (stereo, tracked)</summary>
+        // Headset, stereo, tracked.
         VR,
 
-        /// <summary>Standard screen rendering (mono, user-controlled or first-person)</summary>
+        // Standard screen, mono, user-controlled or first-person.
         Screen,
 
-        /// <summary>360-degree equirectangular rendering</summary>
+        // 360-degree equirectangular.
         Screen360,
 
-        /// <summary>Static camera (no movement)</summary>
+        // Static camera, no movement.
         Static
     }
 
@@ -52,19 +47,20 @@ public partial class HeadOutput : Node
     private bool _hasPositionOverride = false;
     private bool _hasRotationOverride = false;
 
-    /// <summary>
-    /// Current camera position in world space.
-    /// </summary>
+    // Which camera the clip planes and FOV were last written to, and with what. Every Camera3D
+    // setter is a marshalled call that re-sends the projection to the rendering server, and these
+    // three were rewritten every frame with values that never change. They are re-pushed when the
+    // camera object changes hands (VR <-> screen), because the VR mirror overwrites the desktop
+    // camera's planes and FOV while the headset is rendering. -xlinka
+    private Camera3D? _settingsCamera;
+    private float _appliedNear;
+    private float _appliedFar;
+    private float _appliedFov;
+
     public Vector3 CameraPosition => _camera?.GlobalPosition ?? Vector3.Zero;
 
-    /// <summary>
-    /// Current camera rotation.
-    /// </summary>
     public Quaternion CameraRotation => _camera?.GlobalTransform.Basis.GetRotationQuaternion() ?? Quaternion.Identity;
 
-    /// <summary>
-    /// Initialize HeadOutput with a camera.
-    /// </summary>
     public void Initialize(Camera3D camera)
     {
         _desktopCamera = camera;
@@ -87,19 +83,14 @@ public partial class HeadOutput : Node
             Type = OutputType.Screen;
         }
 
-        LumoraLogger.Log($"HeadOutput: Initialized with type={Type}, FOV={DefaultFOV}, isVR={_isVRActive}");
+        LumoraLogger.Debug($"HeadOutput: Initialized with type={Type}, FOV={DefaultFOV}, isVR={_isVRActive}");
     }
 
-    /// <summary>
-    /// Locate the XROrigin3D / XRCamera3D defined in Bootstrap.tscn.
-    /// They live inside the XR SubViewport (see %XROrigin3D / %XRCamera3D) and
-    /// are no longer created at runtime - the .tscn ships them so the XR
-    /// viewport stays valid for the whole process lifetime.
-    /// We resolve via CurrentScene rather than the calling node's owner-chain
-    /// because HeadOutput is created at runtime (Owner == null), which breaks
-    /// the bare-percent unique-name lookup.
-    /// - xlinka
-    /// </summary>
+    // Locate the XROrigin3D / XRCamera3D defined in Bootstrap.tscn. They live inside the XR
+    // SubViewport (see %XROrigin3D / %XRCamera3D) and are no longer created at runtime; the .tscn
+    // ships them so the XR viewport stays valid for the whole process lifetime. Resolved via
+    // CurrentScene rather than the calling node's owner-chain because HeadOutput is created at
+    // runtime (Owner == null), which breaks the bare-percent unique-name lookup. - xlinka
     private void SetupVRCamera()
     {
         if (!IsInsideTree())
@@ -181,23 +172,18 @@ public partial class HeadOutput : Node
             camera.Fov = DefaultFOV;
     }
 
-    /// <summary>
-    /// Update camera positioning based on focused world.
-    /// </summary>
+    // Camera positioning from the focused world, once per frame after the engine update.
     public void UpdatePositioning(Lumora.Core.Engine? engine)
     {
         if (_camera == null || engine == null)
             return;
 
-        // Get focused world
         var focusedWorld = engine.WorldManager?.FocusedWorld;
         if (focusedWorld == null)
             return;
 
-        // Update camera settings from world
-        UpdateCameraSettings(focusedWorld);
+        UpdateCameraSettings();
 
-        // Update position/rotation
         if (Type == OutputType.VR)
         {
             UpdateVRPositioning(focusedWorld);
@@ -206,37 +192,43 @@ public partial class HeadOutput : Node
         {
             UpdateScreenPositioning(focusedWorld);
         }
-        // TODO: Screen360, Static modes
+        // Screen360 and Static have no positioning path yet.
     }
 
-    /// <summary>
-    /// Update camera settings (FOV, clip planes) from world.
-    /// </summary>
-    private void UpdateCameraSettings(World world)
+    // Clip planes and FOV. Defaults until a RenderSettings component exists to read from; written
+    // only when the value or the camera object changed.
+    private void UpdateCameraSettings()
     {
-        // Defaults until a RenderSettings component exists to read from.
-        _camera.Near = NearClip;
-        _camera.Far = FarClip;
+        bool sameCamera = ReferenceEquals(_settingsCamera, _camera);
 
-        if (Type == OutputType.Screen)
+        if (!sameCamera || _appliedNear != NearClip)
+        {
+            _camera.Near = NearClip;
+            _appliedNear = NearClip;
+        }
+
+        if (!sameCamera || _appliedFar != FarClip)
+        {
+            _camera.Far = FarClip;
+            _appliedFar = FarClip;
+        }
+
+        if (Type == OutputType.Screen && (!sameCamera || _appliedFov != DefaultFOV))
         {
             _camera.Fov = DefaultFOV;
+            _appliedFov = DefaultFOV;
         }
+
+        _settingsCamera = _camera;
     }
 
-    /// <summary>
-    /// Update VR camera positioning.
-    /// VR cameras are tracked automatically by XR system.
-    /// </summary>
+    // The VR camera is tracked by OpenXR; the XR origin follows the local user's root so HMD and
+    // controllers land on the avatar's transforms.
     private void UpdateVRPositioning(World world)
     {
-        // VR camera is automatically tracked by OpenXR
-        // We just need to position the XR Origin based on world's local user
-
         if (world.LocalUser == null)
             return;
 
-        // Align the XR origin to the local user's root so HMD/controllers match avatar transforms
         var userRootSlot = world.LocalUser.Root?.Slot;
         if (_xrOrigin != null)
         {
@@ -256,24 +248,19 @@ public partial class HeadOutput : Node
         Lumora.Core.Engine.Current?.InputInterface?.SyncTrackingSpaceToFocusedLocalUser();
     }
 
-    /// <summary>
-    /// Update screen camera positioning.
-    /// Screen cameras can be user-controlled or follow first-person view.
-    /// </summary>
+    // Screen cameras are user-controlled or follow the first-person view.
     private void UpdateScreenPositioning(World world)
     {
         // Publish whether the camera is overridden (3rd-person / free-cam) so the userspace dashboard knows it
         // can't simply lock to the local head pose this frame. -xlinka
         Lumora.Core.Engine.Current?.InputInterface?.SetDesktopCameraOverride(_hasPositionOverride || _hasRotationOverride);
 
-        // Check for position/rotation overrides
         if (_hasPositionOverride)
         {
             _camera.GlobalPosition = _overridePosition;
         }
         else
         {
-            // Follow local user's head position if they have a UserRoot
             if (world.LocalUser?.Root != null)
             {
                 var userRoot = world.LocalUser.Root;
@@ -281,7 +268,6 @@ public partial class HeadOutput : Node
             }
             else
             {
-                // Fallback to default height
                 _camera.GlobalPosition = new Vector3(0, 1.6f, 0);
             }
         }
@@ -292,7 +278,6 @@ public partial class HeadOutput : Node
         }
         else
         {
-            // Follow local user's head rotation if they have a UserRoot
             if (world.LocalUser?.Root != null)
             {
                 var userRoot = world.LocalUser.Root;
@@ -302,45 +287,30 @@ public partial class HeadOutput : Node
         }
     }
 
-    /// <summary>
-    /// Set position override for camera.
-    /// Used for custom camera control (e.g., photo mode, cinematic cameras).
-    /// </summary>
+    // Custom camera control (photo mode, cinematic cameras, third-person, free-cam).
     public void SetPositionOverride(Vector3 position)
     {
         _overridePosition = position;
         _hasPositionOverride = true;
     }
 
-    /// <summary>
-    /// Clear position override.
-    /// </summary>
     public void ClearPositionOverride()
     {
         _hasPositionOverride = false;
     }
 
-    /// <summary>
-    /// Set rotation override for camera.
-    /// </summary>
     public void SetRotationOverride(Quaternion rotation)
     {
         _overrideRotation = rotation;
         _hasRotationOverride = true;
     }
 
-    /// <summary>
-    /// Clear rotation override.
-    /// </summary>
     public void ClearRotationOverride()
     {
         _hasRotationOverride = false;
     }
 
-    /// <summary>
-    /// Called by XRModeManager when the VR active state changes at runtime.
-    /// Updates the internal flag and re-runs VR camera setup if activating VR.
-    /// </summary>
+    // Called by XRModeManager when the VR active state changes at runtime.
     public void NotifyVRActiveChanged(bool isActive)
     {
         _isVRActive = isActive;
@@ -357,11 +327,8 @@ public partial class HeadOutput : Node
         LumoraLogger.Log($"HeadOutput: VR active state -> {isActive}");
     }
 
-    /// <summary>
-    /// Switch output type (e.g., VR <-> Screen).
-    /// When switching to VR call <see cref="NotifyVRActiveChanged"/> first so
-    /// <c>_isVRActive</c> is already up-to-date by the time this runs.
-    /// </summary>
+    // Switch output type (VR <-> Screen). When switching to VR call NotifyVRActiveChanged first so
+    // _isVRActive is already up to date by the time this runs.
     public void SwitchOutputType(OutputType newType)
     {
         if (Type == newType)
@@ -384,15 +351,12 @@ public partial class HeadOutput : Node
         Type = newType;
     }
 
-    /// <summary>
-    /// Cleanup.
-    /// </summary>
     public new void Dispose()
     {
         _camera = null!;
         _desktopCamera = null!;
         _vrCamera = null!;
         _xrOrigin = null!;
+        _settingsCamera = null;
     }
 }
-

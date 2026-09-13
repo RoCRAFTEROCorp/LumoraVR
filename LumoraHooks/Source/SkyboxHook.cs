@@ -46,6 +46,20 @@ public sealed class SkyboxHook : ComponentHook<Skybox>
             LumoraLogger.Warn($"SkyboxHook: sky shader not found at {ShaderPath}");
 
         _sky = new Sky { SkyMaterial = _skyMaterial };
+
+        // The radiance map is rendered ONCE, at a size a mobile GPU can afford.
+        //
+        // Left on Automatic with a custom ShaderMaterial, Godot cannot prove the sky is static and
+        // falls to real-time: six cubemap faces plus a full mip chain, every frame. On a Pico 4 that
+        // showed up as 270 ms of GPU per frame with SIX visible draw calls in the scene, unchanged by
+        // turning off glow and by halving the draw count. Quality mode re-renders only when a uniform
+        // changes, which is when the world sets the sky up, and 64 is plenty for the ambient term
+        // since reflections from this sky are killed below anyway. Desktop keeps the defaults. -xlinka
+        if (OS.HasFeature("android"))
+        {
+            _sky.ProcessMode = Sky.ProcessModeEnum.Quality;
+            _sky.RadianceSize = Sky.RadianceSizeEnum.Size64;
+        }
         _environment.BackgroundMode = global::Godot.Environment.BGMode.Sky;
         _environment.Sky = _sky;
 

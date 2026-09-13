@@ -122,6 +122,9 @@ public partial class XRModeManager : Node
         var keyHint = OS.HasFeature("editor") ? "Shift+F8 (editor)" : "F8";
         LumoraLogger.Log($"XRModeManager: Initialized. Mode={( startingInVR ? "VR" : "Desktop" )}");
         LumoraLogger.Log($"XRModeManager: Press {keyHint} at any time to toggle between Desktop and VR.");
+        if (!IsStandalone)
+            LumoraLogger.Log("XRModeManager: Press F9 to re-detect a headset plugged in after launch "
+                           + "(one way into VR, never out of it).");
     }
 
 
@@ -151,6 +154,7 @@ public partial class XRModeManager : Node
     // mode to switch to.
     // - xlinka
     private bool _f8WasDown;
+    private bool _f9WasDown;
     public override void _Process(double delta)
     {
         if (!_initialized) return;
@@ -163,6 +167,17 @@ public partial class XRModeManager : Node
             ToggleMode();
         }
         _f8WasDown = f8Down;
+
+        // F9: plug a headset in after the game is already running, then ask for VR.
+        //
+        // Deliberately NOT F8. F8 toggles, so pressing it while already in VR throws you back to the
+        // desktop - which is the opposite of what someone who just put a headset on wants, and easy to
+        // do by accident when you are wearing one and cannot see the keyboard. This one only ever moves
+        // toward VR. -xlinka
+        bool f9Down = global::Godot.Input.IsKeyPressed(global::Godot.Key.F9);
+        if (f9Down && !_f9WasDown)
+            RetryVR();
+        _f9WasDown = f9Down;
 
         if (IsVRActive)
             SyncDesktopMirrorCamera();
@@ -189,6 +204,45 @@ public partial class XRModeManager : Node
     public void SwitchToVR()
     {
         QueueModeSwitch(true);
+    }
+
+    // Re-detect a headset that arrived after launch, and enter VR if one did. One-way: never leaves VR.
+    //
+    // Starting flat and plugging in later is a normal thing to do, and until now it meant restarting.
+    // It works because the OpenXR INSTANCE is created at boot even with nothing attached - only
+    // xrGetSystem fails, with XR_ERROR_FORM_FACTOR_UNAVAILABLE - so the interface object survives and
+    // can be initialised later once a device actually exists. Everything below it is the same recovery
+    // path F8 already uses, which catches a throwing Initialize() as well as a failing one, so the
+    // worst case is a log line and staying on the desktop. -xlinka
+    public void RetryVR()
+    {
+        if (!_initialized)
+            return;
+
+        if (IsStandalone)
+        {
+            LumoraLogger.Log("XRModeManager: F9 ignored - standalone headset is always in VR.");
+            return;
+        }
+
+        if (IsVRActive)
+        {
+            LumoraLogger.Log("XRModeManager: F9 ignored - already in VR.");
+            return;
+        }
+
+        var xrInterface = XRServer.FindInterface("OpenXR");
+        if (xrInterface == null)
+        {
+            LumoraLogger.Warn("XRModeManager: F9 - no OpenXR interface in this process. A runtime has to be "
+                            + "installed and running BEFORE the game starts; plugging in a headset cannot "
+                            + "create one. Staying on desktop.");
+            return;
+        }
+
+        LumoraLogger.Log($"XRModeManager: F9 - re-detecting XR (sessionUp={xrInterface.IsInitialized()}). "
+                       + "Attempting to enter VR.");
+        SwitchToVR();
     }
 
     private void QueueModeSwitch(bool targetVR)

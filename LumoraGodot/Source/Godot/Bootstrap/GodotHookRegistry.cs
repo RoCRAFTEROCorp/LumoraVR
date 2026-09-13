@@ -20,6 +20,25 @@ public static class GodotHookRegistry
         int componentHooks = World.HookTypes.RegisterFromAssembly(hookAssembly);
         int assetHooks = AssetHookRegistry.RegisterFromAssembly(hookAssembly);
 
-        LumoraLogger.Log($"GodotHookRegistry: registered {componentHooks} component hooks, {assetHooks} asset hooks via reflection");
+        // The core cannot ask the renderer what it is running on, so it is told here, once. Everything
+        // platform-gated reads Engine.CurrentPlatform rather than sniffing the OS name again, and the
+        // local user replicates it so other peers know what a person is on. -xlinka
+        Lumora.Core.Engine.CurrentPlatform = global::Godot.OS.GetName() switch
+        {
+            "Android" => Lumora.Core.Platform.Android,
+            "Windows" or "UWP" => Lumora.Core.Platform.Windows,
+            "Linux" or "FreeBSD" or "NetBSD" or "OpenBSD" or "BSD" => Lumora.Core.Platform.Linux,
+            _ => Lumora.Core.Platform.Other,
+        };
+
+        // The core cannot know what block format this device samples, and the GPU cache key needs it:
+        // the same picture baked as BPTC on a desktop and as ASTC on a headset is different bytes, and
+        // without the tag in the key they collide. Queried here, on the main thread, because this is
+        // the first point where the render layer is known to the engine and the renderer is up. -xlinka
+        var formats = Lumora.Godot.Hooks.TextureAssetHook.QueryDeviceFormats();
+        Lumora.Core.Assets.TextureGpuCache.CompressionTag = Lumora.Godot.Hooks.TextureAssetHook.CompressionTag();
+
+        LumoraLogger.Log($"GodotHookRegistry: registered {componentHooks} component hooks, {assetHooks} asset hooks via reflection "
+            + $"(texture formats: {formats}, cache tag: {Lumora.Core.Assets.TextureGpuCache.CompressionTag})");
     }
 }

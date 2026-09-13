@@ -10,27 +10,44 @@ namespace Lumora.Source.Godot.Rendering;
 public static class ViewportQuality
 {
     private const float DesktopXrRenderTargetMultiplier = 2.0f;
-    private const float StandaloneXrRenderTargetMultiplier = 1.35f;
+    // Standalone renders at NATIVE eye resolution, no supersample, light MSAA, no post passes.
+    //
+    // The previous values stacked 1.35x render target, 1.15x supersample, 4x MSAA, FXAA and debanding
+    // on a mobile tiler: about 90 million samples a frame on a Pico 4's Adreno 650, which ran at 1 to 2
+    // fps. Each is a reasonable desktop choice; on a tile-based mobile GPU the budget for 72-90 fps is a
+    // few million samples and MSAA 2x is the one thing that is nearly free. Sharpness on standalone
+    // comes from the panel's native density, not from oversampling it. -xlinka
+    private const float StandaloneXrRenderTargetMultiplier = 1.3f;
     private const float DesktopXrSupersampleScale = 1.5f;
-    private const float StandaloneXrSupersampleScale = 1.15f;
+    // No supersampling on standalone now that the swapchain itself is bigger (see the multiplier
+    // above): rendering 1.2x into a small buffer was the stand-in for that, and doing both costs
+    // double for a downsample the compositor undoes. -xlinka
+    private const float StandaloneXrSupersampleScale = 1.0f;
 
-    public static void ConfigureOpenXRBeforeInitialize(OpenXRInterface? xrInterface, Action<string>? log = null)
+    // Returns true when the running session was taken down to change the multiplier; the caller has
+    // to wait for it to actually be gone before calling Initialize() again.
+    public static bool ConfigureOpenXRBeforeInitialize(OpenXRInterface? xrInterface, Action<string>? log = null)
     {
         if (xrInterface == null)
-            return;
-
-        if (xrInterface.IsInitialized())
-        {
-            log?.Invoke("OpenXR quality: render target multiplier unchanged because the session is already initialized.");
-            return;
-        }
+            return false;
 
         var multiplier = OS.HasFeature("android")
             ? StandaloneXrRenderTargetMultiplier
             : DesktopXrRenderTargetMultiplier;
 
+        if (xrInterface.IsInitialized())
+        {
+            // On Android the session is created before any script runs (xr/openxr/enabled starts it
+            // at boot). Do NOT try to restart it to get the multiplier in: Uninitialize() marks the
+            // interface down, the XR server stops pumping the OpenXR state machine, and the old session
+            // sits at Focused forever while the new one fails on "session != nullptr". The multiplier is
+            // applied to the running session in ConfigureOpenXRAfterInitialize instead. -xlinka
+            return false;
+        }
+
         xrInterface.RenderTargetSizeMultiplier = multiplier;
         log?.Invoke($"OpenXR quality: render target multiplier set to {multiplier:0.##} before initialization.");
+        return false;
     }
 
     public static void ConfigureOpenXRAfterInitialize(OpenXRInterface? xrInterface, Viewport? viewport, Action<string>? log = null)
@@ -43,15 +60,37 @@ public static class ViewportQuality
 
         ApplyXrViewportDefaults(viewport);
 
+        // The eye swapchain itself, on a RUNNING session. The class reference still says the
+        // multiplier must be set before initialize; 4.7-dev4 recreates the swapchain when it grows,
+        // and on the Pico 4 that took the eye buffer from 1504x1504 (0.7x of the 2160 panel, which
+        // the compositor then upscaled: the "everything is soft" complaint) to 1955x1955 live.
+        // Measured GPU at 72 Hz, MSAA 2x, XR on the root viewport: 1.25x 12.7 ms, 1.3x 13.3 ms,
+        // 1.4x 14-18 ms (drops to 59-70). 1.3x holds 72 in the home; a heavier world will want a
+        // dynamic step down, which is the next thing to build. -xlinka
+        if (OS.HasFeature("android"))
+        {
+            float mult = StandaloneXrRenderTargetMultiplier;
+            if (System.Math.Abs(xrInterface.RenderTargetSizeMultiplier - mult) > 0.001f)
+            {
+                var before = xrInterface.GetRenderTargetSize();
+                xrInterface.RenderTargetSizeMultiplier = mult;
+                var after = xrInterface.GetRenderTargetSize();
+                log?.Invoke($"OpenXR quality: render target multiplier {mult:0.##} applied; eye buffer {before.X:0}x{before.Y:0} -> {after.X:0}x{after.Y:0}");
+            }
+        }
+
         if (xrInterface == null)
             return;
 
         try
         {
+            // No foveation. On the Pico 4 level 1 measured no GPU saving at all and level 2 reads as a
+            // smeared edge; a clean periphery was the complaint. VRS strength is left alone; Godot
+            // refuses anything under 0.1 and VRS is only live when a viewport asks for it, so writing
+            // zero here only produced a warning on every boot. -xlinka
             xrInterface.FoveationDynamic = false;
             xrInterface.FoveationLevel = 0;
             xrInterface.FoveationWithSubsampledImages = false;
-            xrInterface.VrsStrength = 0.0f;
             xrInterface.VrsMinRadius = 1.0f;
         }
         catch (Exception ex)
@@ -88,24 +127,45 @@ public static class ViewportQuality
 
         try
         {
+            bool standalone = OS.HasFeature("android");
             viewport.Scaling3DMode = Viewport.Scaling3DModeEnum.Bilinear;
-            viewport.Scaling3DScale = OS.HasFeature("android")
-                ? StandaloneXrSupersampleScale
-                : DesktopXrSupersampleScale;
+            viewport.Scaling3DScale = standalone ? StandaloneXrSupersampleScale : DesktopXrSupersampleScale;
             viewport.FsrSharpness = 1.0f;
-            viewport.ScreenSpaceAA = Viewport.ScreenSpaceAAEnum.Fxaa;
-            viewport.Msaa3D = OS.HasFeature("android") ? Viewport.Msaa.Msaa4X : Viewport.Msaa.Msaa8X;
+            // Measured on the Pico 4 at 72 Hz (GPU ms, same scene):
+            //   1.0x MSAA4 fov1     6.6-9.1     1.1x MSAA4 fov1    11.0-13.4  (drops to 55-61 fps)
+            //   1.2x MSAA2 fov1     6.3-7.6     1.2x MSAA2 fov0     6.5-8.7
+            //   1.35x MSAA2 fov1    9.0-11.2    1.2x MSAA4 fov1    12-16      (45 fps)
+            // Once the buffer is scaled the mobile renderer leaves its single-pass path and 4x MSAA
+            // stops being free; 2x MSAA under 1.2x supersampling is sharper AND cheaper than 4x at 1x.
+            // FXAA is a full-resolution pass and adds nothing on top of that. Debanding is a dither
+            // folded into the tonemap pass, and a gradient sky in a headset bands without it. -xlinka
+            viewport.ScreenSpaceAA = standalone ? Viewport.ScreenSpaceAAEnum.Disabled : Viewport.ScreenSpaceAAEnum.Fxaa;
+            viewport.Msaa3D = standalone ? Viewport.Msaa.Msaa2X : Viewport.Msaa.Msaa8X;
             viewport.UseTaa = false;
             viewport.UseDebanding = true;
-            viewport.TextureMipmapBias = 0.25f;
-            viewport.AnisotropicFilteringLevel = OS.HasFeature("android")
-                ? Viewport.AnisotropicFiltering.Anisotropy8X
+            viewport.TextureMipmapBias = standalone ? 0f : 0.25f;
+            viewport.AnisotropicFilteringLevel = standalone
+                ? Viewport.AnisotropicFiltering.Anisotropy4X
                 : Viewport.AnisotropicFiltering.Anisotropy16X;
             // Same source of truth as the desktop window: the headset viewport is a different one and
             // would otherwise sit at the project default no matter what the user picked.
             viewport.MeshLodThreshold = EngineSettings.MeshLodThreshold;
             viewport.VrsMode = Viewport.VrsModeEnum.Disabled;
             viewport.VrsUpdateMode = Viewport.VrsUpdateModeEnum.Disabled;
+
+            if (standalone)
+            {
+                // Shadow atlases sized for a mobile tiler. The project default is a 4096 directional
+                // atlas with soft filtering, which on desktop is the single biggest frame cost already
+                // (see the render culling notes) and on an Adreno is prohibitive. Hard filtering plus
+                // a 2048 atlas keeps the sun shadow readable without a second full-resolution pass.
+                RenderingServer.DirectionalShadowAtlasSetSize(2048, true);
+                RenderingServer.DirectionalSoftShadowFilterSetQuality(RenderingServer.ShadowQuality.Hard);
+                RenderingServer.PositionalSoftShadowFilterSetQuality(RenderingServer.ShadowQuality.Hard);
+                viewport.PositionalShadowAtlasSize = 1024;
+                GD.Print("OpenXR quality: standalone shadows set to hard, directional atlas 2048, positional atlas 1024.");
+
+            }
         }
         catch (Exception ex)
         {
