@@ -11,6 +11,7 @@ using System.Collections.Generic;
 using Quaternion = System.Numerics.Quaternion;
 using Vector3 = System.Numerics.Vector3;
 using Vector2 = System.Numerics.Vector2;
+using LumoraLogger = Lumora.Core.Logging.Logger;
 
 namespace Lumora.Source.Godot.Input.Drivers;
 
@@ -30,7 +31,7 @@ public class GodotVRDriver : IVRDriver, IInputDriver
     private XRInterface _xrInterface = null!;
     private InputInterface _inputInterface = null!;
     private bool _modeActive;
-    private bool _trackerAddedConnected;
+    private bool _trackerSignalsConnected;
 
     // Godot XR nodes for tracking (proper Godot 4.x pattern)
     private XRCamera3D _xrCamera = null!;
@@ -45,6 +46,46 @@ public class GodotVRDriver : IVRDriver, IInputDriver
     private TrackedObject _leftHandTrackedObject = null!;
     private TrackedObject _rightHandTrackedObject = null!;
     private readonly Dictionary<BodyNode, TrackedObject> _handSkeletonTrackedObjects = new();
+
+    // Body trackers (the pucks).
+    //
+    // Godot registers one XRPositionalTracker per top-level path in the action map when the OpenXR
+    // session starts, puck or no puck, so "tracker exists" means nothing. A candidate becomes a device
+    // only when the runtime binds an interaction profile to its path (profile_changed) or streams a pose
+    // for it; it drops back to a candidate when the profile is unbound and to nothing on tracker_removed.
+    // The frame loop walks the live list only, so a rig without pucks pays one Count compare.
+    //
+    // UniqueID is the tracker name, which is the OpenXR role path. Godot exposes no serial or persistent
+    // path for a tracker and the runtime keeps role-per-serial itself, so the role path is the most
+    // stable identity on offer. It still never leaves the machine as-is. -xlinka
+    private sealed class TrackerEntry
+    {
+        public string Name = string.Empty;
+        public XRPositionalTracker Tracker = null!;
+        public XRPose? Pose;
+        public TrackerDevice? Device;
+        public bool Live;
+        public bool WantsLive;
+        public bool PoseSubscribed;
+        public XRPositionalTracker.ProfileChangedEventHandler ProfileHandler = null!;
+        public XRPositionalTracker.PoseChangedEventHandler PoseHandler = null!;
+    }
+
+    private const string TrackerRolePathPrefix = "/user/vive_tracker_htcx/role/";
+
+    // Below the head and controllers (100) so a puck mapped onto a node one of those owns can never win
+    // it, above the controller-derived hand estimate (50) because a puck is a measurement, not a guess.
+    // The finger skeleton's 120 is irrelevant: nothing lets a puck map to a finger. -xlinka
+    private const int TrackerPriority = 90;
+
+    private static readonly StringName DefaultPoseName = new StringName("default");
+
+    private readonly Dictionary<string, TrackerEntry> _trackerCandidates = new();
+    private readonly List<TrackerEntry> _liveTrackers = new();
+
+    // InputInterface cannot unregister a device, so a puck that leaves and returns gets its old device
+    // back instead of a second one with the same identity.
+    private readonly Dictionary<string, TrackerDevice> _trackerDevices = new();
 
     private static readonly FingerType[] FingerOrder = new[]
     {
@@ -72,8 +113,8 @@ public class GodotVRDriver : IVRDriver, IInputDriver
         FingerSegmentType.Tip
     };
 
-    // Picks up the XR interface that PhaseXRDetection() already initialized; also subscribes to
-    // TrackerAdded to log the HMD device name on connect.
+    // Picks up the XR interface that PhaseXRDetection() already initialized, hooks tracker add/remove,
+    // and walks the trackers the runtime registered before anyone was listening.
     public void InitializeVR()
     {
         _xrInterface = XRServer.PrimaryInterface;
@@ -91,11 +132,14 @@ public class GodotVRDriver : IVRDriver, IInputDriver
             GD.Print($"GodotVRDriver: Platform={Platform}, Runtime='{RuntimeName}', " +
                      $"LeftProfile='{LeftInteractionProfile}', RightProfile='{RightInteractionProfile}'");
 
-            if (!_trackerAddedConnected)
+            if (!_trackerSignalsConnected)
             {
                 XRServer.TrackerAdded += OnTrackerAdded;
-                _trackerAddedConnected = true;
+                XRServer.TrackerRemoved += OnTrackerRemoved;
+                _trackerSignalsConnected = true;
             }
+
+            DiscoverTrackers();
         }
         else
         {
@@ -133,6 +177,243 @@ public class GodotVRDriver : IVRDriver, IInputDriver
 
         if ((XRServer.TrackerType)type == XRServer.TrackerType.Head)
             global::Godot.GD.Print($"GodotVRDriver: HMD device: {desc}");
+
+        if (tracker is XRPositionalTracker positional)
+            TrackCandidate(positional);
+    }
+
+    private void OnTrackerRemoved(StringName trackerName, long type)
+    {
+        if (!_trackerCandidates.Remove(trackerName.ToString(), out var entry))
+            return;
+
+        bool wasLive = entry.Live;
+        DetachCandidate(entry);
+        if (wasLive)
+            LumoraLogger.Log($"GodotVRDriver: body tracker {entry.Device?.Name} removed");
+    }
+
+    // Vive pucks arrive typed Controller with the role path as their name; the type alone cannot tell
+    // them from a hand controller, the name can. Everything Godot types as a head, hand, body, face,
+    // anchor or base station is something else's job.
+    private static bool IsBodyTracker(XRTracker tracker, string name)
+    {
+        if (tracker is not XRPositionalTracker)
+            return false;
+
+        switch (tracker.Type)
+        {
+            case XRServer.TrackerType.Head:
+            case XRServer.TrackerType.Hand:
+            case XRServer.TrackerType.Body:
+            case XRServer.TrackerType.Face:
+            case XRServer.TrackerType.Anchor:
+            case XRServer.TrackerType.Basestation:
+                return false;
+        }
+
+        return name.StartsWith(TrackerRolePathPrefix, StringComparison.Ordinal);
+    }
+
+    private void DiscoverTrackers()
+    {
+        if (!IsRuntimeInitialized)
+            return;
+
+        using var trackers = XRServer.GetTrackers((int)XRServer.TrackerType.Any);
+        foreach (var pair in trackers)
+        {
+            if (pair.Value.AsGodotObject() is XRPositionalTracker tracker)
+                TrackCandidate(tracker);
+        }
+    }
+
+    private void TrackCandidate(XRPositionalTracker tracker)
+    {
+        string name = tracker.Name.ToString();
+        if (!IsBodyTracker(tracker, name) || _trackerCandidates.ContainsKey(name))
+            return;
+
+        var entry = new TrackerEntry { Name = name, Tracker = tracker };
+        entry.ProfileHandler = profile => OnTrackerProfileChanged(entry, profile);
+        entry.PoseHandler = pose => OnTrackerPoseChanged(entry, pose);
+        tracker.ProfileChanged += entry.ProfileHandler;
+        tracker.PoseChanged += entry.PoseHandler;
+        entry.PoseSubscribed = true;
+        _trackerCandidates[name] = entry;
+
+        LumoraLogger.Debug($"GodotVRDriver: tracker candidate '{name}' profile='{tracker.Profile}'");
+
+        if (!string.IsNullOrEmpty(tracker.Profile))
+            SetTrackerLive(entry, true);
+    }
+
+    private void OnTrackerProfileChanged(TrackerEntry entry, string profile)
+    {
+        SetTrackerLive(entry, !string.IsNullOrEmpty(profile));
+    }
+
+    // Runtimes that never bind a profile to the puck still stream poses; the first one is the connect.
+    private void OnTrackerPoseChanged(TrackerEntry entry, XRPose pose)
+    {
+        if (entry.Live || pose == null || pose.Name != DefaultPoseName)
+            return;
+
+        entry.Pose = pose;
+        SetTrackerLive(entry, true);
+    }
+
+    private void SetTrackerLive(TrackerEntry entry, bool live)
+    {
+        if (live)
+        {
+            if (entry.Live)
+                return;
+
+            if (_inputInterface == null)
+            {
+                entry.WantsLive = true;
+                return;
+            }
+
+            entry.Device ??= AcquireTrackerDevice(entry.Name);
+            entry.Device.IsDeviceActive = true;
+            entry.Live = true;
+            entry.WantsLive = false;
+            _liveTrackers.Add(entry);
+
+            // The frame loop reads the pose from here on; the signal would be a second copy per frame.
+            if (entry.PoseSubscribed)
+            {
+                entry.Tracker.PoseChanged -= entry.PoseHandler;
+                entry.PoseSubscribed = false;
+            }
+
+            LumoraLogger.Log($"GodotVRDriver: body tracker {entry.Device.Name} online, suggested role {entry.Device.SuggestedRole}");
+            return;
+        }
+
+        entry.WantsLive = false;
+        if (!entry.Live)
+            return;
+
+        entry.Live = false;
+        entry.Pose = null;
+        _liveTrackers.Remove(entry);
+        entry.Device?.SetOffline();
+
+        if (!entry.PoseSubscribed && GodotObject.IsInstanceValid(entry.Tracker))
+        {
+            entry.Tracker.PoseChanged += entry.PoseHandler;
+            entry.PoseSubscribed = true;
+        }
+
+        LumoraLogger.Log($"GodotVRDriver: body tracker {entry.Device?.Name} offline");
+    }
+
+    private TrackerDevice AcquireTrackerDevice(string uniqueId)
+    {
+        if (_trackerDevices.TryGetValue(uniqueId, out var existing))
+            return existing;
+
+        var device = new TrackerDevice();
+        device.SetIdentity(uniqueId);
+
+        string publicId = device.PublicID;
+        string shortId = publicId.Length > 12 ? publicId.Substring(0, 12) : publicId;
+        _inputInterface.RegisterInputDevice(device, "VR_Tracker_" + shortId);
+
+        var role = TrackerRoles.FromRolePath(uniqueId);
+        device.SuggestedRole = role;
+
+        // NOT auto-mapped from the role. A puck that has never been calibrated drives NOTHING: its
+        // offset would be identity, so the body node would snap to the raw puck pose and the avatar
+        // would look broken in a way that reads as a bug rather than as "you have not calibrated yet".
+        // The role is a suggestion for the calibrator to break ties with, not an assignment. A saved
+        // mapping is applied separately, by InputInterface at registration. -xlinka
+        device.CorrespondingBodyNode = BodyNode.NONE;
+        device.Priority = TrackerPriority;
+        _trackerDevices[uniqueId] = device;
+        return device;
+    }
+
+    // Candidates that went live before RegisterInputs handed us an InputInterface to put devices in.
+    private void ActivatePendingTrackers()
+    {
+        if (_trackerCandidates.Count == 0)
+            return;
+
+        foreach (var entry in _trackerCandidates.Values)
+        {
+            if (entry.WantsLive)
+                SetTrackerLive(entry, true);
+        }
+    }
+
+    private void DetachCandidate(TrackerEntry entry)
+    {
+        if (entry.Live)
+        {
+            entry.Live = false;
+            _liveTrackers.Remove(entry);
+        }
+
+        entry.WantsLive = false;
+        entry.Pose = null;
+        entry.Device?.SetOffline();
+
+        if (GodotObject.IsInstanceValid(entry.Tracker))
+        {
+            entry.Tracker.ProfileChanged -= entry.ProfileHandler;
+            if (entry.PoseSubscribed)
+                entry.Tracker.PoseChanged -= entry.PoseHandler;
+        }
+
+        entry.PoseSubscribed = false;
+        entry.Tracker = null!;
+    }
+
+    // Live pucks only. The cached XRPose is the tracker's own pose object, updated in place by the
+    // runtime (set_pose reuses it, invalidate_pose flips has_tracking_data on it), so this reads a few
+    // properties and one transform and allocates nothing. Confidence None means no valid pose this
+    // frame and the device says so; Low is the runtime extrapolating and still counts as tracking,
+    // with the level exposed for anyone who wants to be stricter. -xlinka
+    private void UpdateTrackerPoses()
+    {
+        int count = _liveTrackers.Count;
+        if (count == 0)
+            return;
+
+        var space = _inputInterface.GlobalTrackingSpace;
+        for (int i = 0; i < count; i++)
+        {
+            var entry = _liveTrackers[i];
+            var device = entry.Device!;
+            device.TrackingSpace = space;
+            device.IsDeviceActive = true;
+
+            var pose = entry.Pose ??= entry.Tracker.GetPose(DefaultPoseName);
+            if (pose == null || !pose.HasTrackingData)
+            {
+                device.SetUntracked();
+                continue;
+            }
+
+            var confidence = pose.TrackingConfidence;
+            if (confidence == XRPose.TrackingConfidenceEnum.None)
+            {
+                device.SetUntracked();
+                continue;
+            }
+
+            var transform = pose.Transform;
+            var origin = transform.Origin;
+            var quat = transform.Basis.GetRotationQuaternion();
+            device.SetPose(
+                new float3(origin.X, origin.Y, origin.Z),
+                new floatQ(quat.X, quat.Y, quat.Z, quat.W),
+                confidence == XRPose.TrackingConfidenceEnum.High ? 1f : 0.5f);
+        }
     }
 
     // Platform / interaction profile introspection
@@ -312,6 +593,9 @@ public class GodotVRDriver : IVRDriver, IInputDriver
 
         RegisterHandSkeletonDevices(inputInterface);
 
+        DiscoverTrackers();
+        ActivatePendingTrackers();
+
         Lumora.Core.Logging.Logger.Log($"GodotVRDriver: Registered VR tracked devices - Head:{_headTrackedObject?.Name}, LeftController:{_leftControllerTrackedObject?.Name}, RightController:{_rightControllerTrackedObject?.Name}");
     }
 
@@ -332,6 +616,8 @@ public class GodotVRDriver : IVRDriver, IInputDriver
 
         UpdateControllerTracking(_leftControllerTrackedObject, _leftHandTrackedObject, Chirality.Left);
         UpdateControllerTracking(_rightControllerTrackedObject, _rightHandTrackedObject, Chirality.Right);
+
+        UpdateTrackerPoses();
 
         // IMPORTANT: Update VRController inputs (thumbsticks, buttons, triggers)
         // This is separate from TrackedObject tracking
@@ -625,12 +911,15 @@ public class GodotVRDriver : IVRDriver, IInputDriver
         return float.IsNaN(value) || float.IsInfinity(value) ? 0f : value;
     }
 
+    // GetInput, not Get: Get() is GodotObject's PROPERTY lookup and XRController3D has no property
+    // called "ax_button", so every button read came back Nil while the floats (GetFloat) worked. That
+    // is why grip, trigger and the stick reached the engine and no face or menu button ever did. -xlinka
     private static bool ReadBoolAction(XRController3D controller, string action)
     {
         if (controller == null || !GodotObject.IsInstanceValid(controller))
             return false;
 
-        Variant value = controller.Get(action);
+        Variant value = controller.GetInput(action);
         return value.VariantType switch
         {
             Variant.Type.Bool => value.AsBool(),
@@ -812,6 +1101,12 @@ public class GodotVRDriver : IVRDriver, IInputDriver
 
         foreach (var tracked in _handSkeletonTrackedObjects.Values)
             ClearTrackedObject(tracked);
+
+        if (_trackerDevices.Count > 0)
+        {
+            foreach (var device in _trackerDevices.Values)
+                device.SetOffline();
+        }
     }
 
     private static void ClearTrackedObject(TrackedObject tracked)
@@ -855,6 +1150,9 @@ public class GodotVRDriver : IVRDriver, IInputDriver
         controller.GripPressed = false;
         controller.PrimaryButtonPressed = false;
         controller.SecondaryButtonPressed = false;
+        controller.MenuButtonPressed = false;
+        controller.ThumbstickPressed = false;
+        controller.ThumbstickTouched = false;
     }
 
     private void UpdateHeadDevice(HeadDevice headDevice)
@@ -900,6 +1198,9 @@ public class GodotVRDriver : IVRDriver, IInputDriver
         float grip = 0f;
         bool primaryButton = false;
         bool secondaryButton = false;
+        bool menuPressed = false;
+        bool stickPressed = false;
+        bool stickTouched = false;
 
         // Method 1: Try XRController3D if available (requires action map bindings to work)
         if (xrController != null && GodotObject.IsInstanceValid(xrController))
@@ -908,13 +1209,13 @@ public class GodotVRDriver : IVRDriver, IInputDriver
             trigger = xrController.GetFloat("trigger");
             grip = xrController.GetFloat("grip");
 
-            var axButton = xrController.Get("ax_button");
-            primaryButton = axButton.VariantType == Variant.Type.Bool ? axButton.AsBool() :
-                axButton.VariantType == Variant.Type.Float && axButton.AsSingle() > 0.5f;
-
-            var byButton = xrController.Get("by_button");
-            secondaryButton = byButton.VariantType == Variant.Type.Bool ? byButton.AsBool() :
-                byButton.VariantType == Variant.Type.Float && byButton.AsSingle() > 0.5f;
+            primaryButton = ReadBoolAction(xrController, "ax_button");
+            secondaryButton = ReadBoolAction(xrController, "by_button");
+            // The dashboard is bound to the menu button in VR and this was never read, so no
+            // controller on any headset could open it. -xlinka
+            menuPressed = ReadBoolAction(xrController, "menu_button");
+            stickPressed = ReadBoolAction(xrController, "primary_click");
+            stickTouched = ReadBoolAction(xrController, "primary_touch");
         }
 
         // Method 2: Use Godot Input joypad mapping as fallback
@@ -946,8 +1247,31 @@ public class GodotVRDriver : IVRDriver, IInputDriver
         controller.GripPressed = grip > 0.5f;
         controller.PrimaryButtonPressed = primaryButton;
         controller.SecondaryButtonPressed = secondaryButton;
+        controller.MenuButtonPressed = menuPressed;
+        controller.ThumbstickPressed = stickPressed;
+        controller.ThumbstickTouched = stickTouched;
+
+        // First press of each control is logged once, so a headset log answers "does the app get my
+        // buttons" without a debugger attached. -xlinka
+        NoteFirstPress(controller.Side, "primary", primaryButton);
+        NoteFirstPress(controller.Side, "secondary", secondaryButton);
+        NoteFirstPress(controller.Side, "menu", menuPressed);
+        NoteFirstPress(controller.Side, "trigger", trigger > 0.5f);
+        NoteFirstPress(controller.Side, "grip", grip > 0.5f);
+        NoteFirstPress(controller.Side, "stick", thumbstick.LengthSquared() > 0.25f);
+        NoteFirstPress(controller.Side, "stickclick", stickPressed);
 
         DrainHaptics(controller, xrController);
+    }
+
+    private readonly HashSet<string> _seenPresses = new();
+
+    private void NoteFirstPress(VRControllerSide side, string control, bool pressed)
+    {
+        if (!pressed)
+            return;
+        if (_seenPresses.Add($"{side}/{control}"))
+            LumoraLogger.Log($"GodotVRDriver: first '{control}' press on the {side} controller");
     }
 
     // Hand any pulse the engine queued this frame to the runtime. Reading it CLEARS it, so a pulse
@@ -980,11 +1304,17 @@ public class GodotVRDriver : IVRDriver, IInputDriver
 
     public void ShutdownVR()
     {
-        if (_trackerAddedConnected)
+        if (_trackerSignalsConnected)
         {
             XRServer.TrackerAdded -= OnTrackerAdded;
-            _trackerAddedConnected = false;
+            XRServer.TrackerRemoved -= OnTrackerRemoved;
+            _trackerSignalsConnected = false;
         }
+
+        foreach (var entry in _trackerCandidates.Values)
+            DetachCandidate(entry);
+        _trackerCandidates.Clear();
+        _liveTrackers.Clear();
 
         _modeActive = false;
         ClearTrackingState();

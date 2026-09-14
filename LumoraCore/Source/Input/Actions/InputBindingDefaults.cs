@@ -93,8 +93,10 @@ public static class InputBindingDefaults
         else if (action == loco.Jump)
         {
             action.Bind(ControlRef.Key(Key.Space));
-            action.Bind(ControlRef.VR(Chirality.Left, Cat.VRPrimary));
-            action.Bind(ControlRef.VR(Chirality.Right, Cat.VRPrimary));
+            // Stick click, not the face buttons: A/X on both hands both jumping left nothing for the
+            // context menu and equip actions to sit on. -xlinka
+            action.Bind(ControlRef.VR(Chirality.Left, Cat.VRStickPress));
+            action.Bind(ControlRef.VR(Chirality.Right, Cat.VRStickPress));
             action.Bind(ControlRef.Pad(Cat.PadFaceDown));
         }
         else if (action == loco.Sprint)

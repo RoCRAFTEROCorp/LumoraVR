@@ -774,7 +774,7 @@ binding_path = "/user/hand/right/input/grip_surface/pose"
 
 [sub_resource type="OpenXRIPBinding" id="OpenXRIPBinding_pueci"]
 action = SubResource("OpenXRAction_cfob4")
-binding_path = "/user/hand/left/input/system/click"
+binding_path = "/user/hand/left/input/menu/click"
 
 [sub_resource type="OpenXRIPBinding" id="OpenXRIPBinding_jn5l0"]
 action = SubResource("OpenXRAction_cfob4")
@@ -782,7 +782,7 @@ binding_path = "/user/hand/right/input/system/click"
 
 [sub_resource type="OpenXRIPBinding" id="OpenXRIPBinding_44ra8"]
 action = SubResource("OpenXRAction_iu0bw")
-binding_path = "/user/hand/left/input/a/click"
+binding_path = "/user/hand/left/input/x/click"
 
 [sub_resource type="OpenXRIPBinding" id="OpenXRIPBinding_bh82f"]
 action = SubResource("OpenXRAction_iu0bw")
@@ -790,7 +790,7 @@ binding_path = "/user/hand/right/input/a/click"
 
 [sub_resource type="OpenXRIPBinding" id="OpenXRIPBinding_7b312"]
 action = SubResource("OpenXRAction_qfsjh")
-binding_path = "/user/hand/left/input/a/touch"
+binding_path = "/user/hand/left/input/x/touch"
 
 [sub_resource type="OpenXRIPBinding" id="OpenXRIPBinding_ajt26"]
 action = SubResource("OpenXRAction_qfsjh")
@@ -798,7 +798,7 @@ binding_path = "/user/hand/right/input/a/touch"
 
 [sub_resource type="OpenXRIPBinding" id="OpenXRIPBinding_grl1h"]
 action = SubResource("OpenXRAction_kw5jt")
-binding_path = "/user/hand/left/input/b/click"
+binding_path = "/user/hand/left/input/y/click"
 
 [sub_resource type="OpenXRIPBinding" id="OpenXRIPBinding_dlpx3"]
 action = SubResource("OpenXRAction_kw5jt")
@@ -806,7 +806,7 @@ binding_path = "/user/hand/right/input/b/click"
 
 [sub_resource type="OpenXRIPBinding" id="OpenXRIPBinding_s4h6a"]
 action = SubResource("OpenXRAction_d5xd5")
-binding_path = "/user/hand/left/input/b/touch"
+binding_path = "/user/hand/left/input/y/touch"
 
 [sub_resource type="OpenXRIPBinding" id="OpenXRIPBinding_0njdn"]
 action = SubResource("OpenXRAction_d5xd5")
