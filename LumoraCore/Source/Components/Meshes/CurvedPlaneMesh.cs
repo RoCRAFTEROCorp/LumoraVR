@@ -108,13 +108,18 @@ public class CurvedPlaneMesh : ProceduralMesh
             {
                 x = t * width - radius;
                 z = 0f;
-                normal = new float3(0f, 0f, -1f);
+                normal = new float3(0f, 0f, 1f);
             }
             else
             {
+                // CONCAVE toward the viewer. The middle recedes and the edges come forward, so a panel
+                // placed in front of a head wraps around it. This used to put the middle at +Z with the
+                // edges at zero, which on the dashboard read as a barrel bulging at the person; the
+                // source platform's dash curves the other way, edges toward you. The circle's centre is
+                // now on the viewer's side, and the normal points back at that centre. -xlinka
                 x = -MathF.Cos(angle) * widthAdjust * radius;
-                z = MathF.Sin(angle) * radius - globalOffset;
-                normal = new float3(MathF.Cos(angle), 0f, -MathF.Sin(angle)).Normalized;
+                z = globalOffset - MathF.Sin(angle) * radius;
+                normal = new float3(MathF.Cos(angle), 0f, MathF.Sin(angle)).Normalized;
             }
 
             for (int row = 0; row < 2; row++)

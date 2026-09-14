@@ -23,7 +23,11 @@ public class UserspaceDashboard : UIComponent
     // Render the offscreen texture at this multiple of the logical canvas size, then
     // downsample on display. 2x means text/edges land between display pixels with proper
     // detail to filter from instead of stretching 1:1+ from a 1280x720 buffer. - xlinka
-    private const int SupersampleScale = 2;
+    // 1 on a standalone headset. A ViewportTexture has no mipmaps, so every pixel of minification is
+    // aliasing, and a 2560x1440 capture shown at ~1100 eye-buffer pixels tall on a Pico was being
+    // sampled at more than 2:1: text turned to noise. 1280x720 there is close to 1:1 with the panel's
+    // footprint, which is also what the reference platform renders its own dash at on Android. -xlinka
+    private static int SupersampleScale => Engine.IsMobilePlatform ? 1 : 2;
     private const float CanvasScale = 0.001f;
     private const float CaptureDistance = 1f;
 
@@ -66,6 +70,26 @@ public class UserspaceDashboard : UIComponent
     private FontProvider? _fontProviderMono;
     private Grabbable? _grabHandle;
     private bool _lastFreeform;
+
+    // Lazy follow, the way the reference platform's dash rig does it. The anchor is the head position
+    // with a yaw-only rotation; it stays put while the wearer looks around and only starts gliding
+    // toward the head once they have walked ActivationDistance or turned ActivationAngle away, then
+    // settles once within the deactivation thresholds. Pitch is never followed. Pinning the panel to
+    // the full head pose every frame (the old behaviour) read as jitter in a headset: the engine's head
+    // sample is a frame behind the pose the eye actually renders with, so a head-locked panel swims
+    // against the world by exactly that lag. -xlinka
+    private const float FollowPositionSpeed = 3f;
+    private const float FollowRotationSpeed = 3f;
+    private const float FollowActivationDistance = 0.75f;
+    private const float FollowActivationAngle = 140f;
+    private const float FollowDeactivationDistance = 0.1f;
+    private const float FollowDeactivationAngle = 10f;
+    private float3 _anchorPosition;
+    private floatQ _anchorRotation = floatQ.Identity;
+    private float3 _anchorTargetPosition;
+    private floatQ _anchorTargetRotation = floatQ.Identity;
+    private bool _followActivated;
+    private bool _anchorValid;
     private bool _wasOpen;
     // Last seen shared-font atlas generation. New glyphs rasterize on demand and bump this; we re-render the
     // viewport when it changes so freshly-seen text isn't left blank under render-on-dirty. -xlinka
@@ -86,9 +110,12 @@ public class UserspaceDashboard : UIComponent
     public UserspaceDashboard()
     {
         IsOpen = new Sync<bool>(this, false);
-        Distance = new Sync<float>(this, 1.2f);
-        VerticalOffset = new Sync<float>(this, 0f);
-        DisplayHeight = new Sync<float>(this, 0.85f);
+        // Closer and taller than before (was 1.2 m / 0.85 m). The panel's angular size is what makes
+        // text readable in a headset, and this puts it at roughly the reference platform's proportions:
+        // ~60 degrees tall instead of ~40. Desktop ignores both (it fits the window). -xlinka
+        Distance = new Sync<float>(this, 0.85f);
+        VerticalOffset = new Sync<float>(this, 0.05f);
+        DisplayHeight = new Sync<float>(this, 1.0f);
         FollowViewWhileOpen = new Sync<bool>(this, true);
         Freeform = new Sync<bool>(this, false);
         Font = new AssetRef<FontSet>(this);
@@ -246,13 +273,96 @@ public class UserspaceDashboard : UIComponent
         if (!freeform)
         {
             if (FollowViewWhileOpen.Value)
-                PositionInFrontOfFocusedView();
+                FollowFocusedViewLazily(delta);
         }
         else if (!_lastFreeform)
         {
             PositionInFrontOfFocusedView();
         }
         _lastFreeform = freeform;
+    }
+
+    // Head position + yaw only. The pitch and roll of the head never reach the panel.
+    private static bool TryGetFocusedViewAnchor(out float3 position, out floatQ yaw)
+    {
+        if (!TryGetFocusedViewPose(out position, out var headRotation))
+        {
+            yaw = floatQ.Identity;
+            return false;
+        }
+
+        var forward = headRotation * float3.Backward;
+        forward.y = 0f;
+        yaw = forward.LengthSquared > 1e-6f
+            ? floatQ.AxisAngleRad(float3.Up, MathF.Atan2(-forward.x, -forward.z))
+            : floatQ.Identity;
+        return true;
+    }
+
+    private static float AngleBetweenDegrees(floatQ a, floatQ b)
+    {
+        float dot = MathF.Min(1f, MathF.Abs(floatQ.Dot(a, b)));
+        return 2f * MathF.Acos(dot) * (180f / MathF.PI);
+    }
+
+    private void FollowFocusedViewLazily(float delta)
+    {
+        if (!TryGetFocusedViewAnchor(out var headPosition, out var headYaw))
+        {
+            PositionInFrontOfFocusedView();
+            return;
+        }
+
+        if (!_anchorValid)
+        {
+            _anchorPosition = _anchorTargetPosition = headPosition;
+            _anchorRotation = _anchorTargetRotation = headYaw;
+            _anchorValid = true;
+            _followActivated = false;
+        }
+
+        float distance = (headPosition - _anchorPosition).Length;
+        float angle = AngleBetweenDegrees(headYaw, _anchorRotation);
+        if (distance >= FollowActivationDistance || angle >= FollowActivationAngle)
+            _followActivated = true;
+        if (distance <= FollowDeactivationDistance && angle <= FollowDeactivationAngle)
+            _followActivated = false;
+        if (_followActivated)
+        {
+            _anchorTargetPosition = headPosition;
+            _anchorTargetRotation = headYaw;
+        }
+
+        float pt = MathF.Min(1f, delta * FollowPositionSpeed);
+        float rt = MathF.Min(1f, delta * FollowRotationSpeed);
+        _anchorPosition = float3.Lerp(_anchorPosition, _anchorTargetPosition, pt);
+        _anchorRotation = floatQ.Slerp(_anchorRotation, _anchorTargetRotation, rt);
+
+        PlaceRelativeToAnchor(_anchorPosition, _anchorRotation);
+    }
+
+    private void PlaceRelativeToAnchor(float3 anchorPosition, floatQ anchorRotation)
+    {
+        var localOffset = float3.Backward * Distance.Value + float3.Down * VerticalOffset.Value;
+        Slot.GlobalPosition = anchorPosition + anchorRotation * localOffset;
+        Slot.GlobalRotation = anchorRotation;
+        Slot.LocalScale.Value = float3.One;
+    }
+
+    // Snap the anchor to the head right now: on open, and when freeform is switched off.
+    private void ResetFollowAnchor()
+    {
+        if (TryGetFocusedViewAnchor(out var headPosition, out var headYaw))
+        {
+            _anchorPosition = _anchorTargetPosition = headPosition;
+            _anchorRotation = _anchorTargetRotation = headYaw;
+            _anchorValid = true;
+            _followActivated = false;
+            PlaceRelativeToAnchor(_anchorPosition, _anchorRotation);
+            return;
+        }
+        _anchorValid = false;
+        PositionInFrontOfFocusedView();
     }
 
     // Fit the flat surface to the window: place it ahead of the camera and scale
@@ -337,7 +447,10 @@ public class UserspaceDashboard : UIComponent
         SetDashboardOpenFlag(true);
         EnsureBuilt();
         ApplyOpenState();
-        PositionInFrontOfFocusedView();
+        if (Engine.Current?.InputInterface?.VR_Active == true)
+            ResetFollowAnchor();
+        else
+            PositionInFrontOfFocusedView();
     }
 
     public void Close()
@@ -392,6 +505,11 @@ public class UserspaceDashboard : UIComponent
     }
 
     private string _searchBuffer = string.Empty;
+
+    // Whether the screen on show actually wants keystrokes. The VR keyboard asks this to decide
+    // whether to put itself up: a headset user typing into a dash field has no hardware keyboard to
+    // reach for, and every screen that takes text says so by implementing the interface. -xlinka
+    public bool CurrentScreenTakesKeys => _dashboard?.CurrentScreen is IDashboardKeyInput;
 
     public void FeedSearchChar(char c)
     {
@@ -743,7 +861,12 @@ public class UserspaceDashboard : UIComponent
             return;
         }
 
-        var localOffset = float3.Forward * Distance.Value + float3.Down * VerticalOffset.Value;
+        // View forward is -Z, which is float3.BACKWARD in this engine's constants: Forward is (0,0,+1)
+        // and the camera looks down (0,0,-1). VrKeyboard has it right one file over. With Forward here
+        // the dash opened, built, went active at full scale, and sat 1.2 m directly BEHIND the head
+        // every time; measured dot(view, toDash) = -1.00. That is the whole reason pressing the dash
+        // key showed nothing but the keyboard. -xlinka
+        var localOffset = float3.Backward * Distance.Value + float3.Down * VerticalOffset.Value;
         Slot.GlobalPosition = headPosition + headRotation * localOffset;
         Slot.GlobalRotation = headRotation;
         Slot.LocalScale.Value = float3.One;

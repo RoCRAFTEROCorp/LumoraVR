@@ -209,6 +209,18 @@ public sealed class VrKeyboard : Component
         var focused = TextInput.Focused;
         bool hasFocus = focused is { IsDestroyed: false };
 
+        // The dashboard is a SECOND reason to be up, and it is the one that was missing.
+        //
+        // Dash screens do not focus a TextInput: their inline fields take raw keystrokes through the
+        // dashboard's own feed, which until now had exactly one caller, a desktop key handler. So in a
+        // headset the keyboard never appeared for a dash field and would not have typed into it if it
+        // had, which meant you could not sign in, name a folder, rename a world or search your
+        // inventory without taking the headset off. Track the two reasons separately so dismissing one
+        // does not strand the other. -xlinka
+        bool dashWantsKeys = Engine.Current?.InputInterface?.IsVRActive == true
+                             && Engine.Current?.InputInterface?.IsDashboardOpen == true
+                             && UserspaceDashboard.LocalInstance?.CurrentScreenTakesKeys == true;
+
         if (hasFocus)
         {
             _hadFocus = true;
@@ -217,12 +229,19 @@ public sealed class VrKeyboard : Component
             if (!IsShown && Engine.Current?.InputInterface?.IsVRActive == true)
                 Show();
         }
-        else if (_hadFocus)
+        else if (dashWantsKeys)
+        {
+            if (!IsShown)
+                Show();
+        }
+        else if (_hadFocus || _hadDashKeys)
         {
             _hadFocus = false;
             if (IsShown)
                 Hide();
         }
+
+        _hadDashKeys = dashWantsKeys;
 
         if (IsShown)
             UpdatePreview(focused);
@@ -270,6 +289,32 @@ public sealed class VrKeyboard : Component
         var focused = TextInput.Focused;
         if (focused is { IsDestroyed: false })
             focused.Unfocus();
+    }
+
+    // With the dash up, the keyboard hangs off its bottom edge, tilted up toward the wearer, and
+    // rides along as the dash glides: the reference platform's keyboard offset slot lives inside its
+    // dash rig for the same reason. Placing both from the head independently put the keyboard right
+    // in front of the panel it was typing into. -xlinka
+    private const float DockGap = 0.06f;
+    private const float DockTowardViewer = 0.18f;
+    private const float DockTiltDegrees = -45f;
+
+    public override void OnLateUpdate(float delta)
+    {
+        base.OnLateUpdate(delta);
+        if (!IsShown || Engine.Current?.InputInterface?.IsVRActive != true)
+            return;
+
+        var dash = UserspaceDashboard.LocalInstance;
+        var surface = dash?.IsOpen.Value == true ? dash.SurfaceSlot : null;
+        if (surface == null || Slot == null || Slot.IsDestroyed)
+            return;
+
+        float halfHeight = dash!.DisplayHeight.Value * 0.5f;
+        var local = new float3(0f, -halfHeight - DockGap, DockTowardViewer);
+        Slot.GlobalPosition = surface.LocalPointToGlobal(local);
+        Slot.GlobalRotation = surface.GlobalRotation * floatQ.AxisAngle(float3.Right, DockTiltDegrees);
+        Slot.LocalScale.Value = float3.One * PanelScale;
     }
 
     private void PlaceInFrontOfHead()
@@ -468,14 +513,25 @@ public sealed class VrKeyboard : Component
                 Hide();
                 return;
             case VrKeyRole.Escape:
-                // Cancel the edit without committing it; the focus poll puts the panel away next update.
-                BlurFocused();
+                // Cancel the edit without committing it; the focus poll puts the panel away next
+                // update. With no field focused the dashboard is the one editing, so it gets the
+                // cancel instead - otherwise Escape is a dead key on every dash screen.
+                if (TextInput.Focused is { IsDestroyed: false })
+                    BlurFocused();
+                else
+                    UserspaceDashboard.LocalInstance?.FeedEscape();
                 return;
         }
 
         var input = TextInput.Focused;
         if (input == null || input.IsDestroyed)
+        {
+            // Nothing owns a text caret, so the dashboard is the consumer. Its feed already routes at
+            // the current screen and falls back to the file-browser search well, which is exactly what
+            // the desktop key handler does with the same keystrokes.
+            FeedDashboard(key);
             return;
+        }
 
         switch (key.Role.Value)
         {
@@ -512,6 +568,36 @@ public sealed class VrKeyboard : Component
                 break;
             case VrKeyRole.Paste:
                 input.PasteClipboard();
+                break;
+        }
+    }
+
+    private bool _hadDashKeys;
+
+    private void FeedDashboard(VrKey key)
+    {
+        var dash = UserspaceDashboard.LocalInstance;
+        if (dash == null || dash.IsDestroyed)
+            return;
+
+        switch (key.Role.Value)
+        {
+            case VrKeyRole.Character:
+                string glyph = key.ActiveGlyph(ShiftActive.Value);
+                if (!string.IsNullOrEmpty(glyph))
+                    dash.FeedSearchChar(glyph[0]);
+                ConsumeOneShotShift();
+                break;
+            case VrKeyRole.Space:
+                dash.FeedSearchChar(' ');
+                break;
+            case VrKeyRole.Backspace:
+                dash.FeedSearchBackspace();
+                break;
+            case VrKeyRole.Enter:
+                dash.FeedEnter();
+                break;
+            case VrKeyRole.Tab:
                 break;
         }
     }
