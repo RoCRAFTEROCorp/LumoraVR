@@ -135,7 +135,7 @@ public class Engine : IDisposable
     public Input.InputInterface InputInterface { get; private set; } = null!;
     public AssetManager AssetManager { get; private set; } = null!;
     public GlobalCoroutineManager CoroutineManager { get; private set; } = null!;
-    public RemoteAudioManager AudioManager { get; private set; } = null!;
+    public EngineMixerManager AudioManager { get; private set; } = null!;
 
     public LumoraClient? CDNClient { get; private set; }
     public ContentCache? ContentCache { get; private set; }
@@ -765,7 +765,7 @@ public class Engine : IDisposable
 
         // Dispose in reverse initialization order
         DisposeSubsystem("WorldManager", () => { WorldManager?.Dispose(); WorldManager = null!; });
-        DisposeSubsystem("AudioManager", () => { AudioManager = null!; });
+        DisposeSubsystem("AudioManager", () => { AudioManager.Dispose(); });
         DisposeSubsystem("ContentCache", () => { ContentCache?.Dispose(); ContentCache = null; CDNClient?.Dispose(); CDNClient = null; });
         DisposeSubsystem("AssetManager", () => { AssetManager?.Dispose(); AssetManager = null!; });
         DisposeSubsystem("CoroutineManager", () => { CoroutineManager?.Dispose(); CoroutineManager = null!; });

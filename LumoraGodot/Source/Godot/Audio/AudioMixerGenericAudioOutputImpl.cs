@@ -10,7 +10,7 @@ using Lumora.Core.External.Audio.Godot;
 #nullable enable
 namespace Lumora.Source.Godot;
 
-public partial class AudioMixer : IAudioOutputMixerWithInput
+public partial class AudioMixer : IAudioMixer
 {
     bool IAudioMixer.TryCreateAudioBus(string name, [NotNullWhen(true)] out IAudioBus? bus)
     {
@@ -67,7 +67,7 @@ public partial class AudioMixer : IAudioOutputMixerWithInput
         }
     }
 
-    public bool TryGetCapureEffect([NotNullWhen(true)] out IAudioCapureEffect? capureEffect)
+    public bool TryGetCatpureEffect([NotNullWhen(true)] out IAudioCapureEffect? capureEffect)
     {
         if (TryGetCaptureInfo(out var godotEffect, out var _))
         {

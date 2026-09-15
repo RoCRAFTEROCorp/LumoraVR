@@ -7,8 +7,8 @@ namespace Lumora.Core.External.Audio.GenericOutputMixer;
 
 public interface IAudioBus
 {
-    //possibly enable set in future 
-    public float Channels { get; }
+    //possibly enable set in future
+    public int Channels { get; }
     //il work on this more later but for now just pass the fountions thru
     //    public float normalizedvolume { get; set; }
     public void SetVolumeDB(float volume);
@@ -19,5 +19,5 @@ public interface IAudioBus
     //null audio bus is master
     public IAudioBus? Target { get; set; }
     public string Name { get; set; }
-    public bool Mute { get;  set; }
+    public bool Mute { get; set; }
 }

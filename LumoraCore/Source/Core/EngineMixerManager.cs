@@ -10,7 +10,7 @@ using LumoraLogger = Lumora.Core.Logging.Logger;
 
 namespace Lumora.Core;
 
-public class RemoteAudioManager
+public class EngineMixerManager : IDisposable
 {
     private sealed class CacheBus : IAudioBus
     {
@@ -18,8 +18,8 @@ public class RemoteAudioManager
         private readonly List<IAudioEffect> _effects = new();
         private float _volumeDb;
 
-        public bool Mute {get; set;}
-        public float Channels => 2f;
+        public bool Mute { get; set; }
+        public int Channels => 2;
         public List<IAudioEffect> Effects => _effects;
         public IAudioBus? Target { get; set; }
         public string Name { get; set; } = "";
@@ -129,7 +129,8 @@ public class RemoteAudioManager
     private IAudioMixer _mixer = new CacheMixer();
     public IAudioMixer Mixer => _mixer;
 
-    public Lumora.Core.External.Audio.Godot.IAudioCapureEffect? MicCapture {get; internal set;}
+    public External.Audio.Godot.IAudioCapureEffect? MicCapture { get; private set; }
+
     public void Initialize(IAudioMixer mixer)
     {
         ArgumentNullException.ThrowIfNull(mixer);
@@ -141,6 +142,14 @@ public class RemoteAudioManager
             ImportCacheInto(mixer);
 
         _mixer = mixer;
+        if (mixer is External.Audio.Godot.IAudioCaputreProvider mixerWithInput)
+        {
+            mixerWithInput.InitializeInput();
+            if(mixerWithInput.TryGetCatpureEffect(out var cap)){
+                int samplerate = mixerWithInput.GetSampleRate();
+                int framesize = (samplerate*20)/1000;
+            }
+        }
     }
 
     public bool IsInitialized()
@@ -195,8 +204,9 @@ public class RemoteAudioManager
 
             importedSource.Target = importedTarget;
         }
-        if(targetMixer is External.Audio.Godot.IAudioOutputMixerWithInput inputmixer){
-            inputmixer.InitializeInput();
-        }
+    }
+
+    public void Dispose()
+    {
     }
 }
